@@ -359,7 +359,10 @@ def get_client():
     if _STATE.client is None:
         if not CONFIG.api_key:
             raise RuntimeError("GEMINI_API_KEY is not configured.")
-        _STATE.client = genai.Client(api_key=CONFIG.api_key)
+        _STATE.client = genai.Client(
+            api_key=CONFIG.api_key,
+            http_options={"api_version": "v1beta"},
+        )
     return _STATE.client
 
 

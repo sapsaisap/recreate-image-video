@@ -460,17 +460,40 @@ def generate_social_metadata_for_image(
     notify("Generating social media metadata...")
     client = get_client()
 
-    # Build a minimal social prompt from image analysis context
+    # Build viral social prompt from image analysis context
     request = (
-        "You are a viral social media growth expert.\n"
-        "Generate copy-paste ready YouTube and Instagram metadata for this image post.\n\n"
-        "=== YOUTUBE RULES ===\n"
-        "- title: under 80 chars, curiosity-gap, 1 emoji, no ALL-CAPS\n"
-        "- description: 2-3 punchy sentences, under 280 chars, keywords embedded\n"
-        "- tags: comma-separated, TOTAL under 450 chars, no # symbols\n\n"
-        "=== INSTAGRAM RULES ===\n"
-        "- caption: 3-5 words ONLY. Gen-Z funny/catchy reaction. 1-2 emojis.\n"
-        "- hashtags: 2-3 niche + #viral #reels #explorepage. Total 5-6.\n\n"
+        "You are an elite viral growth hacker and visual content SEO specialist.\n"
+        "Generate copy-paste ready, algorithmically optimized YouTube Community/Post and Instagram Post metadata for this visual content.\n\n"
+
+        "=== PLATFORM LIMITS & VIRAL RULES ===\n\n"
+
+        "1. YOUTUBE (Optimized for Click-Through Rate & Search Indexing):\n"
+        "   - title: STRICTLY under 65 characters so it is never truncated on mobile feeds.\n"
+        "     * Front-load the curiosity hook in the first 3-5 words.\n"
+        "     * High curiosity gap or emotional reaction.\n"
+        "     * Include 1 emoji and always append #Shorts or #Image at the end.\n"
+        "     * Example: 'Nobody Expected This In 2070 😳 #Shorts'\n\n"
+        "   - description: Rich SEO format:\n"
+        "     * Line 1 (Hook): Clear, punchy sentence featuring the primary search keyword.\n"
+        "     * Lines 2-3 (Context): 2-3 engaging context sentences with natural semantic keywords explaining the visual concept.\n"
+        "     * Line 4 (CTA): Engagement trigger (e.g. 'Subscribe for daily prompt ideas! What would you rate this 1-10? Comment below 👇').\n"
+        "     * Line 5 (Hashtags): Exactly 3 top hashtags (#Shorts plus 2 niche keywords).\n"
+        "     * Total under 400 characters.\n\n"
+        "   - tags: Comma-separated list under 450 characters (YouTube allows 500 max).\n"
+        "     * 6-10 targeted tags: exact query keyword first, common search terms, niche audience, and 2 broad category tags.\n"
+        "     * NEVER include '#' in tags. Separate strictly with commas.\n\n"
+
+        "2. INSTAGRAM POST / CAROUSEL (Optimized for Explore Discovery, Shares & Saves):\n"
+        "   - caption: Do NOT write only 3 words! Instagram algorithms heavily index caption text for Search & Explore.\n"
+        "     Format with clean line breaks into 3 distinct sections:\n"
+        "     * Section 1 - The Micro-Hook (Line 1, under 120 chars before '...more'): Bold, relatable or shocked reaction with 1-2 emojis that makes viewers tap '...more'.\n"
+        "     * Section 2 - Story & SEO (Lines 2-3): 2-3 conversational sentences giving context and using natural search keywords.\n"
+        "     * Section 3 - The Viral CTA: High-converting trigger for Shares or Saves (the #1 ranking signals on Instagram!).\n"
+        "       Examples: 'Share this with someone who needs inspo 🎨' or 'Save this prompt for your next project 📌' or 'Drop a 🔥 if you want the prompt settings!'.\n\n"
+        "   - hashtags: Exactly 5-6 hashtags starting with #.\n"
+        "     * Mix 2-3 specific content/niche tags, plus #viral #reels #explorepage.\n"
+        "     * Total 5-6 space-separated hashtags.\n\n"
+
         f"=== IMAGE CONTEXT ===\n"
         f"Content type: {analysis.content_type}\n"
         f"Hook: {analysis.hook}\n"

@@ -1109,51 +1109,45 @@ class RecreationPlan(BaseModel):
 
 
 class SocialMetadata(BaseModel):
-    """YouTube and Instagram ready-to-paste metadata for the recreated video."""
+    """YouTube and Instagram ready-to-paste viral metadata for the recreated video."""
 
     youtube_title: str = Field(
         description=(
-            "YouTube title. Under 80 characters. Niche curiosity-gap style with a hook. "
-            "No ALL CAPS. Include 1 relevant emoji at the end. "
-            "Example: 'Phones in 2070 dropped this 😭 (wait for it)'"
+            "YouTube Shorts title under 65 characters so it is NEVER truncated on mobile. "
+            "Front-load the curiosity hook in the first 3-5 words, include 1 emotional emoji, and end with #Shorts. "
+            "Example: 'Nobody Expected This In 2070 😳 #Shorts'"
         )
     )
     youtube_description: str = Field(
         description=(
-            "YouTube description. 2-3 punchy sentences. Under 280 characters total. "
-            "Embed keywords naturally. No hashtags. Conversational tone. "
-            "Example: 'What if your phone could save itself? Futuristic thruster tech meets "
-            "everyday clumsy moments. Technology in 2070 hits different fr.'"
+            "YouTube description. Rich SEO structure under 400 characters: "
+            "Line 1: Hook sentence featuring the primary search keyword. "
+            "Lines 2-3: 2-3 conversational sentences with natural semantic keywords explaining the clip. "
+            "Line 4: Engagement CTA ('Subscribe for daily [topic]! What would you do? Comment below 👇'). "
+            "Line 5: Exactly 3 hashtags (e.g. '#Shorts #NicheTag1 #NicheTag2')."
         )
     )
     youtube_tags: str = Field(
         description=(
-            "Comma-separated YouTube tags. TOTAL string length MUST be under 450 characters. "
-            "Order: 4-5 niche tags specific to this video first, then 3-4 broad tags "
-            "(viral, funny moments, satisfying videos, trending). "
-            "No # symbols. Each individual tag 2-4 words max. "
-            "Example: 'phone drop, futuristic technology, phone thrusters, tech memes, "
-            "viral shorts, funny moments, satisfying videos, trending'"
+            "Comma-separated YouTube tags. TOTAL string length MUST be under 450 characters (YouTube allows 500 max). "
+            "6-10 targeted tags: exact query keyword first, common search terms, niche audience, and 2 broad category tags. "
+            "NO # symbols in tags. Each tag 2-4 words max."
         )
     )
     instagram_caption: str = Field(
         description=(
-            "Instagram caption. 3-5 words ONLY. Gen-Z funny/catchy/naughty reaction style. "
-            "MUST include 1-2 emojis embedded in the words. "
-            "Style examples (match this energy): "
-            "'bro saved his phone 😭', 'future called picked up 🔥', "
-            "'physics said no 💀', 'bro really said nope 🚀', "
-            "'2070 just dropped 😳'. "
-            "NOT generic. NOT 'amazing video!' or 'so cool!'. "
-            "Feel like a shocked/hyped Gen-Z reaction."
+            "Instagram viral caption formatted with line breaks into 3 distinct sections: "
+            "1. Micro-Hook (Line 1, under 120 chars before '...more' fold): Bold, relatable or shocked reaction with 1-2 emojis. "
+            "2. Context/Story (Lines 2-3): 2-3 short conversational sentences embedding high-traffic search keywords (for Instagram SEO). "
+            "3. High-converting CTA (Line 4): Explicit trigger for Shares or Saves (the #1 ranking signals on Reels!). "
+            "Example: 'Send this to someone who does this 😭' or 'Save this for later 📌'."
         )
     )
     instagram_hashtags: str = Field(
         description=(
             "Space-separated hashtags, ALL starting with #. "
             "2-3 niche tags relevant specifically to this video's content/topic, "
-            "then ALWAYS include exactly: #viral #reels #explorepage. "
-            "Total 5-6 hashtags. "
+            "plus #viral #reels #explorepage. Total 5-6 hashtags. "
             "Example: '#phonedrop #futuretech #techfail #viral #reels #explorepage'"
         )
     )
@@ -1498,31 +1492,46 @@ class GeneratedPrompt:
 
 
 def _social_metadata_prompt(analysis: "VideoAnalysis", plan: "RecreationPlan") -> str:
-    """Build the Gemini instruction for generating YouTube + Instagram metadata."""
+    """Build the Gemini instruction for generating viral YouTube + Instagram metadata."""
     return (
-        "You are a viral social media growth expert specialising in short-form video.\n"
-        "Given the VIDEO ANALYSIS and RECREATION PLAN below, generate copy-paste ready metadata.\n\n"
+        "You are an elite viral growth hacker and short-form video SEO specialist.\n"
+        "Generate copy-paste ready, algorithmically optimized metadata for YouTube Shorts and Instagram Reels.\n\n"
 
-        "=== YOUTUBE RULES ===\n"
-        "- title: under 80 chars, curiosity-gap hook, 1 emoji, no ALL-CAPS clickbait\n"
-        "- description: 2-3 punchy sentences, under 280 chars total, keywords embedded naturally\n"
-        "- tags: comma-separated string, TOTAL length under 450 chars\n"
-        "  * 4-5 niche tags specific to this video's topic (first)\n"
-        "  * 3-4 broad tags: viral, funny moments, satisfying videos, trending (last)\n"
-        "  * NO # symbols in tags\n\n"
+        "=== PLATFORM LIMITS & VIRAL RULES ===\n\n"
 
-        "=== INSTAGRAM RULES ===\n"
-        "- caption: 3-5 words ONLY. Gen-Z shocked/hyped reaction with 1-2 emojis.\n"
-        "  Match this energy: 'bro saved his phone 😭', 'future called picked up 🔥',\n"
-        "  'physics said no 💀'. NOT generic. NOT 'amazing video!'. Feel native to Instagram.\n"
-        "- hashtags: 2-3 niche tags relevant to this specific video + #viral #reels #explorepage\n"
-        "  All space-separated with # prefix. Total 5-6 hashtags.\n\n"
+        "1. YOUTUBE SHORTS (Optimized for Click-Through Rate & Search Indexing):\n"
+        "   - title: STRICTLY under 65 characters so it is never truncated on mobile feeds.\n"
+        "     * Front-load the curiosity hook in the first 3-5 words.\n"
+        "     * High curiosity gap or emotional reaction.\n"
+        "     * Include 1 emoji and always append #Shorts at the end.\n"
+        "     * Example: 'Nobody Expected This In 2070 😳 #Shorts'\n\n"
+        "   - description: Rich SEO format (YouTube is the #2 search engine):\n"
+        "     * Line 1 (Hook): Clear, punchy sentence featuring the primary search keyword.\n"
+        "     * Lines 2-3 (Context): 2-3 engaging context sentences with natural semantic keywords explaining the clip.\n"
+        "     * Line 4 (CTA): Engagement trigger (e.g. 'Subscribe for daily [topic]! What would you do? Comment below 👇').\n"
+        "     * Line 5 (Hashtags): Exactly 3 top hashtags (#Shorts plus 2 niche keywords).\n"
+        "     * Total under 400 characters.\n\n"
+        "   - tags: Comma-separated list under 450 characters (YouTube allows 500 max).\n"
+        "     * 6-10 targeted tags: exact query keyword first, common search terms, niche audience, and 2 broad category tags.\n"
+        "     * NEVER include '#' in tags. Separate strictly with commas.\n\n"
+
+        "2. INSTAGRAM REELS (Optimized for Explore Discovery, Shares & Saves):\n"
+        "   - caption: Do NOT write only 3 words! Instagram algorithms heavily index caption text for Search & Explore.\n"
+        "     Format with clean line breaks into 3 distinct sections:\n"
+        "     * Section 1 - The Micro-Hook (Line 1, under 120 chars before '...more'): Bold, relatable or shocked reaction with 1-2 emojis that makes viewers tap '...more'.\n"
+        "     * Section 2 - Story & SEO (Lines 2-3): 2-3 conversational sentences giving context and using natural search keywords.\n"
+        "     * Section 3 - The Viral CTA: High-converting trigger for Shares or Saves (the #1 ranking signals on Reels!).\n"
+        "       Examples: 'Send this to someone who does this 😭' or 'Save this for your next inspo 📌' or 'Drop a 🔥 if you agree!'.\n\n"
+        "   - hashtags: Exactly 5-6 hashtags starting with #.\n"
+        "     * Mix 2-3 specific content/niche tags, plus #viral #reels #explorepage.\n"
+        "     * Total 5-6 space-separated hashtags.\n\n"
 
         f"=== VIDEO CONTEXT ===\n"
         f"Content type: {analysis.content_type}\n"
+        f"Visual medium: {analysis.visual_medium}\n"
         f"Hook: {(analysis.hook or '').strip()}\n"
-        f"Summary: {(analysis.summary or '').strip()[:300]}\n"
-        f"Why it works: {(analysis.why_it_works or '').strip()[:200]}\n\n"
+        f"Summary: {(analysis.summary or '').strip()[:400]}\n"
+        f"Why it works: {(analysis.why_it_works or '').strip()[:300]}\n\n"
 
         f"=== RECREATION PLAN ===\n"
         f"Title: {plan.title}\n"
@@ -1532,10 +1541,11 @@ def _social_metadata_prompt(analysis: "VideoAnalysis", plan: "RecreationPlan") -
 
 
 def _trim_tags(tags: str, limit: int = 450) -> str:
-    """Trim comma-separated tags string to stay within character limit."""
-    if len(tags) <= limit:
-        return tags
-    parts = [t.strip() for t in tags.split(",") if t.strip()]
+    """Trim comma-separated tags string to stay within character limit and remove # symbols."""
+    cleaned = tags.replace("#", "")
+    if len(cleaned) <= limit:
+        return cleaned
+    parts = [t.strip() for t in cleaned.split(",") if t.strip()]
     result = ""
     for part in parts:
         candidate = result + (", " if result else "") + part

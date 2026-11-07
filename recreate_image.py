@@ -405,6 +405,7 @@ def analyze_image(path: Path, notify: Notify = _noop_notify) -> ImageAnalysis:
                 _analysis_prompt_image(),
             ],
             config=genai_types.GenerateContentConfig(
+                http_options={"api_version": "v1beta"},
                 response_mime_type="application/json",
                 response_schema=ImageAnalysis,
                 temperature=0.4,
@@ -432,6 +433,7 @@ def generate_image_plan(
             model=model,
             contents=[request],
             config=genai_types.GenerateContentConfig(
+                http_options={"api_version": "v1beta"},
                 response_mime_type="application/json",
                 response_schema=ImageRecreationPlan,
                 temperature=0.7,
@@ -483,6 +485,7 @@ def generate_social_metadata_for_image(
             model=model,
             contents=[request],
             config=genai_types.GenerateContentConfig(
+                http_options={"api_version": "v1beta"},
                 response_mime_type="application/json",
                 response_schema=SocialMetadata,
                 temperature=0.8,

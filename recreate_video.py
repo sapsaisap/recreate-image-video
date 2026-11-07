@@ -356,6 +356,15 @@ if _STATE is None:
 def get_client():
     from google import genai
 
+    # If an existing client in cache does not have api_version='v1beta', drop it
+    client = getattr(_STATE, "client", None)
+    if client is not None:
+        try:
+            if getattr(client._api_client._http_options, "api_version", None) != "v1beta":
+                _STATE.client = None
+        except Exception:
+            _STATE.client = None
+
     if _STATE.client is None:
         if not CONFIG.api_key:
             raise RuntimeError("GEMINI_API_KEY is not configured.")
@@ -1022,6 +1031,7 @@ def analyze_video(path: Path, media: MediaInfo, notify: Notify = _noop_notify) -
                 model=model,
                 contents=[uploaded, prompt],
                 config=genai_types.GenerateContentConfig(
+                    http_options={"api_version": "v1beta"},
                     response_mime_type="application/json",
                     response_schema=VideoAnalysis,
                     temperature=0.3,
@@ -1558,6 +1568,7 @@ def generate_social_metadata(
             model=model,
             contents=[request],
             config=genai_types.GenerateContentConfig(
+                http_options={"api_version": "v1beta"},
                 response_mime_type="application/json",
                 response_schema=SocialMetadata,
                 temperature=0.8,
@@ -1623,6 +1634,7 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
             model=model,
             contents=[request],
             config=genai_types.GenerateContentConfig(
+                http_options={"api_version": "v1beta"},
                 response_mime_type="application/json",
                 response_schema=RecreationPlan,
                 temperature=0.7,

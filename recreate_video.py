@@ -66,6 +66,16 @@ def _inject_streamlit_secrets() -> None:
         for key in ("GEMINI_API_KEY", "COOKIES_FILE", "DOWNLOAD_PROXY"):
             if key in secrets and not os.environ.get(key):
                 os.environ[key] = str(secrets[key])
+
+        # If full cookies.txt content is provided in Streamlit Cloud secrets
+        for cookie_key in ("COOKIES_CONTENT", "COOKIES_TEXT", "COOKIES_DATA"):
+            if cookie_key in secrets:
+                cookie_content = str(secrets[cookie_key]).strip()
+                if cookie_content:
+                    cloud_cookies_path = APP_DIR / "cookies.txt"
+                    cloud_cookies_path.write_text(cookie_content, encoding="utf-8")
+                    os.environ["COOKIES_FILE"] = str(cloud_cookies_path)
+                    break
     except Exception:
         pass  # Not running in Streamlit, or secrets not configured — skip.
 
@@ -114,7 +124,9 @@ class Config:
         int(value) for value in _env_list("OUTPUT_DURATIONS", "8,10") if value.isdigit()
     ) or (8, 10)
     work_dir: Path = (APP_DIR / os.getenv("WORK_DIR", "work")).resolve()
-    cookies_file: str = os.getenv("COOKIES_FILE", "").strip()
+    cookies_file: str = os.getenv("COOKIES_FILE", "").strip() or (
+        str(APP_DIR / "cookies.txt") if (APP_DIR / "cookies.txt").is_file() else ""
+    )
     download_proxy: str = os.getenv("DOWNLOAD_PROXY", "").strip()
     # The free tier can only produce text, so the video/image prompts ARE the
     # output. true: show them on screen; false: only save + offer download.

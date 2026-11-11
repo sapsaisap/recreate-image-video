@@ -40,8 +40,9 @@ from recreate_video import (
     call_gemini,
     closest_aspect_ratio,
     ffmpeg_exe,
-    generate_social_metadata as _generate_social_metadata_for_video,
+    generate_metadata,
     get_client,
+    render_social,
     render_social_metadata,
     validate_public_video_url,
     URLVideoError,
@@ -414,7 +415,7 @@ def analyze_image(path: Path, notify: Notify = _noop_notify) -> ImageAnalysis:
         )
         return _parse_structured(response, ImageAnalysis)
 
-    return call_gemini(run, notify, label="image-analysis")
+    return call_gemini(run, notify, task="analysis", label="image-analysis")
 
 
 def generate_image_plan(
@@ -442,7 +443,7 @@ def generate_image_plan(
         )
         return _parse_structured(response, ImageRecreationPlan)
 
-    return call_gemini(run, notify, label="image-plan")
+    return call_gemini(run, notify, task="text", label="image-plan")
 
 
 def generate_social_metadata_for_image(
@@ -450,81 +451,20 @@ def generate_social_metadata_for_image(
     plan: ImageRecreationPlan,
     notify: Notify = _noop_notify,
 ) -> SocialMetadata:
-    """Generate YouTube + Instagram social metadata for the image post."""
-    from google.genai import types as genai_types
-    from recreate_video import (
-        _social_metadata_prompt as _base_social_prompt,
-        _trim_tags, _validate_instagram_hashtags,
-    )
-
-    notify("Generating social media metadata...")
-    client = get_client()
-
-    # Build viral social prompt from image analysis context
-    request = (
-        "You are an elite viral growth hacker and visual content SEO specialist.\n"
-        "Generate copy-paste ready, algorithmically optimized YouTube Community/Post and Instagram Post metadata for this visual content.\n\n"
-
-        "=== PLATFORM LIMITS & VIRAL RULES ===\n\n"
-
-        "1. YOUTUBE (Optimized for Click-Through Rate & Search Indexing):\n"
-        "   - title: STRICTLY under 65 characters so it is never truncated on mobile feeds.\n"
-        "     * Front-load the curiosity hook in the first 3-5 words.\n"
-        "     * High curiosity gap or emotional reaction.\n"
-        "     * Include 1 emoji and always append #Shorts or #Image at the end.\n"
-        "     * Example: 'Nobody Expected This In 2070 😳 #Shorts'\n\n"
-        "   - description: Rich SEO format:\n"
-        "     * Line 1 (Hook): Clear, punchy sentence featuring the primary search keyword.\n"
-        "     * Lines 2-3 (Context): 2-3 engaging context sentences with natural semantic keywords explaining the visual concept.\n"
-        "     * Line 4 (CTA): Engagement trigger (e.g. 'Subscribe for daily prompt ideas! What would you rate this 1-10? Comment below 👇').\n"
-        "     * Line 5 (Hashtags): Exactly 3 top hashtags (#Shorts plus 2 niche keywords).\n"
-        "     * Total under 400 characters.\n\n"
-        "   - tags: Comma-separated list under 450 characters (YouTube allows 500 max).\n"
-        "     * 6-10 targeted tags: exact query keyword first, common search terms, niche audience, and 2 broad category tags.\n"
-        "     * NEVER include '#' in tags. Separate strictly with commas.\n\n"
-
-        "2. INSTAGRAM POST / CAROUSEL (Optimized for Explore Discovery, Shares & Saves):\n"
-        "   - caption: Do NOT write only 3 words! Instagram algorithms heavily index caption text for Search & Explore.\n"
-        "     Format with clean line breaks into 3 distinct sections:\n"
-        "     * Section 1 - The Micro-Hook (Line 1, under 120 chars before '...more'): Bold, relatable or shocked reaction with 1-2 emojis that makes viewers tap '...more'.\n"
-        "     * Section 2 - Story & SEO (Lines 2-3): 2-3 conversational sentences giving context and using natural search keywords.\n"
-        "     * Section 3 - The Viral CTA: High-converting trigger for Shares or Saves (the #1 ranking signals on Instagram!).\n"
-        "       Examples: 'Share this with someone who needs inspo 🎨' or 'Save this prompt for your next project 📌' or 'Drop a 🔥 if you want the prompt settings!'.\n\n"
-        "   - hashtags: Exactly 5-6 hashtags starting with #.\n"
-        "     * Mix 2-3 specific content/niche tags, plus #viral #reels #explorepage.\n"
-        "     * Total 5-6 space-separated hashtags.\n\n"
-
-        f"=== IMAGE CONTEXT ===\n"
-        f"Content type: {analysis.content_type}\n"
-        f"Hook: {analysis.hook}\n"
-        f"Summary: {analysis.summary}\n"
-        f"Mood: {analysis.mood}\n"
-        f"Title: {plan.title}\n"
-        f"Logline: {plan.logline}\n"
-    )
-
-    def run(model: str) -> SocialMetadata:
-        response = client.models.generate_content(
-            model=model,
-            contents=[request],
-            config=genai_types.GenerateContentConfig(
-                http_options={"api_version": "v1beta"},
-                response_mime_type="application/json",
-                response_schema=SocialMetadata,
-                temperature=0.8,
-                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
-            ),
-        )
-        return _parse_structured(response, SocialMetadata)
-
-    meta = call_gemini(run, notify, label="image-social")
-    meta = meta.model_copy(update={
-        "youtube_title": meta.youtube_title[:100],
-        "youtube_description": meta.youtube_description[:500],
-        "youtube_tags": _trim_tags(meta.youtube_tags, 450),
-        "instagram_hashtags": _validate_instagram_hashtags(meta.instagram_hashtags),
-    })
-    return meta
+    """YouTube + Instagram metadata for the image post (one Gemini call,
+    grounded in Google Search when today's free search quota allows)."""
+    overlay_text = " | ".join(overlay.text for overlay in analysis.text_overlays if overlay.text.strip())
+    context = "\n".join(part for part in [
+        f"Content type: {analysis.content_type} ({analysis.visual_medium})",
+        f"Summary: {analysis.summary.strip()}",
+        f"Subject: {analysis.subject.strip()}",
+        f"Hook: {analysis.hook.strip()}",
+        f"Mood: {analysis.mood.strip()}",
+        f"Recreated post title: {plan.title}",
+        f"Logline: {plan.logline}",
+        f"Text in the image: {overlay_text}" if overlay_text else "",
+    ] if part)
+    return generate_metadata(context, "image", "English", notify)
 
 
 # ============================================================================
@@ -974,24 +914,7 @@ def run_app() -> None:
 
         with tab_social:
             st.subheader("📲 Post to Social Media")
-            social = generated.social_metadata
-            if social:
-                yt_tab, ig_tab = st.tabs(["▶️ YouTube", "📸 Instagram"])
-                with yt_tab:
-                    st.markdown("**📌 Title**")
-                    _show_copyable(st, social.youtube_title)
-                    st.caption(f"{len(social.youtube_title)}/100 chars")
-                    st.markdown("**📄 Description**")
-                    _show_copyable(st, social.youtube_description)
-                    st.markdown(f"**🏷️ Tags** ({len(social.youtube_tags)}/450 chars)")
-                    _show_copyable(st, social.youtube_tags)
-                with ig_tab:
-                    st.markdown("**✍️ Caption**")
-                    _show_copyable(st, social.instagram_caption)
-                    st.markdown("**#️⃣ Hashtags**")
-                    _show_copyable(st, social.instagram_hashtags)
-            else:
-                st.warning("Social metadata generation failed — try regenerating.")
+            render_social(st, generated.social_metadata)
 
     st.divider()
     st.download_button(

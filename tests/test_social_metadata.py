@@ -1,230 +1,232 @@
 """
-test_social_metadata.py - Tests for the SocialMetadata feature.
-Covers: schema validation, _trim_tags, _validate_instagram_hashtags,
-render_social_metadata, GeneratedPrompt.full_text with social section.
-Zero API calls.
+test_social_metadata.py - YouTube / Instagram metadata: platform limits (tags
+packed to YouTube's own count, description in bytes, 5 niche hashtags), the
+search-grounded generation path and its no-search fallback. Zero API calls.
 """
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dataclasses
+from types import SimpleNamespace
 
 import pytest
+from google.genai.errors import ClientError
+
+import recreate_video as rv
 from recreate_video import (
-    SocialMetadata, _trim_tags, _validate_instagram_hashtags,
-    render_social_metadata, GeneratedPrompt,
+    GeneratedPrompt, SocialMetadata, SocialMetadataDraft, YOUTUBE_TAGS_LIMIT,
+    _finish_metadata, _fit_title, _pack_youtube_tags, _validate_instagram_hashtags,
+    render_social_metadata, split_tags, youtube_tags_cost,
 )
 
-
-# ── Fixtures ────────────────────────────────────────────────────────────────
 
 @pytest.fixture
 def mock_meta():
     return SocialMetadata(
-        youtube_title="Phones in 2070 dropped this (wait for it)",
-        youtube_description=(
-            "What if your phone could save itself? Futuristic thruster tech meets "
-            "everyday clumsy moments. Technology in 2070 hits different fr."
-        ),
-        youtube_tags=(
-            "phone drop, futuristic technology, phone thrusters, tech memes, "
-            "viral shorts, funny moments, satisfying videos, trending"
-        ),
-        instagram_caption="bro saved his phone",
-        instagram_hashtags="#phonedrop #futuretech #techfail #viral #reels #explorepage",
+        youtube_title="Phone Drop Saved By Thrusters 😳 #Shorts",
+        youtube_description="What if your phone could save itself? Futuristic thruster tech.\n#Shorts #phonedrop",
+        youtube_tags="phone drop, futuristic technology, phone thrusters, tech memes",
+        instagram_caption="Phone drop… saved by thrusters 😳\nSave this for later 📌",
+        instagram_hashtags="#phonedrop #futuretech #techfail #gadgets #scifi",
     )
 
 
-@pytest.fixture
-def mock_generated_prompt(mock_meta):
-    social_text = render_social_metadata(mock_meta)
-    return GeneratedPrompt(
-        duration=8,
-        prompt="Mock video prompt text.",
-        plan={},
-        saved_to="test.txt",
-        reference_sheet="",
-        social_metadata=mock_meta,
-        social_text=social_text,
+def make_draft(**overrides):
+    values = dict(
+        primary_keyword="telugu biryani recipe",
+        search_insights="People search 'biryani recipe telugu' and 'hyderabadi biryani'.",
+        youtube_title="Telugu Biryani Recipe in 60 Seconds 🔥",
+        youtube_description="Make Hyderabadi biryani at home.\n\nSubscribe for more!\n#Shorts #biryani",
+        youtube_tags=["biryani recipe telugu", "hyderabadi biryani", "biryani in telugu"],
+        instagram_caption="Biryani in 60 seconds 🔥\nSave this recipe 📌",
+        instagram_hashtags=["#biryani", "#telugufood", "#viral", "hyderabadibiryani", "#reels", "#foodie", "#homecooking"],
     )
+    values.update(overrides)
+    return SocialMetadataDraft(**values)
 
 
-# ── YouTube character limits ─────────────────────────────────────────────────
+# ── YouTube tag packing ─────────────────────────────────────────────────────
 
-class TestYouTubeCharacterLimits:
+class TestYouTubeTags:
+    def test_cost_counts_quotes_and_commas(self):
+        # "phone drop" = 10 + 2 quotes, "tech" = 4, one comma
+        assert youtube_tags_cost(["phone drop", "tech"]) == 17
 
-    def test_youtube_title_under_100_chars(self, mock_meta):
-        assert len(mock_meta.youtube_title) <= 100, (
-            f"Title too long: {len(mock_meta.youtube_title)} chars"
-        )
+    def test_packs_up_to_target_and_never_over_limit(self):
+        candidates = [f"telugu cooking idea number {i}" for i in range(60)]
+        packed = _pack_youtube_tags(candidates)
+        cost = youtube_tags_cost(split_tags(packed))
+        assert 440 <= cost <= 480 < YOUTUBE_TAGS_LIMIT
 
-    def test_youtube_tags_under_450_chars(self, mock_meta):
-        assert len(mock_meta.youtube_tags) <= 450, (
-            f"Tags too long: {len(mock_meta.youtube_tags)} chars (limit 450)"
-        )
+    def test_skips_a_long_tag_but_keeps_filling(self):
+        packed = _pack_youtube_tags(["a" * 20, "b" * 30, "c"], target=25)
+        assert split_tags(packed) == ["a" * 20, "c"]
 
-    def test_youtube_description_under_500_chars(self, mock_meta):
-        assert len(mock_meta.youtube_description) <= 500
+    def test_cleans_and_dedupes(self):
+        packed = _pack_youtube_tags(["#Biryani", "biryani", "<script>", "a,b"])
+        assert split_tags(packed) == ["Biryani", "script", "a b"]
 
-    def test_youtube_tags_no_hash_symbols(self, mock_meta):
-        assert "#" not in mock_meta.youtube_tags, (
-            "YouTube tags must not contain # symbols"
-        )
-
-    def test_youtube_tags_comma_separated(self, mock_meta):
-        parts = [t.strip() for t in mock_meta.youtube_tags.split(",") if t.strip()]
-        assert len(parts) >= 3, "Need at least 3 comma-separated tags"
-
-
-# ── Instagram format ─────────────────────────────────────────────────────────
-
-class TestInstagramFormat:
-
-    def test_instagram_caption_max_5_words(self, mock_meta):
-        word_count = len(mock_meta.instagram_caption.split())
-        assert word_count <= 5, (
-            f"Caption has {word_count} words (limit 5): {mock_meta.instagram_caption!r}"
-        )
-
-    def test_instagram_hashtags_all_start_with_hash(self, mock_meta):
-        tokens = mock_meta.instagram_hashtags.split()
-        for t in tokens:
-            assert t.startswith("#"), f"Hashtag missing #: {t!r}"
-
-    def test_instagram_has_viral(self, mock_meta):
-        lower = mock_meta.instagram_hashtags.lower()
-        assert "#viral" in lower
-
-    def test_instagram_has_reels(self, mock_meta):
-        lower = mock_meta.instagram_hashtags.lower()
-        assert "#reels" in lower
-
-    def test_instagram_has_explorepage(self, mock_meta):
-        lower = mock_meta.instagram_hashtags.lower()
-        assert "#explorepage" in lower
-
-    def test_instagram_total_hashtags_5_to_6(self, mock_meta):
-        count = len(mock_meta.instagram_hashtags.split())
-        assert 5 <= count <= 6, (
-            f"Expected 5-6 hashtags, got {count}: {mock_meta.instagram_hashtags}"
-        )
+    def test_finish_puts_primary_keyword_first(self):
+        meta = _finish_metadata(make_draft(), "video", [], [])
+        assert split_tags(meta.youtube_tags)[0] == "telugu biryani recipe"
 
 
-# ── _trim_tags helper ────────────────────────────────────────────────────────
+# ── Title and description limits ────────────────────────────────────────────
 
-class TestTrimTags:
+class TestTitleAndDescription:
+    def test_shorts_suffix_added_for_video(self):
+        assert _fit_title("Biryani in 60 seconds", shorts=True) == "Biryani in 60 seconds #Shorts"
 
-    def test_short_tags_unchanged(self):
-        tags = "phone drop, tech memes, viral shorts"
-        assert _trim_tags(tags, 450) == tags
+    def test_no_suffix_for_image(self):
+        assert _fit_title("Biryani poster", shorts=False) == "Biryani poster"
 
-    def test_long_tags_trimmed_to_limit(self):
-        long = ", ".join(["tag number " + str(i) for i in range(100)])
-        result = _trim_tags(long, 450)
-        assert len(result) <= 450
+    def test_title_trimmed_to_100_at_a_word(self):
+        title = _fit_title("word " * 40, shorts=True)
+        assert len(title) <= 100 and title.endswith(" #Shorts") and "  " not in title
 
-    def test_trimmed_result_ends_at_full_tag(self):
-        """Result must end at a complete tag, not mid-word."""
-        long = ", ".join(["word" + str(i) for i in range(100)])
-        result = _trim_tags(long, 450)
-        # Should not end with a partial comma
-        assert not result.endswith(",")
+    def test_description_capped_in_bytes(self):
+        telugu = "బిర్యానీ " * 1000  # 3 bytes per letter
+        meta = _finish_metadata(make_draft(youtube_description=telugu), "video", [], [])
+        assert len(meta.youtube_description.encode("utf-8")) <= 5000
+        assert meta.youtube_description.endswith("బిర్యానీ")
 
-    def test_empty_string_unchanged(self):
-        assert _trim_tags("", 450) == ""
+    def test_caption_capped_at_2200(self):
+        meta = _finish_metadata(make_draft(instagram_caption="food " * 1000), "video", [], [])
+        assert len(meta.instagram_caption) <= 2200
 
 
-# ── _validate_instagram_hashtags helper ─────────────────────────────────────
+# ── Instagram hashtags ──────────────────────────────────────────────────────
 
-class TestValidateInstagramHashtags:
+class TestInstagramHashtags:
+    def test_drops_generic_tags_and_caps_at_5(self):
+        result = _finish_metadata(make_draft(), "video", [], []).instagram_hashtags
+        assert result == "#biryani #telugufood #hyderabadibiryani #foodie #homecooking"
 
     def test_adds_missing_hash_prefix(self):
-        result = _validate_instagram_hashtags("phonedrop futuretech")
-        assert "#phonedrop" in result
-        assert "#futuretech" in result
+        assert _validate_instagram_hashtags("phonedrop futuretech") == "#phonedrop #futuretech"
 
-    def test_keeps_existing_hashes(self):
-        result = _validate_instagram_hashtags("#phonedrop #futuretech")
-        assert result.count("#phonedrop") == 1  # no duplication
+    def test_no_duplicates_case_insensitive(self):
+        assert _validate_instagram_hashtags("#Biryani #biryani") == "#Biryani"
 
-    def test_adds_viral_if_missing(self):
-        result = _validate_instagram_hashtags("#phonedrop #futuretech #reels #explorepage")
-        assert "#viral" in result.lower()
+    def test_strips_punctuation(self):
+        assert _validate_instagram_hashtags("#phone-drop! #tech.") == "#phonedrop #tech"
 
-    def test_adds_reels_if_missing(self):
-        result = _validate_instagram_hashtags("#phonedrop #viral #explorepage")
-        assert "#reels" in result.lower()
-
-    def test_adds_explorepage_if_missing(self):
-        result = _validate_instagram_hashtags("#phonedrop #viral #reels")
-        assert "#explorepage" in result.lower()
-
-    def test_caps_at_6_hashtags(self):
-        many = " ".join(["#tag" + str(i) for i in range(20)])
-        result = _validate_instagram_hashtags(many)
-        assert len(result.split()) <= 6
+    def test_keeps_telugu_vowel_signs(self):
+        assert _validate_instagram_hashtags("#తెలుగు") == "#తెలుగు"
 
 
-# ── render_social_metadata output ────────────────────────────────────────────
+# ── Rendering ───────────────────────────────────────────────────────────────
 
 class TestRenderSocialMetadata:
-
-    def test_youtube_section_header_present(self, mock_meta):
+    def test_sections_and_fields_present(self, mock_meta):
         text = render_social_metadata(mock_meta)
-        assert "=== YOUTUBE ===" in text
+        for part in ("=== YOUTUBE ===", "=== INSTAGRAM ===", mock_meta.youtube_title,
+                     mock_meta.youtube_description, mock_meta.youtube_tags,
+                     mock_meta.instagram_caption, mock_meta.instagram_hashtags):
+            assert part in text
 
-    def test_instagram_section_header_present(self, mock_meta):
-        text = render_social_metadata(mock_meta)
-        assert "=== INSTAGRAM ===" in text
+    def test_tag_count_uses_youtube_limit(self, mock_meta):
+        assert f"/{YOUTUBE_TAGS_LIMIT} as YouTube counts them" in render_social_metadata(mock_meta)
 
-    def test_title_in_output(self, mock_meta):
-        text = render_social_metadata(mock_meta)
-        assert mock_meta.youtube_title in text
+    def test_says_when_not_grounded(self, mock_meta):
+        assert "Not grounded in Google Search" in render_social_metadata(mock_meta)
 
-    def test_description_in_output(self, mock_meta):
-        text = render_social_metadata(mock_meta)
-        assert mock_meta.youtube_description in text
+    def test_lists_searches_and_sources_when_grounded(self, mock_meta):
+        meta = mock_meta.model_copy(update={
+            "grounded": True, "search_queries": ["phone drop shorts"],
+            "sources": [{"title": "youtube.com", "uri": "https://example.com/x"}],
+        })
+        text = render_social_metadata(meta)
+        assert "Keywords researched with Google Search (1 searches)" in text
+        assert "phone drop shorts" in text and "https://example.com/x" in text
 
-    def test_tags_in_output(self, mock_meta):
-        text = render_social_metadata(mock_meta)
-        assert mock_meta.youtube_tags in text
-
-    def test_tags_char_count_in_output(self, mock_meta):
-        text = render_social_metadata(mock_meta)
-        assert "/450" in text
-
-    def test_caption_in_output(self, mock_meta):
-        text = render_social_metadata(mock_meta)
-        assert mock_meta.instagram_caption in text
-
-    def test_hashtags_in_output(self, mock_meta):
-        text = render_social_metadata(mock_meta)
-        assert mock_meta.instagram_hashtags in text
-
-
-# ── GeneratedPrompt.full_text includes social section ────────────────────────
 
 class TestGeneratedPromptFullText:
-
-    def test_full_text_includes_social_section(self, mock_generated_prompt):
-        full = mock_generated_prompt.full_text()
-        assert "=== SOCIAL MEDIA METADATA ===" in full
-
-    def test_full_text_includes_youtube(self, mock_generated_prompt):
-        full = mock_generated_prompt.full_text()
-        assert "=== YOUTUBE ===" in full
-
-    def test_full_text_includes_instagram(self, mock_generated_prompt):
-        full = mock_generated_prompt.full_text()
-        assert "=== INSTAGRAM ===" in full
+    def test_full_text_includes_social_section(self, mock_meta):
+        gp = GeneratedPrompt(duration=8, prompt="p", plan={}, saved_to="t.txt",
+                             social_metadata=mock_meta, social_text=render_social_metadata(mock_meta))
+        full = gp.full_text()
+        assert "=== SOCIAL MEDIA METADATA ===" in full and "=== YOUTUBE ===" in full
 
     def test_full_text_without_social_no_section(self):
-        gp = GeneratedPrompt(
-            duration=8, prompt="Test prompt.", plan={},
-            saved_to="test.txt", reference_sheet="",
-        )
-        full = gp.full_text()
-        assert "=== SOCIAL MEDIA METADATA ===" not in full
+        gp = GeneratedPrompt(duration=8, prompt="p", plan={}, saved_to="t.txt")
+        assert "=== SOCIAL MEDIA METADATA ===" not in gp.full_text()
 
-    def test_no_api_calls(self):
-        import recreate_video as rv
-        assert rv._STATE.client is None
+
+# ── generate_metadata against a fake Gemini ─────────────────────────────────
+
+def grounded_response(draft):
+    text = "Here is the metadata you asked for:\n" + draft.model_dump_json() + "\nGood luck!"
+    grounding = SimpleNamespace(
+        web_search_queries=["telugu biryani recipe shorts", "hyderabadi biryani"],
+        grounding_chunks=[
+            SimpleNamespace(web=SimpleNamespace(uri="https://example.com/a", title="youtube.com", domain=None)),
+            SimpleNamespace(web=SimpleNamespace(uri="https://example.com/a", title="youtube.com", domain=None)),
+        ],
+    )
+    return SimpleNamespace(parsed=None, text=text, prompt_feedback=None,
+                           candidates=[SimpleNamespace(finish_reason="STOP", grounding_metadata=grounding)])
+
+
+def search_quota_error():
+    return ClientError(429, {"error": {
+        "code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded.",
+        "details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [
+            {"quotaId": "SearchGroundingRequestsPerDayPerProject-FreeTier", "quotaValue": "500"}]}],
+    }})
+
+
+class TestGenerateMetadata:
+    @pytest.fixture
+    def fake(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rv, "CONFIG", dataclasses.replace(rv.CONFIG, work_dir=tmp_path, task_models={
+            **rv.CONFIG.task_models, "metadata": ("gemini-2.5-flash-lite", "gemini-3.5-flash-lite"),
+        }))
+        monkeypatch.setattr(rv._STATE, "quota", None)
+        monkeypatch.setattr(rv, "_throttle", lambda: None)
+        calls = []
+        replies = []
+
+        def generate_content(model, contents, config):
+            calls.append({"model": model, "search": bool(config.tools), "schema": config.response_schema,
+                          "prompt": contents[0]})
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        monkeypatch.setattr(rv, "get_client", lambda: SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate_content)))
+        return calls, replies
+
+    def test_grounded_on_free_search_model(self, fake):
+        calls, replies = fake
+        replies.append(grounded_response(make_draft()))
+        meta = rv.generate_metadata("Content: biryani", "video", "Telugu")
+        assert calls[0]["search"] and calls[0]["schema"] is None
+        assert "use Google Search" in calls[0]["prompt"] and "Tenglish" in calls[0]["prompt"]
+        assert meta.grounded and meta.search_queries == ["telugu biryani recipe shorts", "hyderabadi biryani"]
+        assert meta.sources == [{"title": "youtube.com", "uri": "https://example.com/a"}]
+        assert meta.youtube_title.endswith("#Shorts")
+
+    def test_search_quota_falls_back_without_search_on_same_model(self, fake):
+        calls, replies = fake
+        replies += [search_quota_error(), SimpleNamespace(parsed=make_draft())]
+        meta = rv.generate_metadata("Content: biryani", "video", "English")
+        assert [(c["model"], c["search"]) for c in calls] == [
+            ("gemini-2.5-flash-lite", True), ("gemini-2.5-flash-lite", False)]
+        assert calls[1]["schema"] is SocialMetadataDraft
+        assert not meta.grounded
+        assert rv._search_used_up() and rv._unavailable_models() == {}
+
+    def test_skips_search_once_used_up_today(self, fake):
+        calls, replies = fake
+        rv._mark_search_used_up()
+        replies.append(SimpleNamespace(parsed=make_draft()))
+        rv.generate_metadata("Content: biryani", "image", "English")
+        assert calls[0]["search"] is False
+
+    def test_no_search_on_model_without_free_search(self, fake):
+        calls, replies = fake
+        rv._mark_unavailable("gemini-2.5-flash-lite", "daily free quota used up")
+        replies.append(SimpleNamespace(parsed=make_draft()))
+        meta = rv.generate_metadata("Content: poster", "image", "English")
+        assert calls[0]["model"] == "gemini-3.5-flash-lite" and calls[0]["search"] is False
+        assert not meta.youtube_title.endswith("#Shorts")

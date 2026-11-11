@@ -40,11 +40,14 @@ import sys
 import threading
 import time
 import types
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -63,7 +66,16 @@ def _inject_streamlit_secrets() -> None:
         if get_script_run_ctx() is None:
             return
         secrets = _st.secrets
-        for key in ("GEMINI_API_KEY", "COOKIES_FILE", "DOWNLOAD_PROXY"):
+        # Without a secrets.toml, `key in st.secrets` draws an st.error on the
+        # page, which then breaks st.set_page_config(). Check quietly first.
+        load_quietly = getattr(secrets, "load_if_toml_exists", None)
+        if load_quietly is not None and not load_quietly():
+            return
+        for key in (
+            "GEMINI_API_KEY", "COOKIES_FILE", "DOWNLOAD_PROXY", "GEMINI_RPM",
+            "GEMINI_ANALYSIS_MODELS", "GEMINI_TEXT_MODELS", "GEMINI_METADATA_MODELS",
+            "DIALOGUE_SCRIPT", "METADATA_LANGUAGE",
+        ):
             if key in secrets and not os.environ.get(key):
                 os.environ[key] = str(secrets[key])
 
@@ -110,11 +122,52 @@ def _env_list(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
 
 
+try:
+    _PACIFIC: Any = ZoneInfo("America/Los_Angeles")
+except ZoneInfoNotFoundError:  # Windows without the tzdata package
+    _PACIFIC = timezone(timedelta(hours=-8))
+
+
+def _pacific_now() -> datetime:
+    """Gemini's daily quotas reset at midnight Pacific time."""
+    return datetime.now(_PACIFIC)
+
+
+def _seconds_until_quota_reset() -> int:
+    now = _pacific_now()
+    midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=now.tzinfo)
+    return max(0, int((midnight - now).total_seconds()))
+
+
+# Models the Gemini API free tier serves at no cost (AI Studio pricing page,
+# Nov 2026). Paid-only models such as gemini-3.8-flash are deliberately not
+# here: a free-tier key only gets "limit: 0" errors from them. Add a model
+# only once the pricing page lists it as "Free of charge" on the free tier.
+FREE_TIER_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite"})
+
+# Shutdown dates from the deprecations page. From that date the model is
+# dropped from every chain: Google routes its requests to another model, so
+# keeping it would only spend that other model's quota twice.
+MODEL_SHUTDOWN = {"gemini-2.5-flash": date(2026, 12, 1)}
+
+# Which models each kind of Gemini call tries, in order. Spreading the steps
+# of one run over different models stretches the per-model daily quotas.
+#   analysis: watches the video / looks at the image (needs the best vision)
+#   text:     writes the recreation prompt from the analysis JSON
+#   metadata: writes the YouTube / Instagram metadata
+TASK_MODEL_ENV = {
+    "analysis": ("GEMINI_ANALYSIS_MODELS", "gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
+    "text": ("GEMINI_TEXT_MODELS", "gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
+    "metadata": ("GEMINI_METADATA_MODELS", "gemini-2.5-flash-lite,gemini-3.5-flash-lite"),
+}
+
+
 @dataclass(frozen=True)
 class Config:
     api_key: str = os.getenv("GEMINI_API_KEY", "").strip()
-    model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    fallback_models: tuple[str, ...] = tuple(_env_list("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite"))
+    task_models: dict[str, tuple[str, ...]] = field(default_factory=lambda: {
+        task: tuple(_env_list(env_name, default)) for task, (env_name, default) in TASK_MODEL_ENV.items()
+    })
     rpm: int = max(1, _env_int("GEMINI_RPM", 8))
     max_wait_seconds: int = max(30, _env_int("RATE_LIMIT_MAX_WAIT_SECONDS", 900))
     max_video_seconds: int = _env_int("MAX_VIDEO_SECONDS", 60)
@@ -131,10 +184,25 @@ class Config:
     # The free tier can only produce text, so the video/image prompts ARE the
     # output. true: show them on screen; false: only save + offer download.
     show_prompt: bool = os.getenv("SHOW_PROMPT", "true").strip().lower() not in {"false", "0", "no", "off"}
+    # How dialogue is written in the video prompt: "native" (Telugu script,
+    # Devanagari, ...) or "romanized" (Latin letters), for generators that
+    # pronounce one better than the other.
+    dialogue_script: str = os.getenv("DIALOGUE_SCRIPT", "native").strip().lower()
+    # Language of the YouTube / Instagram metadata for non-English content:
+    # "auto" (English mixed with romanized Telugu/Hindi, as viewers search),
+    # "english" or "native".
+    metadata_language: str = os.getenv("METADATA_LANGUAGE", "auto").strip().lower()
 
-    @property
-    def models(self) -> list[str]:
-        return [self.model, *[m for m in self.fallback_models if m != self.model]]
+    def models_for(self, task: str) -> list[str]:
+        """The model chain for one kind of call, minus models already shut down."""
+        today = _pacific_now().date()
+        return [
+            model for model in dict.fromkeys(self.task_models[task])
+            if model not in MODEL_SHUTDOWN or today < MODEL_SHUTDOWN[model]
+        ]
+
+    def all_models(self) -> list[str]:
+        return list(dict.fromkeys(model for task in self.task_models for model in self.models_for(task)))
 
     def problems(self) -> list[str]:
         issues = []
@@ -143,12 +211,28 @@ class Config:
                 "GEMINI_API_KEY is not set. "
                 "Add it to .env (local) or App Settings → Secrets (Streamlit Cloud)."
             )
+        for task, (env_name, _) in TASK_MODEL_ENV.items():
+            paid = [model for model in self.task_models[task] if model not in FREE_TIER_MODELS]
+            if paid:
+                issues.append(
+                    f"{env_name} lists {', '.join(paid)}, which the Gemini free tier does not offer. "
+                    f"Free-tier models: {', '.join(sorted(FREE_TIER_MODELS))}."
+                )
+            elif not self.models_for(task):
+                issues.append(f"Every model in {env_name} has been shut down -- add a current free-tier model.")
         if self.cookies_file and not Path(self.cookies_file).is_file():
             issues.append(f"COOKIES_FILE points to a missing file: {self.cookies_file}")
         return issues
 
 
 CONFIG = Config()
+
+for _legacy in ("GEMINI_MODEL", "GEMINI_FALLBACK_MODELS"):
+    if os.getenv(_legacy, "").strip():
+        logger.warning(
+            f"[CONFIG] {_legacy} is no longer used -- set GEMINI_ANALYSIS_MODELS, "
+            "GEMINI_TEXT_MODELS and GEMINI_METADATA_MODELS instead (see .env.example)."
+        )
 
 
 # ============================================================================
@@ -363,6 +447,9 @@ if _STATE is None:
     _STATE.last_call = 0.0
     _STATE.client = None
     sys.modules["_recreate_video_state"] = _STATE
+if not hasattr(_STATE, "quota_lock"):  # stash created by an older version of this file
+    _STATE.quota_lock = threading.Lock()
+    _STATE.quota = None
 
 
 def get_client():
@@ -397,7 +484,90 @@ class GeminiCallError(RuntimeError):
 
 
 class QuotaExhaustedError(RuntimeError):
-    """Every configured model has used up its daily free-tier quota."""
+    """Every model in a step's chain is used up (or unusable) for today."""
+
+
+# ── Daily free-tier quota memory ────────────────────────────────────────────
+# Which models are used up today, plus this app's call count per model. Shared
+# by every session through _STATE and kept on disk, so neither a new session,
+# a restart nor the CLI re-spends a request on a model that is already out.
+# The record is dropped when the Pacific date changes (= Google's reset).
+
+def _quota_state_path() -> Path:
+    return CONFIG.work_dir / "cache" / "quota_state.json"
+
+
+def _quota_state() -> dict:
+    """Today's record. Call with _STATE.quota_lock held."""
+    today = _pacific_now().date().isoformat()
+    state = _STATE.quota
+    if state is None:
+        try:
+            state = json.loads(_quota_state_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+    if not isinstance(state, dict) or state.get("day") != today:
+        state = {"day": today, "calls": {}, "unavailable": {}}
+    _STATE.quota = state
+    return state
+
+
+def _save_quota_state(state: dict) -> None:
+    try:
+        _quota_state_path().parent.mkdir(parents=True, exist_ok=True)
+        _quota_state_path().write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"[QUOTA] could not save quota state: {exc}")
+
+
+def _record_call(model: str) -> None:
+    with _STATE.quota_lock:
+        state = _quota_state()
+        state["calls"][model] = state["calls"].get(model, 0) + 1
+        _save_quota_state(state)
+
+
+def _mark_unavailable(model: str, reason: str) -> None:
+    with _STATE.quota_lock:
+        state = _quota_state()
+        state["unavailable"][model] = reason
+        _save_quota_state(state)
+
+
+def _unavailable_models() -> dict[str, str]:
+    with _STATE.quota_lock:
+        return dict(_quota_state()["unavailable"])
+
+
+def _search_used_up() -> bool:
+    """Today's free Google Search grounding quota is spent. Tracked apart from
+    the models: the model itself still answers without search."""
+    with _STATE.quota_lock:
+        return bool(_quota_state().get("search_used_up"))
+
+
+def _mark_search_used_up() -> None:
+    with _STATE.quota_lock:
+        state = _quota_state()
+        state["search_used_up"] = True
+        _save_quota_state(state)
+
+
+def quota_snapshot() -> dict:
+    """For the UI: today's calls and unusable models, and time to the reset."""
+    with _STATE.quota_lock:
+        state = _quota_state()
+        return {
+            "calls": dict(state["calls"]),
+            "unavailable": dict(state["unavailable"]),
+            "search_used_up": bool(state.get("search_used_up")),
+            "reset_in_seconds": _seconds_until_quota_reset(),
+        }
+
+
+def _format_reset_wait() -> str:
+    hours, minutes = divmod(_seconds_until_quota_reset() // 60, 60)
+    return f"{hours}h {minutes}m"
 
 
 class _RetryableResponse(RuntimeError):
@@ -423,9 +593,34 @@ def _error_code(exc: Exception) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _error_details(exc: Exception) -> list[dict]:
+    """The google.rpc detail objects (QuotaFailure, RetryInfo, ...) of a Gemini
+    API error. google-genai keeps the whole response body in exc.details."""
+    payload = getattr(exc, "details", None)
+    if isinstance(payload, dict):
+        body = payload.get("error", payload)
+        payload = body.get("details") if isinstance(body, dict) else None
+    return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+
+def _quota_violations(exc: Exception) -> list[dict]:
+    return [
+        violation
+        for detail in _error_details(exc)
+        if str(detail.get("@type", "")).endswith("QuotaFailure")
+        for violation in detail.get("violations") or []
+        if isinstance(violation, dict)
+    ]
+
+
 def _retry_delay_seconds(exc: Exception) -> float | None:
     """Google's 429 body carries a RetryInfo detail ("retryDelay": "37s") and
     usually also says "Please retry in 37.2s" in the message."""
+    for detail in _error_details(exc):
+        if str(detail.get("@type", "")).endswith("RetryInfo"):
+            match = re.match(r"(\d+(?:\.\d+)?)s", str(detail.get("retryDelay", "")))
+            if match:
+                return float(match.group(1))
     text = str(getattr(exc, "details", "") or "") + " " + str(exc)
     for pattern in (
         r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s",
@@ -438,8 +633,51 @@ def _retry_delay_seconds(exc: Exception) -> float | None:
 
 
 def _is_daily_quota(exc: Exception) -> bool:
+    """quotaId is e.g. "GenerateRequestsPerDayPerProjectPerModel-FreeTier".
+    The message text is only checked when the error carries no QuotaFailure."""
+    violations = _quota_violations(exc)
+    if violations:
+        return any("perday" in str(v.get("quotaId", "")).lower() for v in violations)
     text = str(getattr(exc, "details", "") or "") + " " + str(exc)
     return bool(re.search(r"per ?day", text, flags=re.IGNORECASE))
+
+
+def _is_not_on_free_tier(exc: Exception) -> bool:
+    """A quota of 0 means this key's tier has no access to the model at all."""
+    if any(str(v.get("quotaValue", "")).strip() == "0" for v in _quota_violations(exc)):
+        return True
+    return bool(re.search(r"\blimit:\s*0\b", str(exc)))
+
+
+def _is_search_quota(exc: Exception) -> bool:
+    """A 429 about the Google Search grounding quota, not the model's own."""
+    if _classify(exc) != "rate":
+        return False
+    violations = _quota_violations(exc)
+    if violations:
+        return any(
+            word in f"{v.get('quotaId', '')} {v.get('quotaMetric', '')}".lower()
+            for v in violations for word in ("search", "grounding")
+        )
+    return "grounding" in str(exc).lower()
+
+
+def _is_model_missing(exc: Exception) -> bool:
+    """404 "models/... is not found": renamed, retired or never existed."""
+    return _error_code(exc) == 404
+
+
+def _unusable_reason(exc: Exception) -> str | None:
+    """Why a model cannot serve any more requests today, or None if waiting
+    and retrying the same model can still work."""
+    if _classify(exc) == "rate":
+        if _is_not_on_free_tier(exc):
+            return "not available on the free tier"
+        if _is_daily_quota(exc):
+            return "daily free quota used up"
+    elif _is_model_missing(exc):
+        return "model not found"
+    return None
 
 
 def _classify(exc: Exception) -> str:
@@ -482,57 +720,74 @@ def call_gemini(
     fn: Callable[[str], T],
     notify: Notify = _noop_notify,
     *,
+    task: str | None,
     label: str = "Gemini",
     throttle: bool = True,
 ) -> T:
-    """Runs fn(model_name) until it succeeds.
+    """Runs fn(model_name) until it succeeds, walking the free-tier model
+    chain of `task` ("analysis", "text" or "metadata", see TASK_MODEL_ENV).
 
+    - Models already known to be unusable today are skipped without sending
+      a request. That memory is shared by all sessions and lasts until the
+      daily reset at midnight Pacific.
+    - 429 per-day limit, 429 "limit: 0" (model not on the free tier) or model
+      not found: waiting cannot help, so mark the model unusable and move to
+      the next one; QuotaExhaustedError once the chain is empty.
     - 429 per-minute limits: wait Google's retryDelay (or 5/10/20/40/60 s
       backoff) and retry the same model, until RATE_LIMIT_MAX_WAIT_SECONDS.
-    - 429 per-day limits: waiting cannot help, so switch to the next model
-      in GEMINI_FALLBACK_MODELS; QuotaExhaustedError once all are spent.
     - 5xx/overloaded/timeout: backoff on the same model, moving to the next
       model after 3 consecutive failures (free-tier 503 "high demand" spells
       often last minutes, and each failed call can itself take ~90 s).
     - Anything else (bad key, bad request, safety block): GeminiCallError now.
+
+    task=None is for Files API calls: they use no model and no daily quota,
+    so fn gets "" and only the per-minute / transient handling applies.
     """
-    models = CONFIG.models
-    index = 0
+    chain = CONFIG.models_for(task) if task else [""]
+    passed_over: set[str] = set()  # transient failures: skipped for this call only
+    current = None
     failures_on_model = 0
     deadline = time.monotonic() + CONFIG.max_wait_seconds
 
     while True:
-        model = models[index]
+        unusable = _unavailable_models() if task else {}
+        candidates = [m for m in chain if m not in unusable and m not in passed_over]
+        if not candidates:
+            details = "; ".join(f"{m}: {unusable.get(m, 'unavailable')}" for m in chain)
+            raise QuotaExhaustedError(
+                f"No free-tier Gemini model is left for this step today ({details}). "
+                f"The free quota resets at midnight Pacific time, in about {_format_reset_wait()}."
+            )
+        model = candidates[0]
+        if model != current:
+            if current is not None:
+                notify(f"Switching to {model}")
+            current = model
+            failures_on_model = 0
         if throttle:
             _throttle()
+        if task:
+            _record_call(model)
         try:
             return fn(model)
         except (GeminiCallError, QuotaExhaustedError):
             raise
         except Exception as exc:
             kind = _classify(exc)
+            reason = _unusable_reason(exc) if task else None
+            if reason:
+                logger.warning(f"[GEMINI] {label} model={model} {reason}: {exc}")
+                _mark_unavailable(model, reason)
+                notify(f"{model}: {reason}")
+                continue
             if kind == "fatal":
                 logger.error(f"[GEMINI] {label} model={model} fatal: {exc}")
                 raise GeminiCallError(_readable_error(exc)) from exc
 
-            if kind == "rate" and _is_daily_quota(exc):
-                logger.warning(f"[GEMINI] {label} model={model} daily quota exhausted")
-                if index + 1 < len(models):
-                    index += 1
-                    failures_on_model = 0
-                    notify(f"Daily free quota used up on {model}, switching to {models[index]}")
-                    continue
-                raise QuotaExhaustedError(
-                    "The daily free-tier Gemini quota is used up for every configured model "
-                    f"({', '.join(models)}). It resets at midnight Pacific time -- try again "
-                    "then, or add another model to GEMINI_FALLBACK_MODELS."
-                ) from exc
-
             failures_on_model += 1
-            if kind == "transient" and failures_on_model > 2 and index + 1 < len(models):
-                logger.warning(f"[GEMINI] {label} model={model} keeps failing, switching to {models[index + 1]}")
-                index += 1
-                failures_on_model = 0
+            if kind == "transient" and failures_on_model > 2 and len(candidates) > 1:
+                logger.warning(f"[GEMINI] {label} model={model} keeps failing, switching to {candidates[1]}")
+                passed_over.add(model)
                 continue
 
             delay = _retry_delay_seconds(exc) if kind == "rate" else None
@@ -546,13 +801,13 @@ def call_gemini(
                     f"{CONFIG.max_wait_seconds}s. Try again in a few minutes, or raise "
                     "RATE_LIMIT_MAX_WAIT_SECONDS."
                 ) from exc
-            reason = (
+            wait_reason = (
                 f"Free-tier rate limit hit on {model}"
                 if kind == "rate"
                 else f"Gemini busy/unavailable on {model}"
             )
             logger.warning(f"[GEMINI] {label} model={model} {kind} failure, waiting {delay:.1f}s: {exc}")
-            _wait_with_countdown(delay, reason, notify)
+            _wait_with_countdown(delay, wait_reason, notify)
 
 
 def _parse_structured(response: Any, schema: type[BaseModel]) -> BaseModel:
@@ -903,16 +1158,33 @@ class SourceScene(BaseModel):
     subject_movement: str
     transition_out: str = Field(description="How this scene ends/cuts to the next: hard cut, jump cut, match cut, fade, whip, none.")
     on_screen_text: str = Field(description="Any captions/titles/text overlays and their placement, or empty.")
-    audio: str = Field(description="What is heard in this scene: speech (paraphrased), music, sound effects.")
+    audio: str = Field(description="What is heard in this scene: who speaks (the words are in audio.transcript), music, sound effects.")
+
+
+class Utterance(BaseModel):
+    start_seconds: float
+    end_seconds: float
+    speaker: str = Field(description="Who speaks, using the same visual label as in `characters`, or 'narrator (off-screen)'.")
+    text: str = Field(
+        description="Exactly what is said, word for word, in the language actually spoken and in that "
+                    "language's own script (Telugu in Telugu script, Hindi in Devanagari). Never translated. "
+                    "Code-mixed speech (e.g. Telugu with English words) is kept exactly as spoken."
+    )
+    romanized: str = Field(description="The same words transliterated into Latin letters (identical to `text` for English).")
+    english: str = Field(description="English translation, for the user to read only.")
 
 
 class AudioProfile(BaseModel):
     has_speech: bool
-    spoken_language: str = Field(description="Language(s) spoken, or 'none'.")
-    speech_summary: str = Field(description="What is said, paraphrased (who speaks, tone, key lines). Empty if no speech.")
+    spoken_language: str = Field(description="Main spoken language as an English name, e.g. 'Telugu', 'Hindi', 'English', or 'none'.")
+    speech_summary: str = Field(description="Who speaks, tone and what the speech is about. Empty if no speech.")
     voice_character: str = Field(description="Voice type and delivery, e.g. 'excited child voice', 'calm male narrator', 'none'.")
-    music: str = Field(description="Music genre, tempo, energy, instruments, or 'none'.")
+    music: str = Field(description="Music genre, tempo, energy, instruments, or 'none'. Describe sung lyrics here; do not transcribe them.")
     sound_effects: str
+    transcript: list[Utterance] = Field(
+        description="Every spoken line in order, one entry per sentence or speaker turn, covering all speech "
+                    "from start to end. Empty if there is no speech. Sung lyrics are not included."
+    )
 
 
 class VideoAnalysis(BaseModel):
@@ -951,7 +1223,11 @@ def _analysis_prompt(media: MediaInfo) -> str:
         "scene times must cover 0 to the end without gaps.\n"
         "- Describe only what is actually seen and heard. Do not invent dialogue or sounds.\n"
         "- Never identify real people by name; describe them by appearance only.\n"
-        "- Paraphrase speech and lyrics instead of transcribing them word for word.\n"
+        "- SPEECH: transcribe every spoken line into audio.transcript word for word, with start/end "
+        "times. Write it in the language actually spoken and in that language's own script -- "
+        "do NOT translate it into English, do not summarise, and do not skip short or filler words. "
+        "Keep code-mixed speech exactly as spoken.\n"
+        "- Song lyrics are not speech: describe the song in audio.music instead of transcribing it.\n"
         "- Ignore platform UI and watermarks (TikTok/Instagram/YouTube logos, usernames, "
         "like buttons) -- they are not part of the content.\n"
         "Return JSON matching the schema."
@@ -968,6 +1244,7 @@ def _upload_and_wait(path: Path, notify: Notify):
             config=genai_types.UploadFileConfig(mime_type="video/mp4", display_name=path.name),
         ),
         notify,
+        task=None,
         label="upload",
         throttle=False,
     )
@@ -985,6 +1262,7 @@ def _upload_and_wait(path: Path, notify: Notify):
         uploaded = call_gemini(
             lambda _model: client.files.get(name=uploaded.name),
             notify,
+            task=None,
             label="file-status",
             throttle=False,
         )
@@ -1052,7 +1330,7 @@ def analyze_video(path: Path, media: MediaInfo, notify: Notify = _noop_notify) -
             )
             return _parse_structured(response, VideoAnalysis)
 
-        analysis = call_gemini(run, notify, label="analyze")
+        analysis = call_gemini(run, notify, task="analysis", label="analyze")
         logger.info(
             f"[ANALYZE] ok content_type={analysis.content_type} medium={analysis.visual_medium} "
             f"scenes={len(analysis.scenes)}"
@@ -1081,8 +1359,13 @@ class PromptBeat(BaseModel):
     visual: str = Field(description="What is on screen: subjects, composition, setting, framing.")
     action: str = Field(description="What happens during this beat, in order.")
     camera: str = Field(description="Shot type + camera movement.")
-    audio: str = Field(description="Speech (short, paraphrased), music, sound effects for this beat, or 'none'.")
+    audio: str = Field(description="Music and sound effects for this beat, or 'none'. Never dialogue -- that goes in dialogue_line_ids.")
     on_screen_text: str = Field(description="Short text overlay ONLY if the source relies on it (max ~5 words), else empty.")
+    dialogue_line_ids: list[int] = Field(
+        default_factory=list,
+        description="Numbers of the transcript lines (L1 = 1, L2 = 2, ...) spoken during this beat, in order. "
+                    "Empty if nobody speaks in this beat.",
+    )
 
 
 class ReferenceImage(BaseModel):
@@ -1108,49 +1391,33 @@ class RecreationPlan(BaseModel):
 
 
 
-class SocialMetadata(BaseModel):
-    """YouTube and Instagram ready-to-paste viral metadata for the recreated video."""
+class SocialMetadataDraft(BaseModel):
+    """What Gemini writes; _finish_metadata turns it into SocialMetadata."""
 
-    youtube_title: str = Field(
-        description=(
-            "YouTube Shorts title under 65 characters so it is NEVER truncated on mobile. "
-            "Front-load the curiosity hook in the first 3-5 words, include 1 emotional emoji, and end with #Shorts. "
-            "Example: 'Nobody Expected This In 2070 😳 #Shorts'"
-        )
+    primary_keyword: str = Field(description="The one search phrase most viewers would type to find this content.")
+    search_insights: str = Field(
+        description="2-4 sentences: what people search for on this topic and what top-performing titles look like."
     )
-    youtube_description: str = Field(
-        description=(
-            "YouTube description. Rich SEO structure under 400 characters: "
-            "Line 1: Hook sentence featuring the primary search keyword. "
-            "Lines 2-3: 2-3 conversational sentences with natural semantic keywords explaining the clip. "
-            "Line 4: Engagement CTA ('Subscribe for daily [topic]! What would you do? Comment below 👇'). "
-            "Line 5: Exactly 3 hashtags (e.g. '#Shorts #NicheTag1 #NicheTag2')."
-        )
-    )
-    youtube_tags: str = Field(
-        description=(
-            "Comma-separated YouTube tags. TOTAL string length MUST be under 450 characters (YouTube allows 500 max). "
-            "6-10 targeted tags: exact query keyword first, common search terms, niche audience, and 2 broad category tags. "
-            "NO # symbols in tags. Each tag 2-4 words max."
-        )
-    )
-    instagram_caption: str = Field(
-        description=(
-            "Instagram viral caption formatted with line breaks into 3 distinct sections: "
-            "1. Micro-Hook (Line 1, under 120 chars before '...more' fold): Bold, relatable or shocked reaction with 1-2 emojis. "
-            "2. Context/Story (Lines 2-3): 2-3 short conversational sentences embedding high-traffic search keywords (for Instagram SEO). "
-            "3. High-converting CTA (Line 4): Explicit trigger for Shares or Saves (the #1 ranking signals on Reels!). "
-            "Example: 'Send this to someone who does this 😭' or 'Save this for later 📌'."
-        )
-    )
-    instagram_hashtags: str = Field(
-        description=(
-            "Space-separated hashtags, ALL starting with #. "
-            "2-3 niche tags relevant specifically to this video's content/topic, "
-            "plus #viral #reels #explorepage. Total 5-6 hashtags. "
-            "Example: '#phonedrop #futuretech #techfail #viral #reels #explorepage'"
-        )
-    )
+    youtube_title: str = Field(description="YouTube title, max 100 characters.")
+    youtube_description: str = Field(description="YouTube description, 1000-2000 characters.")
+    youtube_tags: list[str] = Field(description="30-40 YouTube tags, best first, no '#'.")
+    instagram_caption: str = Field(description="Instagram caption without hashtags.")
+    instagram_hashtags: list[str] = Field(description="Exactly 5 niche Instagram hashtags, best first.")
+
+
+class SocialMetadata(BaseModel):
+    """Ready-to-paste YouTube and Instagram metadata, already fitted to each
+    platform's limits."""
+
+    youtube_title: str
+    youtube_description: str
+    youtube_tags: str  # comma-separated, within YouTube's 500-character tag limit
+    instagram_caption: str
+    instagram_hashtags: str  # space-separated
+    primary_keyword: str = ""
+    grounded: bool = False  # True when Gemini actually ran Google searches for it
+    search_queries: list[str] = Field(default_factory=list)
+    sources: list[dict[str, str]] = Field(default_factory=list)  # {"title", "uri"}
 
 
 # How each reference purpose is attached to a video generator. Kept in code
@@ -1186,6 +1453,46 @@ def beats_for_duration(seconds: int, scene_count: int = 0) -> int:
         density = max(base, min(seconds, (scene_count + 2) // 3))
         return density
     return base
+
+
+def _speech_seconds(lines: list[Utterance]) -> float:
+    return sum(max(0.0, line.end_seconds - line.start_seconds) for line in lines)
+
+
+def _dialogue_rules(analysis: VideoAnalysis, duration: int) -> str:
+    """Plan-prompt section for speech. Gemini only picks which transcript
+    lines go in which beat; render_prompt inserts the original words, so the
+    dialogue can never be translated, reworded or shortened."""
+    lines = analysis.audio.transcript
+    if not lines:
+        return ""
+    language = analysis.audio.spoken_language.strip() or "the original language"
+    speech = _speech_seconds(lines)
+    if speech <= duration:
+        coverage = f"- All {len(lines)} lines fit in {duration}s: you MUST use every line."
+    else:
+        coverage = (
+            f"- The speech ({speech:.1f}s) is longer than {duration}s: keep the lines that carry the "
+            "story and the punchline, in order, and leave out the rest."
+        )
+    rows = "\n".join(
+        f"  L{number} [{line.start_seconds:.1f}s-{line.end_seconds:.1f}s, "
+        f"{max(0.0, line.end_seconds - line.start_seconds):.1f}s] {line.speaker}: "
+        f"\"{line.text.strip()}\" (meaning: {line.english.strip()})"
+        for number, line in enumerate(lines, start=1)
+    )
+    return (
+        f"=== DIALOGUE (spoken language: {language}) ===\n"
+        f"- The source speech is listed below as L1-L{len(lines)} ({speech:.1f}s of speech in total).\n"
+        "- Do NOT write dialogue yourself. For each beat, put the numbers of the lines spoken in it "
+        "in dialogue_line_ids; the original words are inserted later exactly as transcribed.\n"
+        "- Use line numbers in increasing order across the beats, each line at most once.\n"
+        f"{coverage}\n"
+        "- Give every beat at least as many seconds as its lines took in the source.\n"
+        "- If the source speaks from its first second, Beat 1 may carry L1 and need not be silent.\n"
+        "- The beat `audio` field is for music and sound effects only.\n"
+        f"{rows}\n\n"
+    )
 
 
 def _plan_prompt(analysis: VideoAnalysis, media: MediaInfo, duration: int, beat_count: int) -> str:
@@ -1260,9 +1567,11 @@ def _plan_prompt(analysis: VideoAnalysis, media: MediaInfo, duration: int, beat_
         "'0.0s: knife impact; 0.3s: chicken slide; 0.8s: whoosh transition'.\n"
         "- Preserve the source audio character (ASMR, SFX, voice, music genre).\n\n"
 
+        f"{_dialogue_rules(analysis, duration)}"
+
         "=== CHARACTER & REFERENCE RULES ===\n"
         "- Describe each character once in `characters`; reuse those exact words in every beat.\n"
-        "- Speech: paraphrase only -- never copy lyrics or lines verbatim. ~2.5 words/second.\n"
+        "- Song lyrics: describe the song, never copy lyrics.\n"
         "- reference_images: 0-3 images. 'character' for recurring characters (max 2), "
         "'first_frame' when opening composition matters, 'object' for a key prop. "
         "Number REF_1, REF_2... and cite as [REF_n] inside beat text.\n"
@@ -1323,17 +1632,36 @@ _GLOBAL_AVOID = [
 ]
 
 
-def render_prompt(plan: RecreationPlan, media: MediaInfo, duration: int) -> str:
+def _is_english(language: str) -> bool:
+    return language.strip().lower() in {"", "english", "en", "none"}
+
+
+def _dialogue_line(line: Utterance, language: str) -> str:
+    words = line.romanized if CONFIG.dialogue_script == "romanized" and line.romanized.strip() else line.text
+    spoken_in = "" if _is_english(language) else f" in {language}"
+    return f"Dialogue: {line.speaker.strip()} says{spoken_in}: \"{words.strip()}\""
+
+
+def render_prompt(
+    plan: RecreationPlan,
+    media: MediaInfo,
+    duration: int,
+    audio: AudioProfile | None = None,
+) -> str:
     """Render the final text prompt that gets pasted into a video generator.
 
     Improvements over original:
     - SOCIAL MEDIA OPTIMISED header block so the model knows context.
     - Scene 1 annotated as HOOK with sound-off and full-energy instructions.
     - _GLOBAL_AVOID prepended before video-specific avoids to kill zoom bias.
+    - With the source `audio`, each beat's transcript lines are written out
+      word for word in the spoken language, plus a language + voice header.
     """
     orientation = {"9:16": "vertical", "3:4": "vertical", "4:5": "vertical", "1:1": "square"}.get(
         media.aspect_ratio, "horizontal"
     )
+    transcript = audio.transcript if audio else []
+    language = audio.spoken_language.strip() if audio else ""
     lines = [
         f"Create one {duration}-second {orientation} {media.aspect_ratio} video. {plan.logline.strip()}",
         "",
@@ -1343,6 +1671,17 @@ def render_prompt(plan: RecreationPlan, media: MediaInfo, duration: int) -> str:
         "- No fade-in at the very start; begin on the first frame at full energy.",
         "",
     ]
+    if transcript:
+        spoken = "English" if _is_english(language) else language
+        lines += [
+            "SPOKEN LANGUAGE AND VOICE",
+            f"- All dialogue is spoken in {spoken}, word for word exactly as written in the Dialogue lines. "
+            "Do not translate, shorten, reword or skip any of it"
+            + ("." if _is_english(language) else ", and do not switch to English."),
+        ]
+        if audio.voice_character.strip() and audio.voice_character.strip().lower() != "none":
+            lines.append(f"- Voice: {audio.voice_character.strip()}.")
+        lines.append("")
     if plan.reference_images:
         lines.append("REFERENCE IMAGES (attached)")
         for ref in plan.reference_images:
@@ -1369,9 +1708,10 @@ def render_prompt(plan: RecreationPlan, media: MediaInfo, duration: int) -> str:
             # Enforce hook label and sound-off annotation on the first beat.
             if "HOOK" not in label:
                 label = f"HOOK -- {label}"
+            sound_note = "" if beat.dialogue_line_ids else "works sound-OFF, "
             scene_header = (
                 f"Scene {number} ({_fmt_seconds(cursor)}-{_fmt_seconds(end)} sec) - {label}"
-                "  [scroll-stopper: works sound-OFF, starts at full energy, no fade-in]"
+                f"  [scroll-stopper: {sound_note}starts at full energy, no fade-in]"
             )
         else:
             scene_header = f"Scene {number} ({_fmt_seconds(cursor)}-{_fmt_seconds(end)} sec) - {label}"
@@ -1381,6 +1721,9 @@ def render_prompt(plan: RecreationPlan, media: MediaInfo, duration: int) -> str:
         lines.append(f"Camera: {beat.camera.strip()}")
         if beat.audio.strip():
             lines.append(f"Audio: {beat.audio.strip()}")
+        for line_id in beat.dialogue_line_ids:
+            if 1 <= line_id <= len(transcript):
+                lines.append(_dialogue_line(transcript[line_id - 1], language))
         if beat.on_screen_text.strip():
             lines.append(f"On-screen text: \"{beat.on_screen_text.strip()}\"")
         lines.append("")
@@ -1391,6 +1734,10 @@ def render_prompt(plan: RecreationPlan, media: MediaInfo, duration: int) -> str:
 
     # Global avoids first (suppress model defaults), then video-specific.
     avoid = list(_GLOBAL_AVOID) + [item.strip() for item in plan.avoid if item.strip()]
+    if transcript:
+        avoid.append("Translating, rewording, shortening or skipping any dialogue line")
+        if not _is_english(language):
+            avoid.append(f"Any spoken language other than {language}; no English voice-over")
     avoid.append("watermarks, platform UI, or logos")
     lines += ["AVOID", *[f"- {item}" for item in dict.fromkeys(avoid)], ""]
     lines.append(
@@ -1466,6 +1813,45 @@ def render_reference_sheet(plan: RecreationPlan) -> str:
     return "\n".join(lines).strip()
 
 
+def _clean_dialogue_ids(beats: list[PromptBeat], line_count: int) -> list[PromptBeat]:
+    """Keeps valid transcript line numbers, each used once, in plan order."""
+    seen: set[int] = set()
+    cleaned = []
+    for beat in beats:
+        ids = [n for n in beat.dialogue_line_ids if 1 <= n <= line_count and n not in seen]
+        seen.update(ids)
+        cleaned.append(beat.model_copy(update={"dialogue_line_ids": ids}))
+    return cleaned
+
+
+def _missing_lines(beats: list[PromptBeat], line_count: int) -> list[int]:
+    used = {n for beat in beats for n in beat.dialogue_line_ids}
+    return [n for n in range(1, line_count + 1) if n not in used]
+
+
+def _dialogue_warnings(beats: list[PromptBeat], transcript: list[Utterance], duration: int) -> list[str]:
+    """Plain-language warnings shown above the prompt when speech is cut or
+    squeezed into less time than it took in the source."""
+    warnings = []
+    missing = _missing_lines(beats, len(transcript))
+    if missing:
+        dropped = "; ".join(f"L{n}: {transcript[n - 1].english.strip()}" for n in missing)
+        reason = (
+            f"the source has {_speech_seconds(transcript):.1f}s of speech, more than {duration}s"
+            if _speech_seconds(transcript) > duration
+            else "Gemini left them out even after a retry"
+        )
+        warnings.append(f"{len(missing)} dialogue line(s) are not in the prompt because {reason} -- {dropped}")
+    for number, beat in enumerate(beats, start=1):
+        needed = _speech_seconds([transcript[n - 1] for n in beat.dialogue_line_ids])
+        if needed > beat.duration_seconds * 1.15:
+            warnings.append(
+                f"Scene {number} has {needed:.1f}s of dialogue in {beat.duration_seconds:g}s -- the "
+                "video generator may rush or cut words. A longer output length avoids this."
+            )
+    return warnings
+
+
 @dataclass
 class GeneratedPrompt:
     duration: int
@@ -1476,6 +1862,7 @@ class GeneratedPrompt:
     reference_sheet: str = ""
     social_metadata: "SocialMetadata | None" = None
     social_text: str = ""
+    warnings: list[str] = field(default_factory=list)
 
     def full_text(self) -> str:
         parts = [
@@ -1491,82 +1878,256 @@ class GeneratedPrompt:
 
 
 
-def _social_metadata_prompt(analysis: "VideoAnalysis", plan: "RecreationPlan") -> str:
-    """Build the Gemini instruction for generating viral YouTube + Instagram metadata."""
+# ── YouTube / Instagram metadata ────────────────────────────────────────────
+# YouTube counts a tag containing a space as 2 characters longer (it wraps it
+# in quotes), plus 1 per comma, and ignores EVERY tag once that total passes
+# 500 -- so tags are packed to a target safely below the limit.
+YOUTUBE_TITLE_MAX = 100
+YOUTUBE_DESCRIPTION_MAX_BYTES = 5000  # bytes, not characters: Telugu/Hindi letters take 3 each
+YOUTUBE_TAGS_LIMIT = 500
+YOUTUBE_TAGS_TARGET = 480
+INSTAGRAM_CAPTION_MAX = 2200
+INSTAGRAM_HASHTAGS_MAX = 5  # Instagram has reportedly enforced 5 per post since Dec 2025
+# Tags so broad they bring no targeted viewers and only use up a slot.
+GENERIC_HASHTAGS = frozenset({
+    "#viral", "#reels", "#explorepage", "#explore", "#fyp", "#foryou", "#foryoupage",
+    "#trending", "#instagood", "#reelsinstagram", "#viralreels", "#viralvideo", "#reelitfeelit",
+})
+# Free-tier models whose quota includes Grounding with Google Search (500
+# requests/day on the pricing page). gemini-3.5-flash-lite has none for free.
+FREE_SEARCH_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite"})
+
+
+def _metadata_language_rule(language: str) -> str:
+    if _is_english(language) or CONFIG.metadata_language == "english":
+        return "- Write everything in English."
+    if CONFIG.metadata_language == "native":
+        return (
+            f"- Write the title, description and caption in {language}, in its own script. "
+            f"Tags: {language} script, romanized {language} and English."
+        )
     return (
-        "You are an elite viral growth hacker and short-form video SEO specialist.\n"
-        "Generate copy-paste ready, algorithmically optimized metadata for YouTube Shorts and Instagram Reels.\n\n"
-
-        "=== PLATFORM LIMITS & VIRAL RULES ===\n\n"
-
-        "1. YOUTUBE SHORTS (Optimized for Click-Through Rate & Search Indexing):\n"
-        "   - title: STRICTLY under 65 characters so it is never truncated on mobile feeds.\n"
-        "     * Front-load the curiosity hook in the first 3-5 words.\n"
-        "     * High curiosity gap or emotional reaction.\n"
-        "     * Include 1 emoji and always append #Shorts at the end.\n"
-        "     * Example: 'Nobody Expected This In 2070 😳 #Shorts'\n\n"
-        "   - description: Rich SEO format (YouTube is the #2 search engine):\n"
-        "     * Line 1 (Hook): Clear, punchy sentence featuring the primary search keyword.\n"
-        "     * Lines 2-3 (Context): 2-3 engaging context sentences with natural semantic keywords explaining the clip.\n"
-        "     * Line 4 (CTA): Engagement trigger (e.g. 'Subscribe for daily [topic]! What would you do? Comment below 👇').\n"
-        "     * Line 5 (Hashtags): Exactly 3 top hashtags (#Shorts plus 2 niche keywords).\n"
-        "     * Total under 400 characters.\n\n"
-        "   - tags: Comma-separated list under 450 characters (YouTube allows 500 max).\n"
-        "     * 6-10 targeted tags: exact query keyword first, common search terms, niche audience, and 2 broad category tags.\n"
-        "     * NEVER include '#' in tags. Separate strictly with commas.\n\n"
-
-        "2. INSTAGRAM REELS (Optimized for Explore Discovery, Shares & Saves):\n"
-        "   - caption: Do NOT write only 3 words! Instagram algorithms heavily index caption text for Search & Explore.\n"
-        "     Format with clean line breaks into 3 distinct sections:\n"
-        "     * Section 1 - The Micro-Hook (Line 1, under 120 chars before '...more'): Bold, relatable or shocked reaction with 1-2 emojis that makes viewers tap '...more'.\n"
-        "     * Section 2 - Story & SEO (Lines 2-3): 2-3 conversational sentences giving context and using natural search keywords.\n"
-        "     * Section 3 - The Viral CTA: High-converting trigger for Shares or Saves (the #1 ranking signals on Reels!).\n"
-        "       Examples: 'Send this to someone who does this 😭' or 'Save this for your next inspo 📌' or 'Drop a 🔥 if you agree!'.\n\n"
-        "   - hashtags: Exactly 5-6 hashtags starting with #.\n"
-        "     * Mix 2-3 specific content/niche tags, plus #viral #reels #explorepage.\n"
-        "     * Total 5-6 space-separated hashtags.\n\n"
-
-        f"=== VIDEO CONTEXT ===\n"
-        f"Content type: {analysis.content_type}\n"
-        f"Visual medium: {analysis.visual_medium}\n"
-        f"Hook: {(analysis.hook or '').strip()}\n"
-        f"Summary: {(analysis.summary or '').strip()[:400]}\n"
-        f"Why it works: {(analysis.why_it_works or '').strip()[:300]}\n\n"
-
-        f"=== RECREATION PLAN ===\n"
-        f"Title: {plan.title}\n"
-        f"Logline: {plan.logline}\n"
-        f"Mood: {plan.mood}\n"
+        f"- The content is in {language}. Viewers search in English AND in {language} typed in Latin "
+        f"letters (e.g. Tenglish / Hinglish), and sometimes in {language} script. Write the title, "
+        f"description and caption in English mixed with the most-searched romanized {language} words. "
+        f"Tags: English, romanized {language} and {language}-script variants."
     )
 
 
-def _trim_tags(tags: str, limit: int = 450) -> str:
-    """Trim comma-separated tags string to stay within character limit and remove # symbols."""
-    cleaned = tags.replace("#", "")
-    if len(cleaned) <= limit:
-        return cleaned
-    parts = [t.strip() for t in cleaned.split(",") if t.strip()]
-    result = ""
-    for part in parts:
-        candidate = result + (", " if result else "") + part
-        if len(candidate) > limit:
-            break
-        result = candidate
-    return result
+def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> str:
+    """kind: "video" (a Short / Reel) or "image" (a post). With search=True the
+    reply is plain-text JSON, because 2.5 models cannot combine Google Search
+    with a response schema."""
+    is_video = kind == "video"
+    if search:
+        research = (
+            "=== RESEARCH FIRST (use Google Search) ===\n"
+            "1. Search what people currently type on YouTube and Instagram to find this exact topic.\n"
+            f"2. Look at the titles, descriptions and tags of top-performing recent "
+            f"{'Shorts and Reels' if is_video else 'posts'} about it.\n"
+            "3. Note the exact search phrases, long-tail variants and currently trending terms.\n"
+            "Base every keyword on what you found; do not invent trends.\n\n"
+        )
+        reply = (
+            "\nReply with ONLY one JSON object and no other text, with these keys: primary_keyword, "
+            "search_insights, youtube_title, youtube_description, youtube_tags (array of strings), "
+            "instagram_caption, instagram_hashtags (array of strings)."
+        )
+    else:
+        research = "=== KEYWORDS ===\nUse what you know people search on YouTube and Instagram for this topic.\n\n"
+        reply = ""
+    title_rule = "End it with ' #Shorts'." if is_video else "No hashtags in the title."
+    hashtag_line = "#Shorts first, then 2-4 niche hashtags" if is_video else "3-5 niche hashtags"
+    return (
+        "You are a YouTube and Instagram growth strategist. Write metadata that gets this "
+        f"{'short video' if is_video else 'image post'} found in search and recommended.\n\n"
+        f"{research}"
+        "=== LANGUAGE ===\n"
+        f"{_metadata_language_rule(language)}\n\n"
+        "=== YOUTUBE ===\n"
+        "- primary_keyword: the single phrase most viewers type to find this.\n"
+        f"- youtube_title: max {YOUTUBE_TITLE_MAX} characters, best 50-70. Primary keyword within the "
+        f"first 40 characters, plus a curiosity or emotion hook and 1 emoji. {title_rule}\n"
+        "- youtube_description: 1000-2000 characters, in this order:\n"
+        "  1. One hook sentence containing the primary keyword.\n"
+        "  2. Two short paragraphs about the content that naturally use the primary keyword and 4-6 "
+        "related search phrases. Write sentences, never a bare list of keywords.\n"
+        "  3. A call to action (subscribe, or answer a question in the comments).\n"
+        f"  4. Last line: {hashtag_line}.\n"
+        "- youtube_tags: 30-40 tags, best first: the primary keyword, its close variants, long-tail "
+        "phrases people really search, language variants, and 2-3 broad category tags. 1-5 words "
+        "each, no '#'. The app keeps as many as fit in YouTube's 500-character limit.\n\n"
+        "=== INSTAGRAM ===\n"
+        f"- instagram_caption: max {INSTAGRAM_CAPTION_MAX} characters, best 300-800. The first line "
+        "(under 125 characters, shown before '...more') holds the hook and the primary keyword, "
+        "because Instagram search reads captions. Then 2-4 short lines with natural keywords. End "
+        "with a save or share call to action. No hashtags in the caption.\n"
+        f"- instagram_hashtags: exactly {INSTAGRAM_HASHTAGS_MAX}, best first, specific to this "
+        "content's topic, niche and community. Never generic tags such as #viral #reels "
+        "#explorepage #fyp #trending.\n\n"
+        "=== CONTENT ===\n"
+        f"{context}\n"
+        f"{reply}"
+    )
 
 
-def _validate_instagram_hashtags(tags: str) -> str:
-    """Ensure all tokens start with # and #viral #reels #explorepage are present."""
-    tokens = tags.split()
-    fixed = []
-    for t in tokens:
-        fixed.append(t if t.startswith("#") else "#" + t)
-    mandatory = {"#viral", "#reels", "#explorepage"}
-    existing = {t.lower() for t in fixed}
-    for tag in mandatory:
-        if tag not in existing:
-            fixed.append(tag)
-    return " ".join(fixed[:6])  # cap at 6
+def youtube_tags_cost(tags: list[str]) -> int:
+    """Characters YouTube counts against its 500 limit: quotes around tags
+    that contain a space, plus one per comma."""
+    return sum(len(tag) + (2 if " " in tag else 0) for tag in tags) + max(0, len(tags) - 1)
+
+
+def split_tags(tags: str) -> list[str]:
+    return [tag.strip() for tag in tags.split(",") if tag.strip()]
+
+
+def _pack_youtube_tags(candidates: list[str], target: int = YOUTUBE_TAGS_TARGET) -> str:
+    """Best-first tags, deduplicated, filled up to `target` YouTube-counted
+    characters. A tag that does not fit is skipped, so shorter ones after it
+    can still use the space."""
+    chosen: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        tag = " ".join(re.sub(r"[#,<>]", " ", raw).split())  # YouTube rejects < and >
+        if not tag or tag.casefold() in seen:
+            continue
+        if youtube_tags_cost([*chosen, tag]) <= target:
+            chosen.append(tag)
+            seen.add(tag.casefold())
+    return ", ".join(chosen)
+
+
+def _validate_instagram_hashtags(tags: str | list[str]) -> str:
+    """'#' + letters/marks/digits/underscore (so Telugu or Hindi tags keep their
+    vowel signs), deduplicated, generic tags dropped, at most 5."""
+    tokens = tags.split() if isinstance(tags, str) else [t for tag in tags for t in tag.split()]
+    result: list[str] = []
+    for token in tokens:
+        body = "".join(ch for ch in token.lstrip("#") if ch == "_" or unicodedata.category(ch)[0] in "LMN")
+        tag = f"#{body}"
+        if body and tag.casefold() not in GENERIC_HASHTAGS and tag.casefold() not in {t.casefold() for t in result}:
+            result.append(tag)
+    return " ".join(result[:INSTAGRAM_HASHTAGS_MAX])
+
+
+def _cut_at_boundary(text: str) -> str:
+    """Drops the partial line or word a hard length cut leaves at the end."""
+    for separator in ("\n", " "):
+        index = text.rfind(separator)
+        if index > len(text) // 2:
+            return text[:index].rstrip()
+    return text
+
+
+def _fit_title(title: str, shorts: bool) -> str:
+    title = " ".join(title.split())
+    suffix = " #Shorts" if shorts and "#shorts" not in title.casefold() else ""
+    room = YOUTUBE_TITLE_MAX - len(suffix)
+    if len(title) > room:
+        title = title[:room].rsplit(" ", 1)[0].rstrip(" -|,:")
+    return title + suffix
+
+
+def _finish_metadata(
+    draft: SocialMetadataDraft, kind: str, queries: list[str], sources: list[dict[str, str]],
+) -> SocialMetadata:
+    """Fits Gemini's draft to each platform's limits."""
+    description = draft.youtube_description.strip()
+    encoded = description.encode("utf-8")
+    if len(encoded) > YOUTUBE_DESCRIPTION_MAX_BYTES:
+        description = _cut_at_boundary(encoded[:YOUTUBE_DESCRIPTION_MAX_BYTES].decode("utf-8", "ignore"))
+    caption = draft.instagram_caption.strip()
+    if len(caption) > INSTAGRAM_CAPTION_MAX:
+        caption = _cut_at_boundary(caption[:INSTAGRAM_CAPTION_MAX])
+    return SocialMetadata(
+        youtube_title=_fit_title(draft.youtube_title, shorts=kind == "video"),
+        youtube_description=description,
+        youtube_tags=_pack_youtube_tags([draft.primary_keyword, *draft.youtube_tags]),
+        instagram_caption=caption,
+        instagram_hashtags=_validate_instagram_hashtags(draft.instagram_hashtags),
+        primary_keyword=draft.primary_keyword.strip(),
+        grounded=bool(queries or sources),
+        search_queries=queries,
+        sources=sources,
+    )
+
+
+def _grounding_info(response: Any) -> tuple[list[str], list[dict[str, str]]]:
+    """The Google searches Gemini ran and the pages it used."""
+    candidates = getattr(response, "candidates", None) or []
+    meta = getattr(candidates[0], "grounding_metadata", None) if candidates else None
+    if meta is None:
+        return [], []
+    queries = [query for query in (meta.web_search_queries or []) if query]
+    sources: list[dict[str, str]] = []
+    for chunk in meta.grounding_chunks or []:
+        web = getattr(chunk, "web", None)
+        if web is not None and web.uri and all(s["uri"] != web.uri for s in sources):
+            sources.append({"title": web.title or web.domain or web.uri, "uri": web.uri})
+    return queries, sources
+
+
+def _parse_draft_text(response: Any) -> SocialMetadataDraft:
+    """Search replies come back as text, sometimes with prose around the JSON."""
+    try:
+        return _parse_structured(response, SocialMetadataDraft)
+    except _RetryableResponse:
+        text = getattr(response, "text", None) or ""
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        try:
+            return SocialMetadataDraft.model_validate_json(text[start:end + 1])
+        except ValueError as exc:
+            raise _RetryableResponse(f"Gemini returned invalid metadata JSON: {exc}") from exc
+
+
+def generate_metadata(context: str, kind: str, language: str, notify: Notify = _noop_notify) -> SocialMetadata:
+    """One free-tier Gemini call for YouTube + Instagram metadata.
+
+    On a model whose free tier includes Google Search the call is grounded in
+    live searches. Otherwise -- or once today's free search quota is used up --
+    it falls back to Gemini's own knowledge, and SocialMetadata.grounded says so.
+    """
+    from google.genai import types as genai_types
+
+    client = get_client()
+
+    def ask(model: str, search: bool) -> SocialMetadata:
+        options: dict[str, Any] = {
+            "http_options": {"api_version": "v1beta"},
+            "temperature": 0.7,
+            "automatic_function_calling": genai_types.AutomaticFunctionCallingConfig(disable=True),
+        }
+        if search:
+            options["tools"] = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
+        else:
+            options.update(response_mime_type="application/json", response_schema=SocialMetadataDraft)
+        response = client.models.generate_content(
+            model=model,
+            contents=[_metadata_prompt(context, kind, language, search)],
+            config=genai_types.GenerateContentConfig(**options),
+        )
+        if not search:
+            return _finish_metadata(_parse_structured(response, SocialMetadataDraft), kind, [], [])
+        queries, sources = _grounding_info(response)
+        return _finish_metadata(_parse_draft_text(response), kind, queries, sources)
+
+    def run(model: str) -> SocialMetadata:
+        if model in FREE_SEARCH_MODELS and not _search_used_up():
+            try:
+                return ask(model, search=True)
+            except Exception as exc:
+                if not _is_search_quota(exc):
+                    raise
+                logger.warning(f"[GEMINI] {kind}-metadata model={model} search quota used up: {exc}")
+                _mark_search_used_up()
+                notify("Today's free Google Search quota is used up -- writing metadata without search")
+                _record_call(model)
+        return ask(model, search=False)
+
+    notify("Researching keywords and writing social media metadata...")
+    return call_gemini(run, notify, task="metadata", label=f"{kind}-metadata")
 
 
 def generate_social_metadata(
@@ -1574,49 +2135,33 @@ def generate_social_metadata(
     plan: "RecreationPlan",
     notify: Notify = _noop_notify,
 ) -> "SocialMetadata":
-    """Generate YouTube + Instagram metadata for the recreated video.
-
-    Makes one extra free-tier Gemini call (~200 tokens) after prompt generation.
-    Returns a validated SocialMetadata object.
-    """
-    from google.genai import types as genai_types
-
+    """YouTube + Instagram metadata for the recreated video (one Gemini call)."""
     analysis = VideoAnalysis.model_validate(result.analysis)
-    client = get_client()
-    request = _social_metadata_prompt(analysis, plan)
-
-    def run(model: str) -> SocialMetadata:
-        response = client.models.generate_content(
-            model=model,
-            contents=[request],
-            config=genai_types.GenerateContentConfig(
-                http_options={"api_version": "v1beta"},
-                response_mime_type="application/json",
-                response_schema=SocialMetadata,
-                temperature=0.8,
-                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
-            ),
-        )
-        meta = _parse_structured(response, SocialMetadata)
-        return meta
-
-    notify("Generating social media metadata...")
-    meta = call_gemini(run, notify, label="social-metadata")
-
-    # Validate and auto-trim
-    meta = meta.model_copy(update={
-        "youtube_title": meta.youtube_title[:100],
-        "youtube_description": meta.youtube_description[:500],
-        "youtube_tags": _trim_tags(meta.youtube_tags, 450),
-        "instagram_hashtags": _validate_instagram_hashtags(meta.instagram_hashtags),
-    })
-    return meta
+    audio = analysis.audio
+    speech = " ".join(line.english.strip() for line in audio.transcript)[:600]
+    context = "\n".join(part for part in [
+        f"Content type: {analysis.content_type} ({analysis.visual_medium})",
+        f"Summary: {analysis.summary.strip()[:400]}",
+        f"Hook: {analysis.hook.strip()}",
+        f"Why it works: {analysis.why_it_works.strip()[:300]}",
+        f"Recreated video title: {plan.title}",
+        f"Logline: {plan.logline}",
+        f"Mood: {plan.mood}",
+        f"Spoken language: {audio.spoken_language}" if audio.has_speech else "",
+        f"What is said (English meaning): {speech}" if speech else "",
+    ] if part)
+    language = audio.spoken_language if audio.has_speech else "English"
+    return generate_metadata(context, "video", language, notify)
 
 
 def render_social_metadata(meta: "SocialMetadata") -> str:
     """Render the social metadata into a copy-paste ready text block."""
-    tag_len = len(meta.youtube_tags)
+    tag_cost = youtube_tags_cost(split_tags(meta.youtube_tags))
     lines = [
+        (f"🔎 Keywords researched with Google Search ({len(meta.search_queries)} searches)"
+         if meta.grounded else
+         "⚠️ Not grounded in Google Search -- keywords come from Gemini's own knowledge"),
+        "",
         "=== YOUTUBE ===",
         "",
         "📌 TITLE",
@@ -1625,7 +2170,7 @@ def render_social_metadata(meta: "SocialMetadata") -> str:
         "📄 DESCRIPTION",
         meta.youtube_description,
         "",
-        f"🏷️ TAGS  ({tag_len}/450 chars — paste into YouTube Tags field)",
+        f"🏷️ TAGS  ({tag_cost}/{YOUTUBE_TAGS_LIMIT} as YouTube counts them — paste into YouTube Tags field)",
         meta.youtube_tags,
         "",
         "─" * 50,
@@ -1638,6 +2183,10 @@ def render_social_metadata(meta: "SocialMetadata") -> str:
         "#️⃣ HASHTAGS",
         meta.instagram_hashtags,
     ]
+    if meta.search_queries:
+        lines += ["", "🔎 SEARCHES USED", "; ".join(meta.search_queries)]
+    if meta.sources:
+        lines += ["", "SOURCES", *[f"- {source['title']}: {source['uri']}" for source in meta.sources]]
     return "\n".join(lines)
 
 def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _noop_notify) -> GeneratedPrompt:
@@ -1649,12 +2198,14 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
     analysis = VideoAnalysis.model_validate(result.analysis)
     media = MediaInfo(**result.media)
     beat_count = beats_for_duration(duration, len(analysis.scenes))
+    transcript = analysis.audio.transcript
     request = _plan_prompt(analysis, media, duration, beat_count)
+    contents = [request]
 
     def run(model: str) -> RecreationPlan:
         response = client.models.generate_content(
             model=model,
-            contents=[request],
+            contents=contents,
             config=genai_types.GenerateContentConfig(
                 http_options={"api_version": "v1beta"},
                 response_mime_type="application/json",
@@ -1669,14 +2220,31 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
         return plan
 
     notify(f"Writing the {duration}-second prompt...")
-    plan = call_gemini(run, notify, label="prompt")
+    plan = call_gemini(run, notify, task="text", label="prompt")
+    plan = plan.model_copy(update={"beats": _clean_dialogue_ids(plan.beats, len(transcript))})
+    missing = _missing_lines(plan.beats, len(transcript))
+    if missing and _speech_seconds(transcript) <= duration:
+        # The speech fits, so a dropped line is Gemini's mistake: one retry.
+        logger.info(f"[PROMPT] dialogue lines {missing} missing -- retrying once")
+        notify("Some dialogue was left out -- asking Gemini to include every line...")
+        contents = [
+            request + "\n\n=== CORRECTION ===\n"
+            f"Your previous plan left out dialogue lines {', '.join(f'L{n}' for n in missing)}. "
+            f"All lines fit in {duration}s, so every line L1-L{len(transcript)} must appear in exactly "
+            "one beat's dialogue_line_ids, in increasing order. Return the complete corrected plan."
+        ]
+        retry = call_gemini(run, notify, task="text", label="prompt-dialogue-retry")
+        retry = retry.model_copy(update={"beats": _clean_dialogue_ids(retry.beats, len(transcript))})
+        if len(_missing_lines(retry.beats, len(transcript))) < len(missing):
+            plan = retry
     if len(plan.beats) != beat_count:
         logger.info(f"[PROMPT] asked for {beat_count} beats, got {len(plan.beats)} -- keeping Gemini's split")
     plan = plan.model_copy(update={
         "beats": _normalize_durations(plan.beats, duration),
         "reference_images": _normalize_references(plan.reference_images, len(plan.beats)),
     })
-    prompt = render_prompt(plan, media, duration)
+    warnings = _dialogue_warnings(plan.beats, transcript, duration) if transcript else []
+    prompt = render_prompt(plan, media, duration, analysis.audio)
 
     prompts_dir = CONFIG.work_dir / "prompts"
     prompts_dir.mkdir(parents=True, exist_ok=True)
@@ -1688,6 +2256,7 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
         saved_to=str(prompts_dir / f"{stem}.txt"),
         references=[ref.model_dump() for ref in plan.reference_images],
         reference_sheet=render_reference_sheet(plan),
+        warnings=warnings,
     )
     # social metadata populated below
     # Generate social metadata (one extra free-tier Gemini call)
@@ -1703,6 +2272,7 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
             reference_sheet=render_reference_sheet(plan),
             social_metadata=social_meta,
             social_text=social_text,
+            warnings=warnings,
         )
         (prompts_dir / f"{stem}_social.json").write_text(
             social_meta.model_dump_json(indent=2), encoding="utf-8"
@@ -1769,6 +2339,14 @@ def _load_cached(video_sha: str) -> AnalysisResult | None:
     path = _cache_path(video_sha)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        audio = payload.get("analysis", {}).get("audio", {})
+        if "transcript" not in audio:
+            # Cached before transcripts existed. With speech it must be
+            # re-analysed, or the dialogue would be lost; without, upgrade it.
+            if audio.get("has_speech"):
+                logger.info(f"[CACHE] {video_sha[:12]} has speech but no transcript -- re-analysing")
+                return None
+            audio["transcript"] = []
         result = AnalysisResult(**payload)
         VideoAnalysis.model_validate(result.analysis)
         # Video file may have been deleted after analysis — that's OK,
@@ -1900,6 +2478,47 @@ def _show_copyable(st, text: str) -> None:
     st.code(text, language=None, **_supported_kwargs(st.code, wrap_lines=True))
 
 
+def render_social(st, social: "SocialMetadata | None") -> None:
+    """YouTube / Instagram metadata with copy boxes and the platform counts."""
+    if not social:
+        st.warning("Social metadata generation failed — try regenerating.")
+        return
+    if social.grounded:
+        st.caption(f"🔎 Keywords researched with Google Search ({len(social.search_queries)} searches). Edit before posting.")
+    else:
+        st.caption(
+            "⚠️ Not grounded in Google Search (today's free search quota is used up, or the search "
+            "model was unavailable) — keywords come from Gemini's own knowledge. Edit before posting."
+        )
+    tab_yt, tab_ig = st.tabs(["▶️ YouTube", "📸 Instagram"])
+    with tab_yt:
+        st.markdown("**📌 Title** — paste into the YouTube title field")
+        _show_copyable(st, social.youtube_title)
+        st.caption(f"{len(social.youtube_title)}/{YOUTUBE_TITLE_MAX} characters")
+        st.markdown("**📄 Description**")
+        _show_copyable(st, social.youtube_description)
+        st.caption(f"{len(social.youtube_description.encode('utf-8'))}/{YOUTUBE_DESCRIPTION_MAX_BYTES} bytes")
+        tags = split_tags(social.youtube_tags)
+        st.markdown(
+            f"**🏷️ Tags** — {len(tags)} tags · {youtube_tags_cost(tags)}/{YOUTUBE_TAGS_LIMIT} "
+            "as YouTube counts them (quotes included)"
+        )
+        _show_copyable(st, social.youtube_tags)
+    with tab_ig:
+        st.markdown("**✍️ Caption**")
+        _show_copyable(st, social.instagram_caption)
+        st.caption(f"{len(social.instagram_caption)}/{INSTAGRAM_CAPTION_MAX} characters")
+        st.markdown("**#️⃣ Hashtags** — paste after your caption")
+        _show_copyable(st, social.instagram_hashtags)
+        st.caption(f"{len(social.instagram_hashtags.split())}/{INSTAGRAM_HASHTAGS_MAX} hashtags")
+    if social.search_queries or social.sources:
+        with st.expander("Searches and sources used"):
+            if social.search_queries:
+                st.markdown("**Searches:** " + "; ".join(social.search_queries))
+            for source in social.sources:
+                st.markdown(f"- [{source['title']}]({source['uri']})")
+
+
 def _render_generated(st, generated: "GeneratedPrompt") -> None:
     references = getattr(generated, "references", []) or []
     full_text = generated.full_text() if hasattr(generated, "full_text") else generated.prompt
@@ -1916,6 +2535,8 @@ def _render_generated(st, generated: "GeneratedPrompt") -> None:
             "Free-tier Gemini only writes text -- no video or image is generated here. "
             "Paste this into your video generator (Seedance, Omni, Veo, Kling, ...)."
         )
+        for warning in getattr(generated, "warnings", []) or []:
+            st.warning(warning)
         _show_copyable(st, generated.prompt)
 
         st.subheader("Reference images to attach")
@@ -1943,36 +2564,9 @@ def _render_generated(st, generated: "GeneratedPrompt") -> None:
                     _show_copyable(st, ref.get("image_prompt", ""))
 
     # ── Social Media Metadata ──────────────────────────────────────────────
-    social = getattr(generated, "social_metadata", None)
-    if social:
-        st.divider()
-        st.subheader("📲 Post to Social Media")
-        st.caption(
-            "Copy-paste ready metadata for YouTube and Instagram. "
-            "Generated by Gemini — edit before posting!"
-        )
-        tab_yt, tab_ig = st.tabs(["▶️ YouTube", "📸 Instagram"])
-
-        with tab_yt:
-            st.markdown("**📌 Title** — copy-paste into YouTube title field")
-            _show_copyable(st, social.youtube_title)
-            st.caption(f"{len(social.youtube_title)}/100 characters")
-
-            st.markdown("**📄 Description** — copy-paste into YouTube description field")
-            _show_copyable(st, social.youtube_description)
-            st.caption(f"{len(social.youtube_description)}/500 characters")
-
-            tag_len = len(social.youtube_tags)
-            st.markdown(f"**🏷️ Tags** — paste into YouTube Tags field · {tag_len}/450 chars")
-            _show_copyable(st, social.youtube_tags)
-
-        with tab_ig:
-            st.markdown("**✍️ Caption** — copy-paste as your Instagram caption")
-            _show_copyable(st, social.instagram_caption)
-
-            st.markdown("**#️⃣ Hashtags** — copy-paste after your caption")
-            _show_copyable(st, social.instagram_hashtags)
-            st.caption(f"{len(social.instagram_hashtags.split())} hashtags")
+    st.divider()
+    st.subheader("📲 Post to Social Media")
+    render_social(st, getattr(generated, "social_metadata", None))
 
     st.divider()
     st.download_button(
@@ -1983,6 +2577,21 @@ def _render_generated(st, generated: "GeneratedPrompt") -> None:
         **_supported_kwargs(st.download_button, icon=":material/download:"),
     )
     st.caption(f"Saved to {generated.saved_to}")
+
+
+def _render_quota_sidebar(st) -> None:
+    snapshot = quota_snapshot()
+    st.markdown("**Gemini free tier · today**")
+    for model in CONFIG.all_models():
+        reason = snapshot["unavailable"].get(model)
+        status = f":red[{reason}]" if reason else ":green[available]"
+        st.caption(f"`{model}` · {snapshot['calls'].get(model, 0)} call(s) · {status}")
+    search = ":red[used up]" if snapshot["search_used_up"] else ":green[available]"
+    st.caption(f"Google Search for metadata · {search}")
+    st.caption(
+        f"Counts are this app's requests only. Free quotas reset at midnight "
+        f"Pacific time (in {_format_reset_wait()})."
+    )
 
 
 def run_app() -> None:
@@ -2015,6 +2624,8 @@ def run_app() -> None:
             "Paste any public link. The app auto-detects image vs video. "
             "Use this toggle to override if needed."
         )
+        st.divider()
+        _render_quota_sidebar(st)
 
     is_image_mode = mode == "🖼️ Image Post"
 
@@ -2257,6 +2868,21 @@ def _render_video_results(st) -> None:
             )
             st.write(analysis.summary)
             st.caption(f"**Hook:** {analysis.hook}")
+        transcript = analysis.audio.transcript
+        if transcript:
+            language = analysis.audio.spoken_language or "original language"
+            with st.expander(f"Transcript ({language}, {len(transcript)} lines)"):
+                st.caption(
+                    "These lines go into the video prompt word for word. Only reuse "
+                    "dialogue from content you own or have the rights to."
+                )
+                for number, line in enumerate(transcript, start=1):
+                    st.markdown(
+                        f"**L{number}** `{line.start_seconds:.1f}-{line.end_seconds:.1f}s` "
+                        f"{line.speaker}: {line.text}"
+                    )
+                    if line.english.strip() and line.english.strip() != line.text.strip():
+                        st.caption(line.english)
         with st.expander("Full analysis"):
             st.json(result.analysis, expanded=False)
 
@@ -2408,24 +3034,7 @@ def _render_image_results(st, is_image_mode: bool) -> None:
                 _show_copyable(st, audio.alternative_search_query)
         with tab_social:
             st.subheader("📲 Social Media")
-            social = gen.social_metadata
-            if social:
-                yt_tab, ig_tab = st.tabs(["▶️ YouTube", "📸 Instagram"])
-                with yt_tab:
-                    st.markdown("**📌 Title**")
-                    _show_copyable(st, social.youtube_title)
-                    st.caption(f"{len(social.youtube_title)}/100 chars")
-                    st.markdown("**📄 Description**")
-                    _show_copyable(st, social.youtube_description)
-                    st.markdown(f"**🏷️ Tags** ({len(social.youtube_tags)}/450 chars)")
-                    _show_copyable(st, social.youtube_tags)
-                with ig_tab:
-                    st.markdown("**✍️ Caption**")
-                    _show_copyable(st, social.instagram_caption)
-                    st.markdown("**#️⃣ Hashtags**")
-                    _show_copyable(st, social.instagram_hashtags)
-            else:
-                st.warning("Social metadata generation failed — try regenerating.")
+            render_social(st, gen.social_metadata)
 
     st.divider()
     st.download_button(

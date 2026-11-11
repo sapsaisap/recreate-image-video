@@ -414,7 +414,7 @@ def analyze_image(path: Path, notify: Notify = _noop_notify) -> ImageAnalysis:
         )
         return _parse_structured(response, ImageAnalysis)
 
-    return call_gemini(run, notify, label="image-analysis")
+    return call_gemini(run, notify, task="analysis", label="image-analysis")
 
 
 def generate_image_plan(
@@ -442,7 +442,7 @@ def generate_image_plan(
         )
         return _parse_structured(response, ImageRecreationPlan)
 
-    return call_gemini(run, notify, label="image-plan")
+    return call_gemini(run, notify, task="text", label="image-plan")
 
 
 def generate_social_metadata_for_image(
@@ -517,7 +517,7 @@ def generate_social_metadata_for_image(
         )
         return _parse_structured(response, SocialMetadata)
 
-    meta = call_gemini(run, notify, label="image-social")
+    meta = call_gemini(run, notify, task="metadata", label="image-social")
     meta = meta.model_copy(update={
         "youtube_title": meta.youtube_title[:100],
         "youtube_description": meta.youtube_description[:500],

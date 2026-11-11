@@ -42,9 +42,11 @@ import time
 import types
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -63,7 +65,15 @@ def _inject_streamlit_secrets() -> None:
         if get_script_run_ctx() is None:
             return
         secrets = _st.secrets
-        for key in ("GEMINI_API_KEY", "COOKIES_FILE", "DOWNLOAD_PROXY"):
+        # Without a secrets.toml, `key in st.secrets` draws an st.error on the
+        # page, which then breaks st.set_page_config(). Check quietly first.
+        load_quietly = getattr(secrets, "load_if_toml_exists", None)
+        if load_quietly is not None and not load_quietly():
+            return
+        for key in (
+            "GEMINI_API_KEY", "COOKIES_FILE", "DOWNLOAD_PROXY", "GEMINI_RPM",
+            "GEMINI_ANALYSIS_MODELS", "GEMINI_TEXT_MODELS", "GEMINI_METADATA_MODELS",
+        ):
             if key in secrets and not os.environ.get(key):
                 os.environ[key] = str(secrets[key])
 
@@ -110,11 +120,52 @@ def _env_list(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
 
 
+try:
+    _PACIFIC: Any = ZoneInfo("America/Los_Angeles")
+except ZoneInfoNotFoundError:  # Windows without the tzdata package
+    _PACIFIC = timezone(timedelta(hours=-8))
+
+
+def _pacific_now() -> datetime:
+    """Gemini's daily quotas reset at midnight Pacific time."""
+    return datetime.now(_PACIFIC)
+
+
+def _seconds_until_quota_reset() -> int:
+    now = _pacific_now()
+    midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=now.tzinfo)
+    return max(0, int((midnight - now).total_seconds()))
+
+
+# Models the Gemini API free tier serves at no cost (AI Studio pricing page,
+# Nov 2026). Paid-only models such as gemini-3.8-flash are deliberately not
+# here: a free-tier key only gets "limit: 0" errors from them. Add a model
+# only once the pricing page lists it as "Free of charge" on the free tier.
+FREE_TIER_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite"})
+
+# Shutdown dates from the deprecations page. From that date the model is
+# dropped from every chain: Google routes its requests to another model, so
+# keeping it would only spend that other model's quota twice.
+MODEL_SHUTDOWN = {"gemini-2.5-flash": date(2026, 12, 1)}
+
+# Which models each kind of Gemini call tries, in order. Spreading the steps
+# of one run over different models stretches the per-model daily quotas.
+#   analysis: watches the video / looks at the image (needs the best vision)
+#   text:     writes the recreation prompt from the analysis JSON
+#   metadata: writes the YouTube / Instagram metadata
+TASK_MODEL_ENV = {
+    "analysis": ("GEMINI_ANALYSIS_MODELS", "gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
+    "text": ("GEMINI_TEXT_MODELS", "gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
+    "metadata": ("GEMINI_METADATA_MODELS", "gemini-2.5-flash-lite,gemini-3.5-flash-lite"),
+}
+
+
 @dataclass(frozen=True)
 class Config:
     api_key: str = os.getenv("GEMINI_API_KEY", "").strip()
-    model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    fallback_models: tuple[str, ...] = tuple(_env_list("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite"))
+    task_models: dict[str, tuple[str, ...]] = field(default_factory=lambda: {
+        task: tuple(_env_list(env_name, default)) for task, (env_name, default) in TASK_MODEL_ENV.items()
+    })
     rpm: int = max(1, _env_int("GEMINI_RPM", 8))
     max_wait_seconds: int = max(30, _env_int("RATE_LIMIT_MAX_WAIT_SECONDS", 900))
     max_video_seconds: int = _env_int("MAX_VIDEO_SECONDS", 60)
@@ -132,9 +183,16 @@ class Config:
     # output. true: show them on screen; false: only save + offer download.
     show_prompt: bool = os.getenv("SHOW_PROMPT", "true").strip().lower() not in {"false", "0", "no", "off"}
 
-    @property
-    def models(self) -> list[str]:
-        return [self.model, *[m for m in self.fallback_models if m != self.model]]
+    def models_for(self, task: str) -> list[str]:
+        """The model chain for one kind of call, minus models already shut down."""
+        today = _pacific_now().date()
+        return [
+            model for model in dict.fromkeys(self.task_models[task])
+            if model not in MODEL_SHUTDOWN or today < MODEL_SHUTDOWN[model]
+        ]
+
+    def all_models(self) -> list[str]:
+        return list(dict.fromkeys(model for task in self.task_models for model in self.models_for(task)))
 
     def problems(self) -> list[str]:
         issues = []
@@ -143,12 +201,28 @@ class Config:
                 "GEMINI_API_KEY is not set. "
                 "Add it to .env (local) or App Settings → Secrets (Streamlit Cloud)."
             )
+        for task, (env_name, _) in TASK_MODEL_ENV.items():
+            paid = [model for model in self.task_models[task] if model not in FREE_TIER_MODELS]
+            if paid:
+                issues.append(
+                    f"{env_name} lists {', '.join(paid)}, which the Gemini free tier does not offer. "
+                    f"Free-tier models: {', '.join(sorted(FREE_TIER_MODELS))}."
+                )
+            elif not self.models_for(task):
+                issues.append(f"Every model in {env_name} has been shut down -- add a current free-tier model.")
         if self.cookies_file and not Path(self.cookies_file).is_file():
             issues.append(f"COOKIES_FILE points to a missing file: {self.cookies_file}")
         return issues
 
 
 CONFIG = Config()
+
+for _legacy in ("GEMINI_MODEL", "GEMINI_FALLBACK_MODELS"):
+    if os.getenv(_legacy, "").strip():
+        logger.warning(
+            f"[CONFIG] {_legacy} is no longer used -- set GEMINI_ANALYSIS_MODELS, "
+            "GEMINI_TEXT_MODELS and GEMINI_METADATA_MODELS instead (see .env.example)."
+        )
 
 
 # ============================================================================
@@ -363,6 +437,9 @@ if _STATE is None:
     _STATE.last_call = 0.0
     _STATE.client = None
     sys.modules["_recreate_video_state"] = _STATE
+if not hasattr(_STATE, "quota_lock"):  # stash created by an older version of this file
+    _STATE.quota_lock = threading.Lock()
+    _STATE.quota = None
 
 
 def get_client():
@@ -397,7 +474,75 @@ class GeminiCallError(RuntimeError):
 
 
 class QuotaExhaustedError(RuntimeError):
-    """Every configured model has used up its daily free-tier quota."""
+    """Every model in a step's chain is used up (or unusable) for today."""
+
+
+# ── Daily free-tier quota memory ────────────────────────────────────────────
+# Which models are used up today, plus this app's call count per model. Shared
+# by every session through _STATE and kept on disk, so neither a new session,
+# a restart nor the CLI re-spends a request on a model that is already out.
+# The record is dropped when the Pacific date changes (= Google's reset).
+
+def _quota_state_path() -> Path:
+    return CONFIG.work_dir / "cache" / "quota_state.json"
+
+
+def _quota_state() -> dict:
+    """Today's record. Call with _STATE.quota_lock held."""
+    today = _pacific_now().date().isoformat()
+    state = _STATE.quota
+    if state is None:
+        try:
+            state = json.loads(_quota_state_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+    if not isinstance(state, dict) or state.get("day") != today:
+        state = {"day": today, "calls": {}, "unavailable": {}}
+    _STATE.quota = state
+    return state
+
+
+def _save_quota_state(state: dict) -> None:
+    try:
+        _quota_state_path().parent.mkdir(parents=True, exist_ok=True)
+        _quota_state_path().write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"[QUOTA] could not save quota state: {exc}")
+
+
+def _record_call(model: str) -> None:
+    with _STATE.quota_lock:
+        state = _quota_state()
+        state["calls"][model] = state["calls"].get(model, 0) + 1
+        _save_quota_state(state)
+
+
+def _mark_unavailable(model: str, reason: str) -> None:
+    with _STATE.quota_lock:
+        state = _quota_state()
+        state["unavailable"][model] = reason
+        _save_quota_state(state)
+
+
+def _unavailable_models() -> dict[str, str]:
+    with _STATE.quota_lock:
+        return dict(_quota_state()["unavailable"])
+
+
+def quota_snapshot() -> dict:
+    """For the UI: today's calls and unusable models, and time to the reset."""
+    with _STATE.quota_lock:
+        state = _quota_state()
+        return {
+            "calls": dict(state["calls"]),
+            "unavailable": dict(state["unavailable"]),
+            "reset_in_seconds": _seconds_until_quota_reset(),
+        }
+
+
+def _format_reset_wait() -> str:
+    hours, minutes = divmod(_seconds_until_quota_reset() // 60, 60)
+    return f"{hours}h {minutes}m"
 
 
 class _RetryableResponse(RuntimeError):
@@ -423,9 +568,34 @@ def _error_code(exc: Exception) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _error_details(exc: Exception) -> list[dict]:
+    """The google.rpc detail objects (QuotaFailure, RetryInfo, ...) of a Gemini
+    API error. google-genai keeps the whole response body in exc.details."""
+    payload = getattr(exc, "details", None)
+    if isinstance(payload, dict):
+        body = payload.get("error", payload)
+        payload = body.get("details") if isinstance(body, dict) else None
+    return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+
+def _quota_violations(exc: Exception) -> list[dict]:
+    return [
+        violation
+        for detail in _error_details(exc)
+        if str(detail.get("@type", "")).endswith("QuotaFailure")
+        for violation in detail.get("violations") or []
+        if isinstance(violation, dict)
+    ]
+
+
 def _retry_delay_seconds(exc: Exception) -> float | None:
     """Google's 429 body carries a RetryInfo detail ("retryDelay": "37s") and
     usually also says "Please retry in 37.2s" in the message."""
+    for detail in _error_details(exc):
+        if str(detail.get("@type", "")).endswith("RetryInfo"):
+            match = re.match(r"(\d+(?:\.\d+)?)s", str(detail.get("retryDelay", "")))
+            if match:
+                return float(match.group(1))
     text = str(getattr(exc, "details", "") or "") + " " + str(exc)
     for pattern in (
         r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s",
@@ -438,8 +608,38 @@ def _retry_delay_seconds(exc: Exception) -> float | None:
 
 
 def _is_daily_quota(exc: Exception) -> bool:
+    """quotaId is e.g. "GenerateRequestsPerDayPerProjectPerModel-FreeTier".
+    The message text is only checked when the error carries no QuotaFailure."""
+    violations = _quota_violations(exc)
+    if violations:
+        return any("perday" in str(v.get("quotaId", "")).lower() for v in violations)
     text = str(getattr(exc, "details", "") or "") + " " + str(exc)
     return bool(re.search(r"per ?day", text, flags=re.IGNORECASE))
+
+
+def _is_not_on_free_tier(exc: Exception) -> bool:
+    """A quota of 0 means this key's tier has no access to the model at all."""
+    if any(str(v.get("quotaValue", "")).strip() == "0" for v in _quota_violations(exc)):
+        return True
+    return bool(re.search(r"\blimit:\s*0\b", str(exc)))
+
+
+def _is_model_missing(exc: Exception) -> bool:
+    """404 "models/... is not found": renamed, retired or never existed."""
+    return _error_code(exc) == 404
+
+
+def _unusable_reason(exc: Exception) -> str | None:
+    """Why a model cannot serve any more requests today, or None if waiting
+    and retrying the same model can still work."""
+    if _classify(exc) == "rate":
+        if _is_not_on_free_tier(exc):
+            return "not available on the free tier"
+        if _is_daily_quota(exc):
+            return "daily free quota used up"
+    elif _is_model_missing(exc):
+        return "model not found"
+    return None
 
 
 def _classify(exc: Exception) -> str:
@@ -482,57 +682,74 @@ def call_gemini(
     fn: Callable[[str], T],
     notify: Notify = _noop_notify,
     *,
+    task: str | None,
     label: str = "Gemini",
     throttle: bool = True,
 ) -> T:
-    """Runs fn(model_name) until it succeeds.
+    """Runs fn(model_name) until it succeeds, walking the free-tier model
+    chain of `task` ("analysis", "text" or "metadata", see TASK_MODEL_ENV).
 
+    - Models already known to be unusable today are skipped without sending
+      a request. That memory is shared by all sessions and lasts until the
+      daily reset at midnight Pacific.
+    - 429 per-day limit, 429 "limit: 0" (model not on the free tier) or model
+      not found: waiting cannot help, so mark the model unusable and move to
+      the next one; QuotaExhaustedError once the chain is empty.
     - 429 per-minute limits: wait Google's retryDelay (or 5/10/20/40/60 s
       backoff) and retry the same model, until RATE_LIMIT_MAX_WAIT_SECONDS.
-    - 429 per-day limits: waiting cannot help, so switch to the next model
-      in GEMINI_FALLBACK_MODELS; QuotaExhaustedError once all are spent.
     - 5xx/overloaded/timeout: backoff on the same model, moving to the next
       model after 3 consecutive failures (free-tier 503 "high demand" spells
       often last minutes, and each failed call can itself take ~90 s).
     - Anything else (bad key, bad request, safety block): GeminiCallError now.
+
+    task=None is for Files API calls: they use no model and no daily quota,
+    so fn gets "" and only the per-minute / transient handling applies.
     """
-    models = CONFIG.models
-    index = 0
+    chain = CONFIG.models_for(task) if task else [""]
+    passed_over: set[str] = set()  # transient failures: skipped for this call only
+    current = None
     failures_on_model = 0
     deadline = time.monotonic() + CONFIG.max_wait_seconds
 
     while True:
-        model = models[index]
+        unusable = _unavailable_models() if task else {}
+        candidates = [m for m in chain if m not in unusable and m not in passed_over]
+        if not candidates:
+            details = "; ".join(f"{m}: {unusable.get(m, 'unavailable')}" for m in chain)
+            raise QuotaExhaustedError(
+                f"No free-tier Gemini model is left for this step today ({details}). "
+                f"The free quota resets at midnight Pacific time, in about {_format_reset_wait()}."
+            )
+        model = candidates[0]
+        if model != current:
+            if current is not None:
+                notify(f"Switching to {model}")
+            current = model
+            failures_on_model = 0
         if throttle:
             _throttle()
+        if task:
+            _record_call(model)
         try:
             return fn(model)
         except (GeminiCallError, QuotaExhaustedError):
             raise
         except Exception as exc:
             kind = _classify(exc)
+            reason = _unusable_reason(exc) if task else None
+            if reason:
+                logger.warning(f"[GEMINI] {label} model={model} {reason}: {exc}")
+                _mark_unavailable(model, reason)
+                notify(f"{model}: {reason}")
+                continue
             if kind == "fatal":
                 logger.error(f"[GEMINI] {label} model={model} fatal: {exc}")
                 raise GeminiCallError(_readable_error(exc)) from exc
 
-            if kind == "rate" and _is_daily_quota(exc):
-                logger.warning(f"[GEMINI] {label} model={model} daily quota exhausted")
-                if index + 1 < len(models):
-                    index += 1
-                    failures_on_model = 0
-                    notify(f"Daily free quota used up on {model}, switching to {models[index]}")
-                    continue
-                raise QuotaExhaustedError(
-                    "The daily free-tier Gemini quota is used up for every configured model "
-                    f"({', '.join(models)}). It resets at midnight Pacific time -- try again "
-                    "then, or add another model to GEMINI_FALLBACK_MODELS."
-                ) from exc
-
             failures_on_model += 1
-            if kind == "transient" and failures_on_model > 2 and index + 1 < len(models):
-                logger.warning(f"[GEMINI] {label} model={model} keeps failing, switching to {models[index + 1]}")
-                index += 1
-                failures_on_model = 0
+            if kind == "transient" and failures_on_model > 2 and len(candidates) > 1:
+                logger.warning(f"[GEMINI] {label} model={model} keeps failing, switching to {candidates[1]}")
+                passed_over.add(model)
                 continue
 
             delay = _retry_delay_seconds(exc) if kind == "rate" else None
@@ -546,13 +763,13 @@ def call_gemini(
                     f"{CONFIG.max_wait_seconds}s. Try again in a few minutes, or raise "
                     "RATE_LIMIT_MAX_WAIT_SECONDS."
                 ) from exc
-            reason = (
+            wait_reason = (
                 f"Free-tier rate limit hit on {model}"
                 if kind == "rate"
                 else f"Gemini busy/unavailable on {model}"
             )
             logger.warning(f"[GEMINI] {label} model={model} {kind} failure, waiting {delay:.1f}s: {exc}")
-            _wait_with_countdown(delay, reason, notify)
+            _wait_with_countdown(delay, wait_reason, notify)
 
 
 def _parse_structured(response: Any, schema: type[BaseModel]) -> BaseModel:
@@ -968,6 +1185,7 @@ def _upload_and_wait(path: Path, notify: Notify):
             config=genai_types.UploadFileConfig(mime_type="video/mp4", display_name=path.name),
         ),
         notify,
+        task=None,
         label="upload",
         throttle=False,
     )
@@ -985,6 +1203,7 @@ def _upload_and_wait(path: Path, notify: Notify):
         uploaded = call_gemini(
             lambda _model: client.files.get(name=uploaded.name),
             notify,
+            task=None,
             label="file-status",
             throttle=False,
         )
@@ -1052,7 +1271,7 @@ def analyze_video(path: Path, media: MediaInfo, notify: Notify = _noop_notify) -
             )
             return _parse_structured(response, VideoAnalysis)
 
-        analysis = call_gemini(run, notify, label="analyze")
+        analysis = call_gemini(run, notify, task="analysis", label="analyze")
         logger.info(
             f"[ANALYZE] ok content_type={analysis.content_type} medium={analysis.visual_medium} "
             f"scenes={len(analysis.scenes)}"
@@ -1601,7 +1820,7 @@ def generate_social_metadata(
         return meta
 
     notify("Generating social media metadata...")
-    meta = call_gemini(run, notify, label="social-metadata")
+    meta = call_gemini(run, notify, task="metadata", label="social-metadata")
 
     # Validate and auto-trim
     meta = meta.model_copy(update={
@@ -1669,7 +1888,7 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
         return plan
 
     notify(f"Writing the {duration}-second prompt...")
-    plan = call_gemini(run, notify, label="prompt")
+    plan = call_gemini(run, notify, task="text", label="prompt")
     if len(plan.beats) != beat_count:
         logger.info(f"[PROMPT] asked for {beat_count} beats, got {len(plan.beats)} -- keeping Gemini's split")
     plan = plan.model_copy(update={
@@ -1985,6 +2204,19 @@ def _render_generated(st, generated: "GeneratedPrompt") -> None:
     st.caption(f"Saved to {generated.saved_to}")
 
 
+def _render_quota_sidebar(st) -> None:
+    snapshot = quota_snapshot()
+    st.markdown("**Gemini free tier · today**")
+    for model in CONFIG.all_models():
+        reason = snapshot["unavailable"].get(model)
+        status = f":red[{reason}]" if reason else ":green[available]"
+        st.caption(f"`{model}` · {snapshot['calls'].get(model, 0)} call(s) · {status}")
+    st.caption(
+        f"Counts are this app's requests only. Free quotas reset at midnight "
+        f"Pacific time (in {_format_reset_wait()})."
+    )
+
+
 def run_app() -> None:
     import streamlit as st
     # Lazy import of image pipeline — only needed when image mode is active.
@@ -2015,6 +2247,8 @@ def run_app() -> None:
             "Paste any public link. The app auto-detects image vs video. "
             "Use this toggle to override if needed."
         )
+        st.divider()
+        _render_quota_sidebar(st)
 
     is_image_mode = mode == "🖼️ Image Post"
 

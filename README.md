@@ -70,6 +70,14 @@ Open `.env` and add your Google Gemini API key:
 GEMINI_API_KEY=your_actual_gemini_api_key_here
 ```
 
+#### Free tier only
+The app is built for a **free** Gemini key and accepts only free-tier models
+(`gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3.5-flash-lite`).
+- **Never link a billing account** to the key's Google Cloud project. A project without billing cannot be charged; when a limit is hit, Gemini returns an error and the app waits or switches model.
+- Each step has its own model chain (`GEMINI_ANALYSIS_MODELS`, `GEMINI_TEXT_MODELS`, `GEMINI_METADATA_MODELS`). A model whose daily quota is used up is skipped until the reset at midnight Pacific time; the sidebar shows today's usage.
+- Limits are per Google Cloud project, not per key — extra keys in the same project add no quota.
+- On the free tier, Google may use what you send to improve its products. Don't upload confidential material.
+
 *(Optional)* If you want automated Instagram Reel downloads for accounts requiring a login session, export your browser cookies with the Chrome extension **Get cookies.txt LOCALLY** and save the file as `cookies.txt` in the project root.
 
 ---

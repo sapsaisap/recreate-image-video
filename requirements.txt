@@ -5,3 +5,6 @@ python-dotenv>=1.0
 pydantic>=2.6
 # Bundled ffmpeg binary, used only when ffmpeg is not already on PATH.
 imageio-ffmpeg>=0.5
+# Free Microsoft Edge text-to-speech for Summarise to Short. 7.3.1+ is required:
+# older releases send an outdated Edge version and get HTTP 403 (checked Nov 2026).
+edge-tts>=7.3.1

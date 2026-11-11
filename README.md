@@ -20,9 +20,14 @@ An AI-powered content analysis and recreation studio built with Streamlit and Go
   - 🖥️ **Stable Diffusion / ComfyUI** (with positive and negative prompts)
 - **Text Overlay Extraction**: Detects on-screen typography, fonts, positions, and outputs a ready-to-use Canva / CapCut layout recreation workflow.
 
+### 🗣️ Dialogue That Matches the Source
+- **Word-for-word transcript** in the spoken language and its own script (Telugu, Hindi, ...), with an English translation for you to read.
+- **Exact lines in the video prompt**: Gemini only decides which line goes in which scene; the app inserts the original words, so dialogue is never translated, reworded or shortened. The prompt states the spoken language and voice.
+- **Warnings** when a line had to be left out or a scene is too short for its dialogue. Set `DIALOGUE_SCRIPT=romanized` if your generator pronounces Latin letters better.
+
 ### 🎵 Audio & Social Metadata
 - **Audio Matching**: Suggests matching music tracks, BPM feel, genres, and exact Instagram search queries.
-- **Viral Social Pack**: Generates optimized YouTube titles, descriptions, and tags (with character caps), plus Instagram captions and hashtags.
+- **Search-backed Social Pack**: keywords are researched with Google Search (free on `gemini-2.5-flash-lite`, 500/day) and the searches and sources are shown. YouTube tags are packed to ~480 of YouTube's own 500-character count (tags with spaces cost 2 extra for quotes — over 500 YouTube ignores them all), descriptions up to 5,000 bytes, Instagram captions up to 2,200 characters with 5 niche hashtags (no generic `#viral`/`#reels`).
 
 ### 🔒 Privacy & Automated Cleanup
 - **Immediate Media Cleanup**: Videos and images are deleted as soon as Gemini finishes analyzing them. Only the generated prompt text is retained.

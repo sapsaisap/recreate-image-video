@@ -25,6 +25,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
@@ -42,6 +43,7 @@ from recreate_video import (
     ffmpeg_exe,
     generate_metadata,
     get_client,
+    host_is,
     render_social,
     render_social_metadata,
     validate_public_video_url,
@@ -619,7 +621,7 @@ def analyze_image_url(url: str, notify: Notify = _noop_notify) -> ImageAnalysisR
 
     try:
         url_type = detect_url_type(safe_url)
-        is_instagram = "instagram.com" in (safe_url or "").lower()
+        is_instagram = host_is(urlsplit(safe_url).hostname, "instagram.com")
 
         if is_instagram:
             # Instagram: use requests + cookies (bypasses yt-dlp HTTP 400)

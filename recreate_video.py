@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -45,8 +47,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, TypeVar
-from urllib.parse import urlsplit
+from typing import Any, Callable, Mapping, TypeVar
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -74,7 +76,7 @@ def _inject_streamlit_secrets() -> None:
         for key in (
             "GEMINI_API_KEY", "COOKIES_FILE", "DOWNLOAD_PROXY", "GEMINI_RPM",
             "GEMINI_ANALYSIS_MODELS", "GEMINI_TEXT_MODELS", "GEMINI_METADATA_MODELS",
-            "DIALOGUE_SCRIPT", "METADATA_LANGUAGE",
+            "DIALOGUE_SCRIPT", "METADATA_LANGUAGE", "URL_ALLOWLIST",
         ):
             if key in secrets and not os.environ.get(key):
                 os.environ[key] = str(secrets[key])
@@ -181,6 +183,11 @@ class Config:
         str(APP_DIR / "cookies.txt") if (APP_DIR / "cookies.txt").is_file() else ""
     )
     download_proxy: str = os.getenv("DOWNLOAD_PROXY", "").strip()
+    # Optional: only accept links from these sites (and their subdomains).
+    # Empty = any public website. Recommended for a public deployment.
+    url_allowlist: tuple[str, ...] = tuple(
+        domain.lower().lstrip(".") for domain in _env_list("URL_ALLOWLIST", "")
+    )
     # The free tier can only produce text, so the video/image prompts ARE the
     # output. true: show them on screen; false: only save + offer download.
     show_prompt: bool = os.getenv("SHOW_PROMPT", "true").strip().lower() not in {"false", "0", "no", "off"}
@@ -267,6 +274,14 @@ class MediaType:
     AMBIGUOUS = "ambiguous"  # Instagram /p/ without img_index
 
 
+def host_is(host: str | None, domain: str) -> bool:
+    """True for `domain` itself and its subdomains -- never for a host that
+    merely contains it (evilinstagram.com, instagram.com.evil.net, netflix.com
+    for "x.com")."""
+    host = (host or "").lower().rstrip(".")
+    return host == domain or host.endswith("." + domain)
+
+
 def detect_url_type(url: str) -> str:
     """Classify a URL as video, image, or ambiguous without any network call."""
     parsed = urlsplit((url or "").strip())
@@ -282,23 +297,23 @@ def detect_url_type(url: str) -> str:
         return MediaType.IMAGE
 
     # YouTube
-    if "youtube.com" in host or "youtu.be" in host:
+    if host_is(host, "youtube.com") or host_is(host, "youtu.be"):
         return MediaType.VIDEO
 
     # TikTok
-    if "tiktok.com" in host:
+    if host_is(host, "tiktok.com"):
         return MediaType.VIDEO
 
     # Twitter / X
-    if "twitter.com" in host or "x.com" in host:
+    if host_is(host, "twitter.com") or host_is(host, "x.com"):
         return MediaType.VIDEO
 
     # Facebook
-    if "facebook.com" in host or "fb.watch" in host:
+    if host_is(host, "facebook.com") or host_is(host, "fb.watch"):
         return MediaType.VIDEO
 
     # Instagram
-    if "instagram.com" in host:
+    if host_is(host, "instagram.com"):
         if "/reel/" in path or "/tv/" in path:
             return MediaType.VIDEO
         if "/p/" in path:
@@ -317,21 +332,29 @@ def detect_url_type(url: str) -> str:
 # Instagram image downloader (requests-based, bypasses yt-dlp 400 errors)
 # ============================================================================
 
-def _load_cookies_from_file(cookie_file: str) -> dict[str, str]:
-    """Parse a Netscape cookies.txt file into a plain dict."""
-    cookies: dict[str, str] = {}
+# Instagram serves post images from these CDNs. The image URL comes from the
+# fetched page, so anything else is refused rather than downloaded.
+INSTAGRAM_CDN_DOMAINS = ("cdninstagram.com", "fbcdn.net")
+_INSTAGRAM_PAGE_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _load_cookie_jar(cookie_file: str):
+    """cookies.txt as a cookie jar that keeps each cookie's domain, so requests
+    only sends a cookie to the site it belongs to. yt-dlp's jar also reads the
+    '#HttpOnly_' lines exporters use for login cookies such as sessionid."""
+    from yt_dlp.cookies import YoutubeDLCookieJar
+
+    jar = YoutubeDLCookieJar(cookie_file)
     try:
-        with open(cookie_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 7:
-                    cookies[parts[5]] = parts[6]
-    except OSError:
-        pass
-    return cookies
+        jar.load()
+    except OSError as exc:  # includes http.cookiejar.LoadError
+        logger.warning(f"[COOKIES] could not read {cookie_file}: {exc}")
+        return None
+    return jar
+
+
+def _has_cookies_for(jar, domain: str) -> bool:
+    return jar is not None and any(host_is(cookie.domain.lstrip("."), domain) for cookie in jar)
 
 
 @dataclass
@@ -348,24 +371,16 @@ def download_instagram_image(
 ) -> DownloadedImage:
     """Download an Instagram image post using requests + cookies.txt.
     Extracts og:image URL from the HTML page — avoids yt-dlp's HTTP 400 errors."""
-    import urllib.parse
-    try:
-        import requests as _requests
-    except ImportError as exc:
-        raise URLVideoError(
-            "The 'requests' library is not installed. Run: pip install requests"
-        ) from exc
-
     safe_url = validate_public_video_url(url)
+    if not host_is(urlsplit(safe_url).hostname, "instagram.com"):
+        raise URLVideoError("This is not an Instagram link.")
 
     # Load cookies for Instagram login
-    cookies: dict[str, str] = {}
-    if CONFIG.cookies_file:
-        cookies = _load_cookies_from_file(CONFIG.cookies_file)
-    if not cookies:
+    cookies = _load_cookie_jar(CONFIG.cookies_file) if CONFIG.cookies_file else None
+    if not _has_cookies_for(cookies, "instagram.com"):
         raise URLVideoError(
             "Instagram requires a logged-in session. "
-            "Export your cookies to cookies.txt and set COOKIES_FILE in .env."
+            "Export your Instagram cookies to cookies.txt and set COOKIES_FILE in .env."
         )
 
     headers = {
@@ -381,9 +396,11 @@ def download_instagram_image(
 
     notify("Fetching Instagram post page...")
     try:
-        resp = _requests.get(safe_url, cookies=cookies, headers=headers, timeout=20)
-        resp.raise_for_status()
-    except Exception as exc:
+        resp = safe_get(
+            safe_url, max_bytes=_INSTAGRAM_PAGE_MAX_BYTES, timeout=20, headers=headers,
+            cookies=cookies, allowed_domains=("instagram.com",),
+        )
+    except URLVideoError as exc:
         raise URLVideoError(f"Could not fetch Instagram page: {exc}") from exc
 
     # Extract og:image (the highest-quality image URL in the page)
@@ -409,9 +426,11 @@ def download_instagram_image(
 
     notify("Downloading image from Instagram CDN...")
     try:
-        img_resp = _requests.get(img_url, timeout=30)
-        img_resp.raise_for_status()
-    except Exception as exc:
+        img_resp = safe_get(
+            img_url, max_bytes=CONFIG.max_download_mb * 1024 * 1024,
+            allowed_domains=INSTAGRAM_CDN_DOMAINS,
+        )
+    except URLVideoError as exc:
         raise URLVideoError(f"Image download failed: {exc}") from exc
 
     # Determine extension from content-type
@@ -864,7 +883,90 @@ def validate_public_video_url(url: str) -> str:
         raise URLVideoError("The URL contains an invalid port.") from exc
     if port not in {None, 80, 443}:
         raise URLVideoError("Only standard HTTP/HTTPS ports are allowed.")
+    host = parsed.hostname.lower()
+    if CONFIG.url_allowlist and not any(host_is(host, domain) for domain in CONFIG.url_allowlist):
+        raise URLVideoError(
+            f"Links from {host} are not enabled on this app. "
+            f"Allowed sites: {', '.join(CONFIG.url_allowlist)}."
+        )
+    _check_public_host(host)
     return value
+
+
+def _check_public_host(host: str) -> None:
+    """Every address the host resolves to must be on the public internet, so a
+    link can never reach this server's own network: localhost, 10.x/192.168.x,
+    the cloud metadata service at 169.254.169.254, and so on. Also catches IPs
+    written as decimals (2130706433) or as IPv4-mapped IPv6 (::ffff:127.0.0.1)."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError) as exc:
+        raise URLVideoError(f"Could not find the website {host}. Check the link.") from exc
+    for info in infos:
+        address = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+        if address.version == 6 and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        if not address.is_global:
+            raise URLVideoError("This link points to a private or internal network address, which is not allowed.")
+
+
+_MAX_REDIRECTS = 5
+
+
+@dataclass
+class Fetched:
+    url: str  # after redirects
+    headers: Mapping[str, str]
+    content: bytes
+    encoding: str | None = None
+
+    @property
+    def text(self) -> str:
+        return self.content.decode(self.encoding or "utf-8", errors="replace")
+
+
+def safe_get(
+    url: str,
+    *,
+    max_bytes: int,
+    timeout: float = 30,
+    headers: Mapping[str, str] | None = None,
+    cookies: Any = None,
+    allowed_domains: tuple[str, ...] = (),
+) -> Fetched:
+    """HTTP GET for the app's own downloads. Each redirect hop is re-checked
+    with validate_public_video_url (and against allowed_domains when given),
+    and reading stops once the body passes max_bytes. `cookies` should be a
+    cookie jar: requests then only sends each cookie to its own domain."""
+    import requests
+
+    current = url
+    with requests.Session() as session:
+        for _ in range(_MAX_REDIRECTS + 1):
+            validate_public_video_url(current)
+            host = urlsplit(current).hostname
+            if allowed_domains and not any(host_is(host, domain) for domain in allowed_domains):
+                raise URLVideoError(f"Refusing to download from {host}: not an expected site for this link.")
+            try:
+                response = session.get(
+                    current, headers=headers, cookies=cookies, timeout=timeout,
+                    allow_redirects=False, stream=True,
+                )
+            except requests.RequestException as exc:
+                raise URLVideoError(f"Could not reach {host}: {exc}") from exc
+            with response:
+                if response.is_redirect:
+                    current = urljoin(current, response.headers.get("Location", ""))
+                    continue
+                if response.status_code >= 400:
+                    raise URLVideoError(f"{host} answered HTTP {response.status_code}.")
+                body = bytearray()
+                for chunk in response.iter_content(64 * 1024):
+                    body += chunk
+                    if len(body) > max_bytes:
+                        raise URLVideoError(f"The file is larger than the {max_bytes // 1048576} MB limit.")
+                return Fetched(url=current, headers=response.headers, content=bytes(body), encoding=response.encoding)
+    raise URLVideoError("The link redirected too many times.")
 
 
 def ffmpeg_exe() -> str:

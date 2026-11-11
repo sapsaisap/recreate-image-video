@@ -2518,29 +2518,26 @@ def analyze_url(url: str, notify: Notify = _noop_notify) -> AnalysisResult:
 
 
 def analyze_local_video(path: Path, title: str = "Uploaded video", notify: Notify = _noop_notify) -> AnalysisResult:
-    """Validate and analyse a locally provided/uploaded video file, with caching."""
-    notify("Checking video...")
-    media = probe_video(path)
-    validate_media(media)
+    """Validate and analyse a locally provided/uploaded video file, with caching.
+    The file is always deleted afterwards (success, failure or cache hit)."""
+    try:
+        notify("Checking video...")
+        media = probe_video(path)
+        validate_media(media)
 
-    video_sha = _sha256(path)
-    if cached := _load_cached(video_sha):
-        notify("Using saved analysis for this video")
-        logger.info(f"[CACHE] hit by content sha={video_sha[:12]}")
+        video_sha = _sha256(path)
+        if cached := _load_cached(video_sha):
+            notify("Using saved analysis for this video")
+            logger.info(f"[CACHE] hit by content sha={video_sha[:12]}")
+            return cached
+
+        analysis = analyze_video(path, media, notify)
+    finally:
         try:
             path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return cached
-
-    analysis = analyze_video(path, media, notify)
-
-    # Immediately delete the uploaded video — only prompt is kept.
-    try:
-        path.unlink(missing_ok=True)
-        logger.info(f"[CLEANUP] deleted uploaded video after analysis: {path.name}")
-    except OSError as exc:
-        logger.warning(f"[CLEANUP] could not delete uploaded video {path.name}: {exc}")
+            logger.info(f"[CLEANUP] deleted uploaded video: {path.name}")
+        except OSError as exc:
+            logger.warning(f"[CLEANUP] could not delete uploaded video {path.name}: {exc}")
 
     result = AnalysisResult(
         video_sha=video_sha,
@@ -2681,6 +2678,40 @@ def _render_generated(st, generated: "GeneratedPrompt") -> None:
     st.caption(f"Saved to {generated.saved_to}")
 
 
+def _new_upload(state: Any, key: str, uploaded: Any) -> bytes | None:
+    """The uploaded bytes if this exact file has not been analysed yet in this
+    session, else None. Files are told apart by a hash of their content, not
+    their name: a new 'image.jpg' is analysed, and Streamlit reruns of the same
+    upload are not. Removing the file resets it, so re-adding retries."""
+    if uploaded is None:
+        state.pop(key, None)
+        return None
+    data = uploaded.getvalue()
+    digest = hashlib.sha256(data).hexdigest()
+    if state.get(key) == digest:
+        return None
+    state[key] = digest
+    return data
+
+
+def _save_upload(data: bytes, name: str, folder: str, default_suffix: str) -> Path:
+    """Writes an upload to WORK_DIR/folder just before analysis; the analysis
+    step deletes it."""
+    uploads_dir = CONFIG.work_dir / folder
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(name).suffix.lower() or default_suffix
+    path = uploads_dir / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
+    path.write_bytes(data)
+    return path
+
+
+def _show_image_result(st, status, image_result) -> None:
+    st.session_state.image_result = image_result
+    st.session_state.image_generated = None
+    label = "Analysis loaded from cache" if image_result.from_cache else "Analysis complete"
+    status.update(label=label, state="complete", expanded=False)
+
+
 def _render_quota_sidebar(st) -> None:
     snapshot = quota_snapshot()
     st.markdown("**Gemini free tier · today**")
@@ -2700,8 +2731,7 @@ def run_app() -> None:
     import streamlit as st
     # Lazy import of image pipeline — only needed when image mode is active.
     from recreate_image import (
-        analyze_image_url, generate_image_recreation,
-        ImageAnalysisResult, GeneratedImagePrompt, ImageAnalysis,
+        analyze_image_url, analyze_local_image,
         USER_FACING_ERRORS as IMAGE_USER_FACING_ERRORS,
     )
 
@@ -2776,76 +2806,29 @@ def run_app() -> None:
             )
             img_submitted = st.form_submit_button("🔍 Analyze image", type="primary")
 
-        effective_image = True
-        url_type = MediaType.IMAGE
-
-        # ── Determine image source ────────────────────────────────────────────
-        source_path: Path | None = None
-        source_url_str: str = ""
-
-        if uploaded_file is not None:
-            # Save uploaded file to temp location
-            uploads_dir = CONFIG.work_dir / "image_downloads"
-            uploads_dir.mkdir(parents=True, exist_ok=True)
-            suffix = Path(uploaded_file.name).suffix.lower() or ".jpg"
-            temp_img = uploads_dir / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
-            temp_img.write_bytes(uploaded_file.read())
-            source_path = temp_img
-            source_url_str = f"upload://{uploaded_file.name}"
-
-        # ── Analyze image on submit or upload ─────────────────────────────────
-        should_analyze_image = (img_submitted and img_url.strip()) or (
-            uploaded_file is not None
-            and st.session_state.get("_last_upload") != uploaded_file.name
-        )
-        if uploaded_file is not None:
-            st.session_state["_last_upload"] = uploaded_file.name
-
-        if should_analyze_image:
-            if source_path and source_path.exists():
-                # ── Uploaded file path ────────────────────────────────────────
-                with st.status("Analysing image...", expanded=True) as status:
-                    try:
-                        from recreate_image import analyze_image, ImageAnalysisResult
-                        notify_fn = lambda msg: status.update(label=msg)
-                        analysis = analyze_image(source_path, notify_fn)
-                        import hashlib
-                        h = hashlib.sha256(source_path.read_bytes()).hexdigest()
-                        image_result = ImageAnalysisResult(
-                            image_sha=h,
-                            image_path=str(source_path),
-                            source_url=source_url_str,
-                            title=uploaded_file.name,
-                            extractor="upload",
-                            analysis=analysis.model_dump(),
-                        )
-                        # Immediately delete temp upload after Gemini processes it
-                        try:
-                            source_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                    except (IMAGE_USER_FACING_ERRORS + USER_FACING_ERRORS) as exc:
-                        status.update(label="Analysis failed", state="error")
-                        st.error(str(exc))
-                        image_result = None
-                    else:
-                        st.session_state.image_result = image_result
-                        st.session_state.image_generated = None
-                        status.update(label="Analysis complete", state="complete", expanded=False)
-            elif img_submitted and img_url.strip():
-                # ── URL-based image ───────────────────────────────────────────
-                with st.status("Downloading and analysing image...", expanded=True) as status:
-                    try:
-                        image_result = analyze_image_url(
-                            img_url, lambda msg: status.update(label=msg)
-                        )
-                    except (IMAGE_USER_FACING_ERRORS + USER_FACING_ERRORS) as exc:
-                        status.update(label="Analysis failed", state="error")
-                        st.error(str(exc))
-                    else:
-                        st.session_state.image_result = image_result
-                        st.session_state.image_generated = None
-                        status.update(label="Analysis complete", state="complete", expanded=False)
+        # ── Analyze a new upload, or a submitted URL ──────────────────────────
+        image_upload = _new_upload(st.session_state, "_last_image_upload", uploaded_file)
+        if image_upload is not None:
+            temp_img = _save_upload(image_upload, uploaded_file.name, "image_downloads", ".jpg")
+            with st.status("Analysing image...", expanded=True) as status:
+                try:
+                    image_result = analyze_local_image(
+                        temp_img, uploaded_file.name, lambda msg: status.update(label=msg)
+                    )
+                except (IMAGE_USER_FACING_ERRORS + USER_FACING_ERRORS) as exc:
+                    status.update(label="Analysis failed", state="error")
+                    st.error(str(exc))
+                else:
+                    _show_image_result(st, status, image_result)
+        elif img_submitted and img_url.strip():
+            with st.status("Downloading and analysing image...", expanded=True) as status:
+                try:
+                    image_result = analyze_image_url(img_url, lambda msg: status.update(label=msg))
+                except (IMAGE_USER_FACING_ERRORS + USER_FACING_ERRORS) as exc:
+                    status.update(label="Analysis failed", state="error")
+                    st.error(str(exc))
+                else:
+                    _show_image_result(st, status, image_result)
 
         _render_image_results(st, is_image_mode)
         return  # image mode done — skip video form below
@@ -2858,16 +2841,9 @@ def run_app() -> None:
         help="Upload up to 60s video. File is automatically deleted after Gemini analysis.",
     )
 
-    if (
-        uploaded_video is not None
-        and st.session_state.get("_last_video_upload") != uploaded_video.name
-    ):
-        st.session_state["_last_video_upload"] = uploaded_video.name
-        uploads_dir = CONFIG.work_dir / "video_uploads"
-        uploads_dir.mkdir(parents=True, exist_ok=True)
-        suffix = Path(uploaded_video.name).suffix.lower() or ".mp4"
-        temp_video = uploads_dir / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
-        temp_video.write_bytes(uploaded_video.read())
+    video_upload = _new_upload(st.session_state, "_last_video_upload", uploaded_video)
+    if video_upload is not None:
+        temp_video = _save_upload(video_upload, uploaded_video.name, "video_uploads", ".mp4")
 
         with st.status("Analysing uploaded video...", expanded=True) as status:
             try:

@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -341,7 +342,22 @@ def _analysis_prompt_image() -> str:
     )
 
 
+def _valid_aspect(value: str) -> str:
+    """'W:H' snapped to the nearest ratio image generators accept; '1:1' if unreadable."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[:x/]\s*(\d+(?:\.\d+)?)\s*", value or "")
+    if not match or float(match.group(2)) == 0:
+        return "1:1"
+    return closest_aspect_ratio(float(match.group(1)), float(match.group(2)))
+
+
+def _with_aspect_flag(prompt: str, aspect: str) -> str:
+    """Exactly one correct Midjourney '--ar', whatever Gemini wrote."""
+    cleaned = re.sub(r"\s*--(?:ar|aspect)\s+\S+", "", prompt).rstrip()
+    return f"{cleaned} --ar {aspect}"
+
+
 def _plan_prompt_image(analysis: ImageAnalysis) -> str:
+    aspect = _valid_aspect(analysis.aspect_ratio)
     overlays_desc = ""
     if analysis.has_text and analysis.text_overlays:
         overlay_lines = []
@@ -364,7 +380,7 @@ def _plan_prompt_image(analysis: ImageAnalysis) -> str:
         f"Lighting: {analysis.lighting}\n"
         f"Background: {analysis.background}\n"
         f"Mood: {analysis.mood}\n"
-        f"Aspect ratio: {analysis.aspect_ratio}\n"
+        f"Aspect ratio: {aspect}\n"
         f"Hook: {analysis.hook}\n"
         f"Why it works: {analysis.why_it_works}\n\n"
 
@@ -372,7 +388,7 @@ def _plan_prompt_image(analysis: ImageAnalysis) -> str:
 
         "=== IMAGE GENERATION RULES ===\n"
         "- nano_banana_prompt: natural language, most important elements first, very detailed.\n"
-        "- flux_midjourney_prompt: same content + append '--ar {aspect} --q 2 --style raw'.\n"
+        f"- flux_midjourney_prompt: same content + append '--ar {aspect} --q 2 --style raw'.\n"
         "- stable_diffusion_prompt: comma-separated tokens, include 'masterpiece, best quality'.\n"
         "- negative_prompt: always include 'blurry, low quality, watermark, text, ugly, deformed'.\n\n"
 
@@ -445,7 +461,12 @@ def generate_image_plan(
         )
         return _parse_structured(response, ImageRecreationPlan)
 
-    return call_gemini(run, notify, task="text", label="image-plan")
+    plan = call_gemini(run, notify, task="text", label="image-plan")
+    aspect = _valid_aspect(analysis.aspect_ratio)
+    return plan.model_copy(update={
+        "aspect_ratio": aspect,
+        "flux_midjourney_prompt": _with_aspect_flag(plan.flux_midjourney_prompt, aspect),
+    })
 
 
 def generate_social_metadata_for_image(
@@ -598,13 +619,72 @@ def _image_cache_path(sha: str) -> Path:
 
 def _load_image_cached(sha: str) -> ImageAnalysisResult | None:
     p = _image_cache_path(sha)
-    if p.exists():
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data["from_cache"] = True
+        result = ImageAnalysisResult(**data)
+        ImageAnalysis.model_validate(result.analysis)
+        return result
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning(f"[CACHE] ignoring unreadable image cache {p.name}: {exc}")
+        return None
+
+
+def _pixel_aspect_ratio(path: Path) -> str | None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+    except Exception as exc:  # unreadable / unsupported format: keep Gemini's value
+        logger.warning(f"[IMAGE] could not read size of {path.name}: {exc}")
+        return None
+    return closest_aspect_ratio(width, height)
+
+
+def _analyze_image_file(
+    path: Path, *, source_url: str, title: str, extractor: str, notify: Notify = _noop_notify,
+) -> ImageAnalysisResult:
+    """Hash -> cache -> Gemini -> cache, for a downloaded or uploaded image.
+    The image file is always deleted afterwards (success, failure or cache
+    hit); only the analysis JSON is kept."""
+    try:
+        image_sha = _sha256(path)
+        if cached := _load_image_cached(image_sha):
+            notify("Using saved analysis for this image")
+            return cached
+        analysis = analyze_image(path, notify)
+        # A screenshot's pixels include the phone UI, so for uploads Gemini's
+        # reading of the post's own shape is kept; downloads use real pixels.
+        if extractor != "upload" and (measured := _pixel_aspect_ratio(path)):
+            analysis = analysis.model_copy(update={"aspect_ratio": measured})
+    finally:
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            return ImageAnalysisResult(**data, from_cache=True)
-        except Exception:
-            pass
-    return None
+            path.unlink(missing_ok=True)
+            logger.info(f"[CLEANUP] deleted image after analysis: {path.name}")
+        except OSError as exc:
+            logger.warning(f"[CLEANUP] could not delete image {path.name}: {exc}")
+
+    result = ImageAnalysisResult(
+        image_sha=image_sha,
+        image_path=str(path),  # stored for reference; the file is deleted
+        source_url=source_url,
+        title=title,
+        extractor=extractor,
+        analysis=analysis.model_dump(),
+    )
+    _image_cache_path(image_sha).parent.mkdir(parents=True, exist_ok=True)
+    _image_cache_path(image_sha).write_text(
+        json.dumps(asdict(result), indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return result
+
+
+def analyze_local_image(path: Path, title: str = "Uploaded image", notify: Notify = _noop_notify) -> ImageAnalysisResult:
+    """Analyse an uploaded image, with caching. The file is deleted afterwards."""
+    return _analyze_image_file(path, source_url=f"upload://{title}", title=title, extractor="upload", notify=notify)
 
 
 def analyze_image_url(url: str, notify: Notify = _noop_notify) -> ImageAnalysisResult:
@@ -613,14 +693,11 @@ def analyze_image_url(url: str, notify: Notify = _noop_notify) -> ImageAnalysisR
     For all other URLs: uses yt-dlp as before.
     Image file is deleted immediately after Gemini processes it.
     """
-    from recreate_video import detect_url_type, MediaType
-
     safe_url = validate_public_video_url(url)
     downloads = CONFIG.work_dir / "image_downloads"
     temp_dir = downloads / f"tmp_{uuid.uuid4().hex[:10]}"
 
     try:
-        url_type = detect_url_type(safe_url)
         is_instagram = host_is(urlsplit(safe_url).hostname, "instagram.com")
 
         if is_instagram:
@@ -645,39 +722,9 @@ def analyze_image_url(url: str, notify: Notify = _noop_notify) -> ImageAnalysisR
             source_url = downloaded.source_url
             extractor = downloaded.extractor
 
-        image_sha = _sha256(path)
-        final_path = downloads / f"{image_sha}{path.suffix}"
-        if not final_path.exists():
-            shutil.move(str(path), final_path)
+        return _analyze_image_file(path, source_url=source_url, title=title, extractor=extractor, notify=notify)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-
-    if cached := _load_image_cached(image_sha):
-        notify("Using saved analysis for this image")
-        return cached
-
-    analysis = analyze_image(final_path, notify)
-
-    # Immediately delete the image file — only the analysis JSON is kept
-    try:
-        final_path.unlink(missing_ok=True)
-        logger.info(f"[CLEANUP] deleted image after analysis: {final_path.name}")
-    except OSError as exc:
-        logger.warning(f"[CLEANUP] could not delete image {final_path.name}: {exc}")
-
-    result = ImageAnalysisResult(
-        image_sha=image_sha,
-        image_path=str(final_path),  # stored for reference; file is deleted
-        source_url=source_url,
-        title=title,
-        extractor=extractor,
-        analysis=analysis.model_dump(),
-    )
-    _image_cache_path(image_sha).parent.mkdir(parents=True, exist_ok=True)
-    _image_cache_path(image_sha).write_text(
-        json.dumps(asdict(result), indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    return result
 
 
 

@@ -20,6 +20,12 @@ An AI-powered content analysis and recreation studio built with Streamlit and Go
   - 🖥️ **Stable Diffusion / ComfyUI** (with positive and negative prompts)
 - **Text Overlay Extraction**: Detects on-screen typography, fonts, positions, and outputs a ready-to-use Canva / CapCut layout recreation workflow.
 
+### 🎞️ Image to Video
+- **Third option in the sidebar**: upload one image (JPG, PNG, WebP), pick a duration (1–60 s, default 10) and click **Generate video**; preview and download the MP4 on the same page.
+- **Always 9:16, 1080×1920, 30 fps**, with no zoom, pan or fade. Images of another shape are fitted with black bars, so nothing is cropped.
+- **Quality first**: lossless image preparation (EXIF rotation, colour profile converted to sRGB, transparency flattened), Lanczos scaling, H.264 High at CRF 16 tuned for still images, BT.709 colour, silent AAC track, fast-start MP4.
+- Uses only ffmpeg — no Gemini key or quota needed.
+
 ### 🗣️ Dialogue That Matches the Source
 - **Word-for-word transcript** in the spoken language and its own script (Telugu, Hindi, ...), with an English translation for you to read.
 - **Exact lines in the video prompt**: Gemini only decides which line goes in which scene; the app inserts the original words, so dialogue is never translated, reworded or shortened. The prompt states the spoken language and voice.
@@ -107,6 +113,7 @@ python recreate_video.py --url "https://www.youtube.com/shorts/YOUR_VIDEO_ID" --
 ```
 ├── recreate_video.py              # Main unified Streamlit app & video recreation pipeline
 ├── recreate_image.py              # Image analysis, multi-model prompt generation & Canva workflows
+├── image_to_video.py              # Still image -> 9:16 MP4 with ffmpeg (no Gemini)
 ├── recreate_transition_video.py   # Transition video analysis pipeline
 ├── tests/                         # Unit tests for prompt builders and metadata schemas
 ├── requirements.txt               # Project dependencies

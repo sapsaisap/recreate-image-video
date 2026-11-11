@@ -11,6 +11,7 @@ CHAINS = {
     "analysis": ("gemini-2.5-flash", "gemini-3.5-flash-lite"),
     "text": ("gemini-3.5-flash-lite", "gemini-2.5-flash-lite"),
     "metadata": ("gemini-2.5-flash-lite", "gemini-3.5-flash-lite"),
+    "story": ("gemini-2.5-flash-lite", "gemini-3.5-flash-lite"),
 }
 NOV_11 = datetime(2026, 11, 11, 12, 0, tzinfo=rv._PACIFIC)
 

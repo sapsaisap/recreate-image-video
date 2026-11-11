@@ -863,6 +863,15 @@ class URLVideoError(ValueError):
     pass
 
 
+class NoVideoInPost(URLVideoError):
+    """The link works but the post holds no video (e.g. an Instagram photo post)."""
+
+
+def _is_no_video(exc: Exception) -> bool:
+    lowered = str(exc).lower()
+    return "there is no video in this post" in lowered or "no video formats found" in lowered
+
+
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
 
@@ -1142,6 +1151,8 @@ def download_video(url: str, destination: Path, notify: Notify = _noop_notify) -
 
     if rejection:
         raise URLVideoError(rejection["reason"])
+    if last_exc is not None and _is_no_video(last_exc):
+        raise NoVideoInPost("This post has no video -- it is a photo post.") from last_exc
     if last_exc is not None:
         raise URLVideoError(_download_error_message(safe_url, last_exc)) from last_exc
     if not info or info.get("_type") in {"playlist", "multi_video"}:
@@ -2743,12 +2754,15 @@ def run_app() -> None:
     st.set_page_config(page_title="Recreate any post", page_icon="🎬", layout="centered")
 
     # ── Sidebar navigation ───────────────────────────────────────────────────
+    # An image link analysed from the Video tab asks for the Image view; the
+    # radio's value can only be set before the radio is drawn.
+    if st.session_state.pop("_switch_to_image", False):
+        st.session_state["app_mode"] = IMAGE_MODE
     with st.sidebar:
         st.markdown("## 🎬 Recreate")
         mode = st.radio(
             "What are you recreating?",
-            options=["🎬 Video / Reel", "🖼️ Image Post"],
-            index=0,
+            options=[VIDEO_MODE, IMAGE_MODE],
             key="app_mode",
         )
         st.divider()
@@ -2759,7 +2773,7 @@ def run_app() -> None:
         st.divider()
         _render_quota_sidebar(st)
 
-    is_image_mode = mode == "🖼️ Image Post"
+    is_image_mode = mode == IMAGE_MODE
 
     problems = CONFIG.problems()
     if problems:
@@ -2863,38 +2877,31 @@ def run_app() -> None:
 
     with st.form("analyze_form"):
         url = st.text_input(
-            "Or paste public video URL",
+            "Or paste a public link (video, Reel, or Instagram photo post)",
             placeholder="https://www.youtube.com/shorts/... or https://www.instagram.com/reel/...",
         )
-
-        url_type = detect_url_type(url) if url.strip() else MediaType.VIDEO
-        effective_image = url_type == MediaType.IMAGE  # direct image URL in video form
-
-        if url_type == MediaType.AMBIGUOUS:
-            st.caption("⚠️ This Instagram link could be a photo or a Reel. Select below:")
-            post_type = st.radio(
-                "Post type",
-                options=["🖼️ Image / Photo post", "🎬 Video / Reel"],
-                horizontal=True,
-                key="ambiguous_type",
-                label_visibility="collapsed",
-            )
-            effective_image = post_type == "🖼️ Image / Photo post"
-
-        btn_label = "🔍 Analyze image" if effective_image else "🔍 Analyze video URL"
-        submitted = st.form_submit_button(btn_label, type="primary")
+        submitted = st.form_submit_button("🔍 Analyze link", type="primary")
 
     # ── Analysis ─────────────────────────────────────────────────────────────
-    if submitted and url.strip():
-        if url_type == MediaType.IMAGE and effective_image:
-            st.info("Auto-detected as an **image URL** — use the 🖼️ Image Post tab for image posts.")
-
-        # ── VIDEO pipeline ────────────────────────────────────────────────────
+    # Image links go to the image pipeline. An Instagram /p/ link can be either,
+    # so the video download is tried first and a photo post falls back.
+    url_type = detect_url_type(url) if submitted and url.strip() else MediaType.VIDEO
+    if submitted and url.strip() and url_type == MediaType.IMAGE:
+        _analyze_image_link(st, url)
+    elif submitted and url.strip():
+        photo_post = False
         with st.status("Starting video analysis...", expanded=True) as status:
             try:
                 video_result = analyze_url(
                     url, lambda msg: status.update(label=msg)
                 )
+            except NoVideoInPost as exc:
+                if url_type == MediaType.AMBIGUOUS:
+                    status.update(label="This post is a photo -- analysing it as an image", state="complete")
+                    photo_post = True
+                else:
+                    status.update(label="Analysis failed", state="error")
+                    st.error(str(exc))
             except USER_FACING_ERRORS as exc:
                 status.update(label="Analysis failed", state="error")
                 err_msg = str(exc)
@@ -2916,8 +2923,33 @@ def run_app() -> None:
                 st.session_state.video_prompts = {}
                 label = "Analysis loaded from cache" if video_result.from_cache else "Analysis complete"
                 status.update(label=label, state="complete", expanded=False)
+        if photo_post:
+            _analyze_image_link(st, url)
 
     _render_video_results(st)
+
+
+IMAGE_MODE = "🖼️ Image Post"
+VIDEO_MODE = "🎬 Video / Reel"
+
+
+def _analyze_image_link(st, url: str) -> None:
+    """An image link pasted in the Video tab: analyse it as an image post, then
+    rerun into the Image view. The sidebar switch happens at the top of the
+    next run, because a widget's value cannot change after it is drawn."""
+    from recreate_image import USER_FACING_ERRORS as IMAGE_USER_FACING_ERRORS, analyze_image_url
+
+    with st.status("Downloading and analysing image...", expanded=True) as status:
+        try:
+            image_result = analyze_image_url(url, lambda msg: status.update(label=msg))
+        except (IMAGE_USER_FACING_ERRORS + USER_FACING_ERRORS) as exc:
+            status.update(label="Analysis failed", state="error")
+            st.error(str(exc))
+            return
+    st.session_state.image_result = image_result
+    st.session_state.image_generated = None
+    st.session_state["_switch_to_image"] = True
+    st.rerun()
 
 
 def _render_video_results(st) -> None:

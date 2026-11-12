@@ -165,22 +165,18 @@ MODEL_SHUTDOWN = {"gemini-2.5-flash": date(2026, 12, 1)}
 #   metadata: writes the YouTube / Instagram metadata (Google Search)
 #   story:    Summarise to Short's fact-checked script (Google Search)
 # Newest full model first; gemini-3.1-flash-lite last (works, but took ~25 s
-# for a one-word reply). Steps that use Google Search start on the 2.5
-# models, the only ones whose free tier includes it. gemini-2.5-flash drops
-# out automatically at its shutdown on 2026-12-01.
+# for a one-word reply). Every step uses the same order. Google Search runs
+# only on the 2.5 models (FREE_SEARCH_MODELS); the others answer without it.
+# gemini-2.5-flash drops out automatically at its shutdown on 2026-12-01.
 DEFAULT_MODEL_CHAIN = (
     "gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite,"
-    "gemini-3.1-flash-lite"
-)
-SEARCH_MODEL_CHAIN = (
-    "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,"
     "gemini-3.1-flash-lite"
 )
 TASK_MODEL_ENV = {
     "analysis": ("GEMINI_ANALYSIS_MODELS", DEFAULT_MODEL_CHAIN),
     "text": ("GEMINI_TEXT_MODELS", DEFAULT_MODEL_CHAIN),
-    "metadata": ("GEMINI_METADATA_MODELS", SEARCH_MODEL_CHAIN),
-    "story": ("GEMINI_STORY_MODELS", SEARCH_MODEL_CHAIN),
+    "metadata": ("GEMINI_METADATA_MODELS", DEFAULT_MODEL_CHAIN),
+    "story": ("GEMINI_STORY_MODELS", DEFAULT_MODEL_CHAIN),
 }
 
 # Per-request time limits (seconds). A request that hangs fails at this

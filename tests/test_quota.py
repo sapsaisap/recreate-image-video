@@ -231,10 +231,8 @@ class TestModelOrder:
         assert chain[0] == "gemini-3.6-flash" and chain[-1] == "gemini-3.1-flash-lite"
         assert "gemini-3.8-flash" not in chain and "gemini-3.7-flash" not in chain
 
-    def test_search_steps_start_on_models_with_free_search(self):
-        chain = rv.SEARCH_MODEL_CHAIN.split(",")
-        assert set(chain[:2]) == rv.FREE_SEARCH_MODELS
-        assert rv.TASK_MODEL_ENV["metadata"][1] == rv.TASK_MODEL_ENV["story"][1] == rv.SEARCH_MODEL_CHAIN
+    def test_every_step_uses_the_same_order(self):
+        assert {default for _, default in rv.TASK_MODEL_ENV.values()} == {rv.DEFAULT_MODEL_CHAIN}
 
     def test_every_default_model_is_accepted(self):
         for _, default in rv.TASK_MODEL_ENV.values():

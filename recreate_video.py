@@ -75,7 +75,8 @@ def _inject_streamlit_secrets() -> None:
             return
         for key in (
             "GEMINI_API_KEY", "COOKIES_FILE", "DOWNLOAD_PROXY", "GEMINI_RPM",
-            "GEMINI_ANALYSIS_MODELS", "GEMINI_TEXT_MODELS", "GEMINI_METADATA_MODELS",
+            "GEMINI_ANALYSIS_MODELS", "GEMINI_TEXT_MODELS", "GEMINI_METADATA_MODELS", "GEMINI_STORY_MODELS",
+            "SUMMARY_MAX_VIDEO_SECONDS",
             "DIALOGUE_SCRIPT", "METADATA_LANGUAGE", "URL_ALLOWLIST",
         ):
             if key in secrets and not os.environ.get(key):
@@ -161,6 +162,9 @@ TASK_MODEL_ENV = {
     "analysis": ("GEMINI_ANALYSIS_MODELS", "gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
     "text": ("GEMINI_TEXT_MODELS", "gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
     "metadata": ("GEMINI_METADATA_MODELS", "gemini-2.5-flash-lite,gemini-3.5-flash-lite"),
+    # Summarise to Short: fact-checked script + image prompts. Starts on a
+    # model whose free tier includes Google Search.
+    "story": ("GEMINI_STORY_MODELS", "gemini-2.5-flash-lite,gemini-3.5-flash-lite"),
 }
 
 
@@ -173,6 +177,8 @@ class Config:
     rpm: int = max(1, _env_int("GEMINI_RPM", 8))
     max_wait_seconds: int = max(30, _env_int("RATE_LIMIT_MAX_WAIT_SECONDS", 900))
     max_video_seconds: int = _env_int("MAX_VIDEO_SECONDS", 60)
+    # Summarise to Short takes longer sources (YouTube / Instagram up to 5 min).
+    summary_max_video_seconds: int = _env_int("SUMMARY_MAX_VIDEO_SECONDS", 300)
     min_video_seconds: int = _env_int("MIN_VIDEO_SECONDS", 1)
     max_download_mb: int = _env_int("MAX_DOWNLOAD_MB", 200)
     output_durations: tuple[int, ...] = tuple(
@@ -1059,13 +1065,23 @@ class DownloadedVideo:
     extractor: str
 
 
-def download_video(url: str, destination: Path, notify: Notify = _noop_notify) -> DownloadedVideo:
+def download_video(
+    url: str,
+    destination: Path,
+    notify: Notify = _noop_notify,
+    *,
+    max_seconds: int | None = None,
+    max_height: int = 720,
+) -> DownloadedVideo:
+    """max_seconds defaults to MAX_VIDEO_SECONDS. max_height caps the picture:
+    720p is plenty for Gemini; modes that reuse real frames ask for more."""
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError
 
     safe_url = validate_public_video_url(url)
     destination.mkdir(parents=True, exist_ok=True)
     max_bytes = CONFIG.max_download_mb * 1024 * 1024
+    limit = max_seconds or CONFIG.max_video_seconds
     rejection: dict[str, str] = {}
 
     def match_filter(info: dict, *, incomplete: bool):
@@ -1073,11 +1089,8 @@ def download_video(url: str, destination: Path, notify: Notify = _noop_notify) -
         if info.get("is_live") or info.get("live_status") in {"is_live", "is_upcoming"}:
             reason = "Live streams are not supported."
         duration = info.get("duration")
-        if not reason and duration and duration > CONFIG.max_video_seconds:
-            reason = (
-                f"This video is {duration:.0f} seconds long. The maximum is "
-                f"{CONFIG.max_video_seconds} seconds."
-            )
+        if not reason and duration and duration > limit:
+            reason = f"This video is {duration:.0f} seconds long. The maximum is {limit} seconds."
         size = info.get("filesize") or info.get("filesize_approx")
         if not reason and size and size > max_bytes:
             reason = f"This video is larger than the {CONFIG.max_download_mb} MB limit."
@@ -1094,11 +1107,11 @@ def download_video(url: str, destination: Path, notify: Notify = _noop_notify) -
             notify(f"Downloading video... {min(done / total, 0.99) * 100:.0f}%")
 
     options: dict[str, Any] = {
-        # Capped at 720p: Gemini samples video at low resolution anyway, and a
-        # smaller file uploads faster.
+        # Capped (720p by default): Gemini samples video at low resolution
+        # anyway, and a smaller file uploads faster.
         "format": (
-            "bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/"
-            "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
+            f"bv*[ext=mp4][height<={max_height}]+ba[ext=m4a]/b[ext=mp4][height<={max_height}]/"
+            f"bv*[height<={max_height}]+ba/b[height<={max_height}]/bv*+ba/b"
         ),
         "outtmpl": str(destination / "source.%(ext)s"),
         "merge_output_format": "mp4",
@@ -1237,11 +1250,12 @@ def probe_video(path: Path) -> MediaInfo:
     )
 
 
-def validate_media(media: MediaInfo) -> None:
-    if media.duration_seconds > CONFIG.max_video_seconds + 0.5:
+def validate_media(media: MediaInfo, max_seconds: int | None = None) -> None:
+    limit = max_seconds or CONFIG.max_video_seconds
+    if media.duration_seconds > limit + 0.5:
         raise VideoValidationError(
             f"This video is {media.duration_seconds:.0f} seconds long. "
-            f"The maximum is {CONFIG.max_video_seconds} seconds."
+            f"The maximum is {limit} seconds."
         )
     if media.duration_seconds < CONFIG.min_video_seconds:
         raise VideoValidationError(
@@ -2180,67 +2194,94 @@ def _grounding_info(response: Any) -> tuple[list[str], list[dict[str, str]]]:
     return queries, sources
 
 
-def _parse_draft_text(response: Any) -> SocialMetadataDraft:
+def _parse_json_reply(response: Any, schema: type[BaseModel]) -> BaseModel:
     """Search replies come back as text, sometimes with prose around the JSON."""
     try:
-        return _parse_structured(response, SocialMetadataDraft)
+        return _parse_structured(response, schema)
     except _RetryableResponse:
         text = getattr(response, "text", None) or ""
         start, end = text.find("{"), text.rfind("}")
         if start < 0 or end <= start:
             raise
         try:
-            return SocialMetadataDraft.model_validate_json(text[start:end + 1])
+            return schema.model_validate_json(text[start:end + 1])
         except ValueError as exc:
-            raise _RetryableResponse(f"Gemini returned invalid metadata JSON: {exc}") from exc
+            raise _RetryableResponse(f"Gemini returned invalid JSON: {exc}") from exc
 
 
-def generate_metadata(context: str, kind: str, language: str, notify: Notify = _noop_notify) -> SocialMetadata:
-    """One free-tier Gemini call for YouTube + Instagram metadata.
+def generate_with_optional_search(
+    build_prompt: Callable[[bool], str],
+    schema: type[BaseModel],
+    *,
+    task: str,
+    label: str,
+    notify: Notify = _noop_notify,
+    contents_before: list | None = None,
+    temperature: float = 0.7,
+) -> tuple[BaseModel, list[str], list[dict[str, str]]]:
+    """One free-tier Gemini call, grounded in Google Search when it can be.
 
-    On a model whose free tier includes Google Search the call is grounded in
-    live searches. Otherwise -- or once today's free search quota is used up --
-    it falls back to Gemini's own knowledge, and SocialMetadata.grounded says so.
+    On a model whose free tier includes Google Search (FREE_SEARCH_MODELS) the
+    call searches; 2.5 models cannot combine search with a response schema, so
+    build_prompt(True) must ask for JSON as plain text. Otherwise -- or once
+    today's free search quota is used up -- build_prompt(False) runs with the
+    schema enforced. Returns (result, searches run, sources used); both lists
+    are empty when nothing was searched. `contents_before` (e.g. images) is
+    sent ahead of the prompt.
     """
     from google.genai import types as genai_types
 
     client = get_client()
 
-    def ask(model: str, search: bool) -> SocialMetadata:
+    def ask(model: str, search: bool):
         options: dict[str, Any] = {
             "http_options": {"api_version": "v1beta"},
-            "temperature": 0.7,
+            "temperature": temperature,
             "automatic_function_calling": genai_types.AutomaticFunctionCallingConfig(disable=True),
         }
         if search:
             options["tools"] = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
         else:
-            options.update(response_mime_type="application/json", response_schema=SocialMetadataDraft)
+            options.update(response_mime_type="application/json", response_schema=schema)
         response = client.models.generate_content(
             model=model,
-            contents=[_metadata_prompt(context, kind, language, search)],
+            contents=[*(contents_before or []), build_prompt(search)],
             config=genai_types.GenerateContentConfig(**options),
         )
         if not search:
-            return _finish_metadata(_parse_structured(response, SocialMetadataDraft), kind, [], [])
+            return _parse_structured(response, schema), [], []
         queries, sources = _grounding_info(response)
-        return _finish_metadata(_parse_draft_text(response), kind, queries, sources)
+        return _parse_json_reply(response, schema), queries, sources
 
-    def run(model: str) -> SocialMetadata:
+    def run(model: str):
         if model in FREE_SEARCH_MODELS and not _search_used_up():
             try:
                 return ask(model, search=True)
             except Exception as exc:
                 if not _is_search_quota(exc):
                     raise
-                logger.warning(f"[GEMINI] {kind}-metadata model={model} search quota used up: {exc}")
+                logger.warning(f"[GEMINI] {label} model={model} search quota used up: {exc}")
                 _mark_search_used_up()
-                notify("Today's free Google Search quota is used up -- writing metadata without search")
+                notify("Today's free Google Search quota is used up -- continuing without search")
                 _record_call(model)
         return ask(model, search=False)
 
+    return call_gemini(run, notify, task=task, label=label)
+
+
+def generate_metadata(context: str, kind: str, language: str, notify: Notify = _noop_notify) -> SocialMetadata:
+    """One free-tier Gemini call for YouTube + Instagram metadata, grounded in
+    Google Search when today's free quota allows; SocialMetadata.grounded
+    says whether it was."""
     notify("Researching keywords and writing social media metadata...")
-    return call_gemini(run, notify, task="metadata", label=f"{kind}-metadata")
+    draft, queries, sources = generate_with_optional_search(
+        lambda search: _metadata_prompt(context, kind, language, search),
+        SocialMetadataDraft,
+        task="metadata",
+        label=f"{kind}-metadata",
+        notify=notify,
+    )
+    return _finish_metadata(draft, kind, queries, sources)
 
 
 def generate_social_metadata(
@@ -2762,7 +2803,7 @@ def run_app() -> None:
         st.markdown("## 🎬 Recreate")
         mode = st.radio(
             "What are you recreating?",
-            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE],
+            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE],
             key="app_mode",
         )
         st.divider()
@@ -2778,6 +2819,11 @@ def run_app() -> None:
         from image_to_video import render_page
 
         render_page(st)
+        return
+    if mode == SUMMARY_MODE:  # shows its own Gemini key check on its first step
+        from summary_short import render_page as render_summary_page
+
+        render_summary_page(st)
         return
 
     is_image_mode = mode == IMAGE_MODE
@@ -2939,6 +2985,7 @@ def run_app() -> None:
 IMAGE_MODE = "🖼️ Image Post"
 VIDEO_MODE = "🎬 Video / Reel"
 IMAGE_TO_VIDEO_MODE = "🎞️ Image to Video"
+SUMMARY_MODE = "📝 Summarise to Short"
 
 
 def _analyze_image_link(st, url: str) -> None:

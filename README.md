@@ -20,6 +20,16 @@ An AI-powered content analysis and recreation studio built with Streamlit and Go
   - 🖥️ **Stable Diffusion / ComfyUI** (with positive and negative prompts)
 - **Text Overlay Extraction**: Detects on-screen typography, fonts, positions, and outputs a ready-to-use Canva / CapCut layout recreation workflow.
 
+### 📝 Summarise to Short
+Turn a YouTube / Instagram video of up to 5 minutes into a **10, 15 or 20-second** vertical Short that tells its content in brief — images + voice-over, no video model.
+1. **Video**: paste a link or upload, pick the length, click **Analyse**. Gemini watches the whole video (transcript, key points, the clearest visual moments) and writes a fact-checked script (Google Search on the free tier when available) in the source's language.
+2. **Prompts**: one card per scene, each a **📷 real frame** (the sharpest frame from the source, for places, products, charts, demos), **🎨 AI from reference** (attach the shown frame in Google Flow) or **✨ full AI**. Change the type per scene; download all prompts + reference frames.
+3. **Images**: real frames are filled in; upload your AI images per scene or all at once (filename order).
+4. **Voice-over**: Microsoft Edge TTS (free) — language detected from the video, male/female voice, one natural take fitted to the length by adjusting speed (and shortening the script once if needed). You can upload your own voice-over instead.
+5. **Video**: gentle zoom/pan per image, crossfades, voice at -14 LUFS, 1080×1920 — preview and download, with a credit line for the original creator.
+
+Real footage is limited to about a third of the scenes and never used for frames with faces, on-screen text or watermarks (those become "AI from reference"). Uses 2 Gemini calls per video.
+
 ### 🎞️ Image to Video
 - **Third option in the sidebar**: upload one image (JPG, PNG, WebP), pick a duration (1–60 s, default 10) and click **Generate video**; preview and download the MP4 on the same page.
 - **Always 9:16, 1080×1920, 30 fps**, with no zoom, pan or fade. Images of another shape are fitted with black bars, so nothing is cropped.
@@ -114,6 +124,9 @@ python recreate_video.py --url "https://www.youtube.com/shorts/YOUR_VIDEO_ID" --
 ├── recreate_video.py              # Main unified Streamlit app & video recreation pipeline
 ├── recreate_image.py              # Image analysis, multi-model prompt generation & Canva workflows
 ├── image_to_video.py              # Still image -> 9:16 MP4 with ffmpeg (no Gemini)
+├── summary_short.py               # Summarise to Short: analysis, script, 5-step page
+├── voiceover.py                   # Edge TTS voice-over fitted to a target length
+├── slideshow.py                   # Images + voice -> 9:16 MP4 with motion and crossfades
 ├── recreate_transition_video.py   # Transition video analysis pipeline
 ├── tests/                         # Unit tests for prompt builders and metadata schemas
 ├── requirements.txt               # Project dependencies

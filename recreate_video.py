@@ -2803,7 +2803,7 @@ def run_app() -> None:
         st.markdown("## 🎬 Recreate")
         mode = st.radio(
             "What are you recreating?",
-            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE],
+            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE],
             key="app_mode",
         )
         st.divider()
@@ -2819,6 +2819,11 @@ def run_app() -> None:
         from image_to_video import render_page
 
         render_page(st)
+        return
+    if mode == SUMMARY_MODE:  # shows its own Gemini key check on its first step
+        from summary_short import render_page as render_summary_page
+
+        render_summary_page(st)
         return
 
     is_image_mode = mode == IMAGE_MODE
@@ -2980,6 +2985,7 @@ def run_app() -> None:
 IMAGE_MODE = "🖼️ Image Post"
 VIDEO_MODE = "🎬 Video / Reel"
 IMAGE_TO_VIDEO_MODE = "🎞️ Image to Video"
+SUMMARY_MODE = "📝 Summarise to Short"
 
 
 def _analyze_image_link(st, url: str) -> None:

@@ -46,7 +46,13 @@ WRAPPER = textwrap.dedent('''
 
 
 @pytest.fixture
-def app(tmp_path):
+def app(tmp_path, monkeypatch):
+    # The wrapper swaps functions on modules shared with every other test;
+    # registering them here makes pytest put the originals back afterwards.
+    import recreate_image as ri
+
+    for module, name in [(rv, "analyze_url"), (rv, "CONFIG"), (ri, "analyze_image_url")]:
+        monkeypatch.setattr(module, name, getattr(module, name))
     wrapper = tmp_path / "app.py"
     wrapper.write_text(WRAPPER.format(repo=str(REPO), tests=str(REPO / "tests"), work=str(tmp_path / "work")),
                        encoding="utf-8")

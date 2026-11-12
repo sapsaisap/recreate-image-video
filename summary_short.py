@@ -34,6 +34,8 @@ import slideshow
 import voiceover
 from recreate_video import (
     CONFIG,
+    TIMEOUT_LONG_VIDEO_SECONDS,
+    TIMEOUT_TEXT_SECONDS,
     USER_FACING_ERRORS,
     MediaInfo,
     Notify,
@@ -43,6 +45,7 @@ from recreate_video import (
     _upload_and_wait,
     call_gemini,
     download_video,
+    gemini_http_options,
     get_client,
     generate_with_optional_search,
     probe_video,
@@ -335,7 +338,7 @@ def analyse_source(path: Path, media: MediaInfo, notify: Notify = _noop_notify) 
                 model=model,
                 contents=[video_part, prompt],
                 config=genai_types.GenerateContentConfig(
-                    http_options={"api_version": "v1beta"},
+                    http_options=gemini_http_options(TIMEOUT_LONG_VIDEO_SECONDS),
                     response_mime_type="application/json",
                     response_schema=SourceAnalysis,
                     media_resolution=genai_types.MediaResolution.MEDIA_RESOLUTION_LOW,
@@ -428,7 +431,7 @@ def rewrite_script(narrations: list[str], instruction: str, notify: Notify = _no
         response = client.models.generate_content(
             model=model, contents=[request],
             config=genai_types.GenerateContentConfig(
-                http_options={"api_version": "v1beta"}, response_mime_type="application/json",
+                http_options=gemini_http_options(TIMEOUT_TEXT_SECONDS), response_mime_type="application/json",
                 response_schema=ScriptRewrite, temperature=0.4,
                 automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
             ),

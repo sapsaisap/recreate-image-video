@@ -153,19 +153,38 @@ FREE_TIER_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemi
 # keeping it would only spend that other model's quota twice.
 MODEL_SHUTDOWN = {"gemini-2.5-flash": date(2026, 12, 1)}
 
-# Which models each kind of Gemini call tries, in order. Spreading the steps
-# of one run over different models stretches the per-model daily quotas.
-#   analysis: watches the video / looks at the image (needs the best vision)
+# Which models each kind of Gemini call tries, in order. call_gemini starts
+# with the first model that is not used up today and not cooling down after
+# a "busy" / timeout, so a struggling model costs seconds, not minutes.
+#   analysis: watches the video / looks at the image
 #   text:     writes the recreation prompt from the analysis JSON
-#   metadata: writes the YouTube / Instagram metadata
+#   metadata: writes the YouTube / Instagram metadata (Google Search)
+#   story:    Summarise to Short's fact-checked script (Google Search)
+# gemini-2.5-flash leads (best quality, free Google Search) until its
+# shutdown on 2026-12-01, after which it drops out automatically.
+DEFAULT_MODEL_CHAIN = "gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"
 TASK_MODEL_ENV = {
-    "analysis": ("GEMINI_ANALYSIS_MODELS", "gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
-    "text": ("GEMINI_TEXT_MODELS", "gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
-    "metadata": ("GEMINI_METADATA_MODELS", "gemini-2.5-flash-lite,gemini-3.5-flash-lite"),
-    # Summarise to Short: fact-checked script + image prompts. Starts on a
-    # model whose free tier includes Google Search.
-    "story": ("GEMINI_STORY_MODELS", "gemini-2.5-flash-lite,gemini-3.5-flash-lite"),
+    "analysis": ("GEMINI_ANALYSIS_MODELS", DEFAULT_MODEL_CHAIN),
+    "text": ("GEMINI_TEXT_MODELS", DEFAULT_MODEL_CHAIN),
+    "metadata": ("GEMINI_METADATA_MODELS", DEFAULT_MODEL_CHAIN),
+    "story": ("GEMINI_STORY_MODELS", DEFAULT_MODEL_CHAIN),
 }
+
+# Per-request time limits (seconds). A request that hangs fails at this
+# point and the next model is tried, instead of waiting ~90 s or more.
+TIMEOUT_TEXT_SECONDS = 90  # a full recreation plan with thinking can take ~60 s
+TIMEOUT_SEARCH_SECONDS = 90  # Google Search grounding adds a few searches
+TIMEOUT_IMAGE_SECONDS = 90
+TIMEOUT_VIDEO_SECONDS = 180
+TIMEOUT_LONG_VIDEO_SECONDS = 300  # Summarise to Short: sources up to 5 minutes
+# Metadata needs little reasoning: a small thinking budget on gemini-2.5-flash
+# makes it noticeably faster.
+METADATA_THINKING_BUDGET = 512
+
+
+def gemini_http_options(timeout_seconds: int) -> dict:
+    """http_options for one generate_content call (google-genai wants ms)."""
+    return {"api_version": "v1beta", "timeout": int(timeout_seconds * 1000)}
 
 
 @dataclass(frozen=True)
@@ -475,6 +494,8 @@ if _STATE is None:
 if not hasattr(_STATE, "quota_lock"):  # stash created by an older version of this file
     _STATE.quota_lock = threading.Lock()
     _STATE.quota = None
+if not hasattr(_STATE, "cooldowns"):
+    _STATE.cooldowns = {}  # model -> time.monotonic() until which it is set aside
 
 
 def get_client():
@@ -578,13 +599,40 @@ def _mark_search_used_up() -> None:
         _save_quota_state(state)
 
 
+# ── Short-term cooldowns ────────────────────────────────────────────────────
+# A model that is "busy" (503), timed out or hit a per-minute limit is set
+# aside for a while, for every session, so the next request starts on a
+# model that is answering. In memory only: a restart forgets it.
+COOLDOWN_BUSY_SECONDS = 300
+QUICK_RETRY_SECONDS = 2.0
+
+
+def _cooling_models() -> dict[str, float]:
+    """Models still cooling down -> seconds left."""
+    now = time.monotonic()
+    with _STATE.quota_lock:
+        return {model: until - now for model, until in _STATE.cooldowns.items() if until > now}
+
+
+def _cool_down(model: str, seconds: float) -> None:
+    with _STATE.quota_lock:
+        _STATE.cooldowns[model] = max(_STATE.cooldowns.get(model, 0.0), time.monotonic() + seconds)
+
+
+def _clear_cooldown(model: str) -> None:
+    with _STATE.quota_lock:
+        _STATE.cooldowns.pop(model, None)
+
+
 def quota_snapshot() -> dict:
-    """For the UI: today's calls and unusable models, and time to the reset."""
+    """For the UI: today's calls, unusable and cooling models, time to the reset."""
+    cooling = _cooling_models()
     with _STATE.quota_lock:
         state = _quota_state()
         return {
             "calls": dict(state["calls"]),
             "unavailable": dict(state["unavailable"]),
+            "cooling": cooling,
             "search_used_up": bool(state.get("search_used_up")),
             "reset_in_seconds": _seconds_until_quota_reset(),
         }
@@ -750,39 +798,44 @@ def call_gemini(
     throttle: bool = True,
 ) -> T:
     """Runs fn(model_name) until it succeeds, walking the free-tier model
-    chain of `task` ("analysis", "text" or "metadata", see TASK_MODEL_ENV).
+    chain of `task` ("analysis", "text", "metadata", "story"; TASK_MODEL_ENV).
 
-    - Models already known to be unusable today are skipped without sending
-      a request. That memory is shared by all sessions and lasts until the
-      daily reset at midnight Pacific.
+    - Models used up today are skipped without sending a request (shared by
+      all sessions until the daily reset at midnight Pacific). Models cooling
+      down after "busy" / timeouts / per-minute limits go to the back.
     - 429 per-day limit, 429 "limit: 0" (model not on the free tier) or model
-      not found: waiting cannot help, so mark the model unusable and move to
-      the next one; QuotaExhaustedError once the chain is empty.
-    - 429 per-minute limits: wait Google's retryDelay (or 5/10/20/40/60 s
-      backoff) and retry the same model, until RATE_LIMIT_MAX_WAIT_SECONDS.
-    - 5xx/overloaded/timeout: backoff on the same model, moving to the next
-      model after 3 consecutive failures (free-tier 503 "high demand" spells
-      often last minutes, and each failed call can itself take ~90 s).
+      not found: mark the model unusable for today and move on;
+      QuotaExhaustedError once the chain is empty.
+    - 429 per-minute limit: if another model is available, cool this one
+      down for Google's retryDelay and switch at once; otherwise wait it out.
+    - 5xx / overloaded / timeout: one quick retry (~2 s) on the same model,
+      then cool it down for COOLDOWN_BUSY_SECONDS and switch. Only when no
+      other model is left does it back off (5/10/20/40/60 s).
     - Anything else (bad key, bad request, safety block): GeminiCallError now.
 
     task=None is for Files API calls: they use no model and no daily quota,
     so fn gets "" and only the per-minute / transient handling applies.
     """
     chain = CONFIG.models_for(task) if task else [""]
-    passed_over: set[str] = set()  # transient failures: skipped for this call only
+    passed_over: set[str] = set()  # set aside for the rest of this call
     current = None
     failures_on_model = 0
     deadline = time.monotonic() + CONFIG.max_wait_seconds
 
     while True:
         unusable = _unavailable_models() if task else {}
-        candidates = [m for m in chain if m not in unusable and m not in passed_over]
-        if not candidates:
+        available = [m for m in chain if m not in unusable]
+        if not available:
             details = "; ".join(f"{m}: {unusable.get(m, 'unavailable')}" for m in chain)
             raise QuotaExhaustedError(
                 f"No free-tier Gemini model is left for this step today ({details}). "
                 f"The free quota resets at midnight Pacific time, in about {_format_reset_wait()}."
             )
+        # Every model already set aside in this call: keep going with backoff.
+        candidates = [m for m in available if m not in passed_over] or available
+        if task:
+            cooling = _cooling_models()
+            candidates = [m for m in candidates if m not in cooling] + [m for m in candidates if m in cooling]
         model = candidates[0]
         if model != current:
             if current is not None:
@@ -794,7 +847,10 @@ def call_gemini(
         if task:
             _record_call(model)
         try:
-            return fn(model)
+            result = fn(model)
+            if task:
+                _clear_cooldown(model)
+            return result
         except (GeminiCallError, QuotaExhaustedError):
             raise
         except Exception as exc:
@@ -810,15 +866,27 @@ def call_gemini(
                 raise GeminiCallError(_readable_error(exc)) from exc
 
             failures_on_model += 1
-            if kind == "transient" and failures_on_model > 2 and len(candidates) > 1:
-                logger.warning(f"[GEMINI] {label} model={model} keeps failing, switching to {candidates[1]}")
+            can_switch = bool(task) and any(m != model and m not in passed_over for m in available)
+            if can_switch and kind == "rate":
+                _cool_down(model, _retry_delay_seconds(exc) or 30.0)
                 passed_over.add(model)
+                logger.warning(f"[GEMINI] {label} model={model} per-minute limit, switching: {exc}")
+                notify(f"{model} is rate-limited -- using the next model")
+                continue
+            if can_switch and kind == "transient" and failures_on_model >= 2:
+                _cool_down(model, COOLDOWN_BUSY_SECONDS)
+                passed_over.add(model)
+                logger.warning(f"[GEMINI] {label} model={model} busy, switching: {exc}")
+                notify(f"{model} is busy -- using the next model")
                 continue
 
             delay = _retry_delay_seconds(exc) if kind == "rate" else None
-            if delay is None:
-                delay = min(60.0, 5.0 * 2 ** (failures_on_model - 1))
-            delay += random.uniform(1.0, 3.0)
+            if delay is None and can_switch:  # first transient failure: one quick retry
+                delay = QUICK_RETRY_SECONDS + random.uniform(0.0, 0.5)
+            elif delay is None:
+                delay = min(60.0, 5.0 * 2 ** (failures_on_model - 1)) + random.uniform(1.0, 3.0)
+            else:
+                delay += random.uniform(1.0, 3.0)
             remaining = deadline - time.monotonic()
             if delay > remaining:
                 raise GeminiCallError(
@@ -1448,7 +1516,7 @@ def analyze_video(path: Path, media: MediaInfo, notify: Notify = _noop_notify) -
                 model=model,
                 contents=[uploaded, prompt],
                 config=genai_types.GenerateContentConfig(
-                    http_options={"api_version": "v1beta"},
+                    http_options=gemini_http_options(TIMEOUT_VIDEO_SECONDS),
                     response_mime_type="application/json",
                     response_schema=VideoAnalysis,
                     temperature=0.3,
@@ -2124,16 +2192,36 @@ def _pack_youtube_tags(candidates: list[str], target: int = YOUTUBE_TAGS_TARGET)
     return ", ".join(chosen)
 
 
-def _validate_instagram_hashtags(tags: str | list[str]) -> str:
-    """'#' + letters/marks/digits/underscore (so Telugu or Hindi tags keep their
-    vowel signs), deduplicated, generic tags dropped, at most 5."""
+MAX_FILLER_HASHTAG_LENGTH = 25  # "#telugubiryanirecipe"-length; longer ones nobody searches
+
+
+def _hashtag(text: str) -> str:
+    """'#' + letters/marks/digits/underscore, so Telugu or Hindi tags keep their
+    vowel signs; spaces and punctuation are dropped ('phone drop' -> '#phonedrop')."""
+    body = "".join(ch for ch in text.lstrip("#") if ch == "_" or unicodedata.category(ch)[0] in "LMN")
+    return f"#{body}" if body else ""
+
+
+def _validate_instagram_hashtags(tags: str | list[str], fill_from: list[str] | None = None) -> str:
+    """Exactly INSTAGRAM_HASHTAGS_MAX hashtags when possible: the given ones
+    (deduplicated, generic ones such as #viral dropped), topped up from
+    `fill_from` (ranked keyword ideas, turned into hashtags) when generic tags
+    were removed or Gemini wrote fewer than five."""
     tokens = tags.split() if isinstance(tags, str) else [t for tag in tags for t in tag.split()]
     result: list[str] = []
-    for token in tokens:
-        body = "".join(ch for ch in token.lstrip("#") if ch == "_" or unicodedata.category(ch)[0] in "LMN")
-        tag = f"#{body}"
-        if body and tag.casefold() not in GENERIC_HASHTAGS and tag.casefold() not in {t.casefold() for t in result}:
+
+    def add(tag: str) -> None:
+        if tag and tag.casefold() not in GENERIC_HASHTAGS and tag.casefold() not in {t.casefold() for t in result}:
             result.append(tag)
+
+    for token in tokens:
+        add(_hashtag(token))
+    for idea in fill_from or []:
+        if len(result) >= INSTAGRAM_HASHTAGS_MAX:
+            break
+        tag = _hashtag(idea)
+        if len(tag) <= MAX_FILLER_HASHTAG_LENGTH:
+            add(tag)
     return " ".join(result[:INSTAGRAM_HASHTAGS_MAX])
 
 
@@ -2171,7 +2259,9 @@ def _finish_metadata(
         youtube_description=description,
         youtube_tags=_pack_youtube_tags([draft.primary_keyword, *draft.youtube_tags]),
         instagram_caption=caption,
-        instagram_hashtags=_validate_instagram_hashtags(draft.instagram_hashtags),
+        instagram_hashtags=_validate_instagram_hashtags(
+            draft.instagram_hashtags, fill_from=[draft.primary_keyword, *draft.youtube_tags]
+        ),
         primary_keyword=draft.primary_keyword.strip(),
         grounded=bool(queries or sources),
         search_queries=queries,
@@ -2218,6 +2308,7 @@ def generate_with_optional_search(
     notify: Notify = _noop_notify,
     contents_before: list | None = None,
     temperature: float = 0.7,
+    thinking_budget: int | None = None,
 ) -> tuple[BaseModel, list[str], list[dict[str, str]]]:
     """One free-tier Gemini call, grounded in Google Search when it can be.
 
@@ -2227,7 +2318,8 @@ def generate_with_optional_search(
     today's free search quota is used up -- build_prompt(False) runs with the
     schema enforced. Returns (result, searches run, sources used); both lists
     are empty when nothing was searched. `contents_before` (e.g. images) is
-    sent ahead of the prompt.
+    sent ahead of the prompt. `thinking_budget` caps gemini-2.5-flash's
+    thinking (faster replies); other models ignore it.
     """
     from google.genai import types as genai_types
 
@@ -2235,10 +2327,12 @@ def generate_with_optional_search(
 
     def ask(model: str, search: bool):
         options: dict[str, Any] = {
-            "http_options": {"api_version": "v1beta"},
+            "http_options": gemini_http_options(TIMEOUT_SEARCH_SECONDS if search else TIMEOUT_TEXT_SECONDS),
             "temperature": temperature,
             "automatic_function_calling": genai_types.AutomaticFunctionCallingConfig(disable=True),
         }
+        if thinking_budget is not None and model == "gemini-2.5-flash":
+            options["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=thinking_budget)
         if search:
             options["tools"] = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
         else:
@@ -2280,6 +2374,7 @@ def generate_metadata(context: str, kind: str, language: str, notify: Notify = _
         task="metadata",
         label=f"{kind}-metadata",
         notify=notify,
+        thinking_budget=METADATA_THINKING_BUDGET,
     )
     return _finish_metadata(draft, kind, queries, sources)
 
@@ -2343,7 +2438,24 @@ def render_social_metadata(meta: "SocialMetadata") -> str:
         lines += ["", "SOURCES", *[f"- {source['title']}: {source['uri']}" for source in meta.sources]]
     return "\n".join(lines)
 
-def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _noop_notify) -> GeneratedPrompt:
+def add_social_metadata(generated: GeneratedPrompt, result: "AnalysisResult",
+                        notify: Notify = _noop_notify) -> GeneratedPrompt:
+    """The prompt plus its YouTube / Instagram metadata (one Gemini call),
+    also written next to the saved prompt."""
+    import dataclasses
+
+    plan = RecreationPlan.model_validate(generated.plan)
+    social = generate_social_metadata(result, plan, notify)
+    updated = dataclasses.replace(generated, social_metadata=social, social_text=render_social_metadata(social))
+    saved = Path(updated.saved_to)
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_text(updated.full_text(), encoding="utf-8")
+    saved.with_name(f"{saved.stem}_social.json").write_text(social.model_dump_json(indent=2), encoding="utf-8")
+    return updated
+
+
+def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _noop_notify,
+                    include_social: bool = True) -> GeneratedPrompt:
     from google.genai import types as genai_types
 
     if duration not in CONFIG.output_durations:
@@ -2361,7 +2473,7 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
             model=model,
             contents=contents,
             config=genai_types.GenerateContentConfig(
-                http_options={"api_version": "v1beta"},
+                http_options=gemini_http_options(TIMEOUT_TEXT_SECONDS),
                 response_mime_type="application/json",
                 response_schema=RecreationPlan,
                 temperature=0.7,
@@ -2412,28 +2524,11 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
         reference_sheet=render_reference_sheet(plan),
         warnings=warnings,
     )
-    # social metadata populated below
-    # Generate social metadata (one extra free-tier Gemini call)
-    try:
-        social_meta = generate_social_metadata(result, plan, notify)
-        social_text = render_social_metadata(social_meta)
-        generated = GeneratedPrompt(
-            duration=duration,
-            prompt=prompt,
-            plan=plan.model_dump(),
-            saved_to=str(prompts_dir / f"{stem}.txt"),
-            references=[ref.model_dump() for ref in plan.reference_images],
-            reference_sheet=render_reference_sheet(plan),
-            social_metadata=social_meta,
-            social_text=social_text,
-            warnings=warnings,
-        )
-        (prompts_dir / f"{stem}_social.json").write_text(
-            social_meta.model_dump_json(indent=2), encoding="utf-8"
-        )
-    except Exception as exc:
-        logger.warning(f"[SOCIAL] metadata generation failed: {exc} -- skipping")
-        # Keep generated as-is without social metadata
+    if include_social:  # the UI does this separately, after showing the prompt
+        try:
+            generated = add_social_metadata(generated, result, notify)
+        except Exception as exc:
+            logger.warning(f"[SOCIAL] metadata generation failed: {exc} -- skipping")
 
     (prompts_dir / f"{stem}.txt").write_text(generated.full_text(), encoding="utf-8")
     (prompts_dir / f"{stem}.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
@@ -2656,12 +2751,14 @@ def render_social(st, social: "SocialMetadata | None") -> None:
         )
         _show_copyable(st, social.youtube_tags)
     with tab_ig:
-        st.markdown("**✍️ Caption**")
-        _show_copyable(st, social.instagram_caption)
-        st.caption(f"{len(social.instagram_caption)}/{INSTAGRAM_CAPTION_MAX} characters")
-        st.markdown("**#️⃣ Hashtags** — paste after your caption")
-        _show_copyable(st, social.instagram_hashtags)
-        st.caption(f"{len(social.instagram_hashtags.split())}/{INSTAGRAM_HASHTAGS_MAX} hashtags")
+        st.markdown("**✍️ Caption + hashtags** — one copy, one paste on your phone")
+        _show_copyable(st, f"{social.instagram_caption.rstrip()}\n\n{social.instagram_hashtags}")
+        st.caption(
+            f"{len(social.instagram_caption)}/{INSTAGRAM_CAPTION_MAX} characters · "
+            f"{len(social.instagram_hashtags.split())}/{INSTAGRAM_HASHTAGS_MAX} hashtags"
+        )
+        with st.expander("Hashtags only (e.g. for the first comment)"):
+            _show_copyable(st, social.instagram_hashtags)
     if social.search_queries or social.sources:
         with st.expander("Searches and sources used"):
             if social.search_queries:
@@ -2670,7 +2767,32 @@ def render_social(st, social: "SocialMetadata | None") -> None:
                 st.markdown(f"- [{source['title']}]({source['uri']})")
 
 
-def _render_generated(st, generated: "GeneratedPrompt") -> None:
+def render_social_or_generate(st, social: "SocialMetadata | None", key: str,
+                              make: Callable[[Notify], "SocialMetadata"]) -> None:
+    """Shows the metadata. When it is missing, generates it here -- the
+    prompt is already on screen above -- and on failure shows why, with a
+    Retry button, instead of silently leaving it out. `make` generates and
+    stores it and returns the SocialMetadata."""
+    errors = st.session_state.setdefault("social_errors", {})
+    if social is None and key not in errors:
+        with st.status("Researching keywords and writing the metadata...", expanded=False) as status:
+            try:
+                social = make(lambda message: status.update(label=message))
+            except USER_FACING_ERRORS as exc:
+                errors[key] = str(exc)
+                status.update(label="Metadata failed", state="error")
+            else:
+                status.update(label="Metadata ready", state="complete")
+    if social is None:
+        st.warning(f"The metadata could not be generated: {errors.get(key, 'unknown error')}")
+        if st.button("Retry metadata", key=f"retry_social_{key}"):
+            errors.pop(key, None)
+            st.rerun()
+        return
+    render_social(st, social)
+
+
+def _render_generated(st, generated: "GeneratedPrompt", result: "AnalysisResult | None" = None) -> None:
     references = getattr(generated, "references", []) or []
     full_text = generated.full_text() if hasattr(generated, "full_text") else generated.prompt
     duration = generated.duration
@@ -2717,7 +2839,16 @@ def _render_generated(st, generated: "GeneratedPrompt") -> None:
     # ── Social Media Metadata ──────────────────────────────────────────────
     st.divider()
     st.subheader("📲 Post to Social Media")
-    render_social(st, getattr(generated, "social_metadata", None))
+    social = getattr(generated, "social_metadata", None)
+    if result is None:
+        render_social(st, social)
+    else:
+        def make(notify: Notify) -> "SocialMetadata":
+            updated = add_social_metadata(generated, result, notify)
+            st.session_state.video_prompts[generated.duration] = updated
+            return updated.social_metadata
+
+        render_social_or_generate(st, social, f"video_{result.video_sha[:12]}_{generated.duration}", make)
 
     st.divider()
     st.download_button(
@@ -2769,7 +2900,12 @@ def _render_quota_sidebar(st) -> None:
     st.markdown("**Gemini free tier · today**")
     for model in CONFIG.all_models():
         reason = snapshot["unavailable"].get(model)
-        status = f":red[{reason}]" if reason else ":green[available]"
+        cooling = snapshot["cooling"].get(model)
+        status = (
+            f":red[{reason}]" if reason
+            else f":orange[busy -- retry in {int(cooling // 60)}m {int(cooling % 60)}s]" if cooling
+            else ":green[available]"
+        )
         st.caption(f"`{model}` · {snapshot['calls'].get(model, 0)} call(s) · {status}")
     search = ":red[used up]" if snapshot["search_used_up"] else ":green[available]"
     st.caption(f"Google Search for metadata · {search}")
@@ -3077,17 +3213,19 @@ def _render_video_results(st) -> None:
     ):
         with st.status(f"Writing the {duration}-second prompt...", expanded=True) as status:
             try:
-                generated = generate_prompt(result, duration, lambda msg: status.update(label=msg))
+                generated = generate_prompt(result, duration, lambda msg: status.update(label=msg),
+                                            include_social=False)
             except USER_FACING_ERRORS as exc:
                 status.update(label="Prompt generation failed", state="error")
                 st.error(str(exc))
             else:
                 st.session_state.video_prompts[duration] = generated
+                st.session_state.setdefault("social_errors", {}).pop(f"video_{result.video_sha[:12]}_{duration}", None)
                 status.update(label="Prompt ready", state="complete", expanded=False)
 
     generated: GeneratedPrompt | None = st.session_state.get("video_prompts", {}).get(duration)
     if generated:
-        _render_generated(st, generated)
+        _render_generated(st, generated, result)
 
 
 def _render_image_results(st, is_image_mode: bool) -> None:
@@ -3138,12 +3276,13 @@ def _render_image_results(st, is_image_mode: bool) -> None:
     ):
         with st.status("Generating prompts...", expanded=True) as status:
             try:
-                gen = generate_image_recreation(result, lambda msg: status.update(label=msg))
+                gen = generate_image_recreation(result, lambda msg: status.update(label=msg), include_social=False)
             except IMAGE_USER_FACING_ERRORS as exc:
                 status.update(label="Generation failed", state="error")
                 st.error(str(exc))
             else:
                 st.session_state.image_generated = gen
+                st.session_state.setdefault("social_errors", {}).pop(f"image_{result.image_sha[:12]}", None)
                 status.update(label="Prompts ready", state="complete", expanded=False)
 
     gen: GeneratedImagePrompt | None = st.session_state.get("image_generated")
@@ -3199,7 +3338,14 @@ def _render_image_results(st, is_image_mode: bool) -> None:
                 _show_copyable(st, audio.alternative_search_query)
         with tab_social:
             st.subheader("📲 Social Media")
-            render_social(st, gen.social_metadata)
+            from recreate_image import add_image_social
+
+            def make(notify: Notify) -> "SocialMetadata":
+                updated = add_image_social(gen, result, notify)
+                st.session_state.image_generated = updated
+                return updated.social_metadata
+
+            render_social_or_generate(st, gen.social_metadata, f"image_{result.image_sha[:12]}", make)
 
     st.divider()
     st.download_button(

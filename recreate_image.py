@@ -33,6 +33,9 @@ from pydantic import BaseModel, Field
 # ── Shared utilities from recreate_video ────────────────────────────────────
 from recreate_video import (
     CONFIG,
+    TIMEOUT_IMAGE_SECONDS,
+    TIMEOUT_TEXT_SECONDS,
+    gemini_http_options,
     SUPPORTED_VIDEO_SUFFIXES,
     SocialMetadata,
     _noop_notify,
@@ -424,7 +427,7 @@ def analyze_image(path: Path, notify: Notify = _noop_notify) -> ImageAnalysis:
                 _analysis_prompt_image(),
             ],
             config=genai_types.GenerateContentConfig(
-                http_options={"api_version": "v1beta"},
+                http_options=gemini_http_options(TIMEOUT_IMAGE_SECONDS),
                 response_mime_type="application/json",
                 response_schema=ImageAnalysis,
                 temperature=0.4,
@@ -452,7 +455,7 @@ def generate_image_plan(
             model=model,
             contents=[request],
             config=genai_types.GenerateContentConfig(
-                http_options={"api_version": "v1beta"},
+                http_options=gemini_http_options(TIMEOUT_TEXT_SECONDS),
                 response_mime_type="application/json",
                 response_schema=ImageRecreationPlan,
                 temperature=0.7,
@@ -728,22 +731,32 @@ def analyze_image_url(url: str, notify: Notify = _noop_notify) -> ImageAnalysisR
 
 
 
+def add_image_social(generated: GeneratedImagePrompt, result: ImageAnalysisResult,
+                     notify: Notify = _noop_notify) -> GeneratedImagePrompt:
+    """The prompts plus their YouTube / Instagram metadata (one Gemini call),
+    also written into the saved prompt file."""
+    import dataclasses
+
+    analysis = ImageAnalysis.model_validate(result.analysis)
+    plan = ImageRecreationPlan.model_validate(generated.plan)
+    social = generate_social_metadata_for_image(analysis, plan, notify)
+    updated = dataclasses.replace(generated, social_metadata=social, social_text=render_social_metadata(social))
+    saved = Path(updated.saved_to)
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_text(updated.full_text(), encoding="utf-8")
+    return updated
+
+
 def generate_image_recreation(
     result: ImageAnalysisResult,
     notify: Notify = _noop_notify,
+    include_social: bool = True,
 ) -> GeneratedImagePrompt:
-    """Generate all prompts: image gen + text overlays + audio + social metadata."""
+    """Generate all prompts: image gen + audio, plus social metadata unless
+    include_social is False (the UI adds it after showing the prompts)."""
     analysis = ImageAnalysis.model_validate(result.analysis)
     plan = generate_image_plan(analysis, notify)
     prompt_text = render_image_prompts(plan, analysis)
-
-    try:
-        social_meta = generate_social_metadata_for_image(analysis, plan, notify)
-        social_text = render_social_metadata(social_meta)
-    except Exception as exc:
-        logger.warning(f"[SOCIAL] failed: {exc}")
-        social_meta = None
-        social_text = ""
 
     prompts_dir = CONFIG.work_dir / "image_prompts"
     prompts_dir.mkdir(parents=True, exist_ok=True)
@@ -753,10 +766,15 @@ def generate_image_recreation(
     generated = GeneratedImagePrompt(
         prompt_text=prompt_text,
         plan=plan.model_dump(),
-        social_text=social_text,
-        social_metadata=social_meta,
+        social_text="",
+        social_metadata=None,
         saved_to=saved_to,
     )
+    if include_social:
+        try:
+            generated = add_image_social(generated, result, notify)
+        except Exception as exc:
+            logger.warning(f"[SOCIAL] failed: {exc}")
     (prompts_dir / f"{stem}.txt").write_text(generated.full_text(), encoding="utf-8")
     (prompts_dir / f"{stem}.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
     logger.info(f"[IMAGE-PROMPT] saved {stem}.txt")

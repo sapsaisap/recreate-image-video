@@ -120,7 +120,7 @@ WRAPPER = textwrap.dedent('''
                         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video)], capture_output=True, check=True)
         return video, "Healthy habits", url
 
-    def fake_story(source, seconds, duration, frames, notify):
+    def fake_story(source, seconds, duration, frames, notify, allow_text=False):
         plan = ss.StoryPlan(hook_title="3 habits in 10 seconds", fact_checks=[
             ss.FactCheck(claim="Walking helps", verdict="confirmed", note="WHO")], scenes=[
             ss.StoryScene(narration=f"line {{i}}", visual_type="real_frame", type_reason="clear picture",
@@ -216,3 +216,12 @@ def test_whole_flow_from_link_to_video(tmp_path, restore_patched_modules):
     # Start over removes the job folder
     app = advance(app, "Start a new Short", wrapper)
     assert app.session_state.ss == {"stage": "input"} and not job.exists()
+
+
+class TestOnScreenTextSwitch:
+    def test_text_free_by_default(self):
+        assert "NO text, letters, numbers" in story_prompt(analysis(), 120, 15, search=False)
+
+    def test_switch_allows_quoted_source_text(self):
+        prompt = story_prompt(analysis(), 120, 15, search=False, allow_text=True)
+        assert "NO text, letters" not in prompt and "inside double quotes, word for word" in prompt

@@ -211,3 +211,13 @@ class TestGeneratePromptRetry:
         generated, requests = self.run(tmp_path, monkeypatch, [make_plan()])
         assert len(requests) == 1
         assert TELUGU_1 in generated.prompt and TELUGU_2 in generated.prompt
+
+
+class TestVideoIsTextFree:
+    def test_rendered_prompt_has_no_on_screen_text_line(self):
+        assert "On-screen text" not in render_prompt(make_plan(), MEDIA, 8, make_audio())
+
+    def test_plan_prompt_forbids_text(self):
+        prompt = _plan_prompt(make_analysis(make_audio()), MEDIA, 8, 3)
+        assert "NO TEXT RULE" in prompt and "completely text-free" in prompt
+        assert "on_screen_text" not in prompt

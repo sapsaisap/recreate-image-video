@@ -3,8 +3,9 @@ recreate_image.py
 =================
 Analyses an Instagram image post (or any static image URL) with Gemini Vision
 and produces copy-paste prompts for:
-  - Image generation  (Nano Banana / Nano Banana Pro / FLUX / Midjourney / SD)
-  - Text overlay recreation in Canva / CapCut
+  - Image generation  (Nano Banana / Nano Banana Pro / FLUX / Midjourney / SD),
+    with any text in the image written into the prompt itself (exact wording,
+    position, font, colour) -- no separate overlay step
   - Audio recommendation  (search term for Instagram audio library)
   - YouTube + Instagram social metadata
 
@@ -76,17 +77,12 @@ class TextOverlay(BaseModel):
         description="Where on the image: 'top-center', 'center', 'bottom-center', 'top-left', etc."
     )
     style: str = Field(
-        description="Font style description: e.g. 'bold white sans-serif with black drop shadow', "
-                    "'handwritten yellow', 'neon pink outlined'."
+        description="Font, weight, colour, size relative to the image and effects: e.g. 'large bold white "
+                    "sans-serif with black drop shadow', 'small handwritten yellow', 'neon pink outlined'."
     )
     purpose: str = Field(
         description="Role of this text: 'meme caption', 'quote', 'call-to-action', 'title', "
                     "'watermark', 'hashtag overlay', 'information'."
-    )
-    canva_instruction: str = Field(
-        description="One-line Canva/CapCut instruction to recreate this text overlay. "
-                    "E.g. 'Add a white bold heading text box at the top, font size 80, "
-                    "with black drop shadow, no background fill.'"
     )
 
 
@@ -151,46 +147,28 @@ class ImageRecreationPlan(BaseModel):
     # Image generation prompts
     nano_banana_prompt: str = Field(
         description=(
-            "Image generation prompt optimised for Nano Banana / Nano Banana Pro. "
-            "Highly detailed, includes: subject, setting, lighting, composition, color palette, "
-            "camera angle, lens, mood. Starts with the most important elements. "
-            "Example style: 'portrait of a young woman, golden hour backlight, "
-            "shallow depth of field, warm earth tones, rule of thirds, "
-            "shot on 85mm f/1.4, photorealistic, cinematic'."
+            "One complete prompt for Nano Banana / Nano Banana Pro: subject, setting, lighting, "
+            "composition, colour palette, camera angle, lens, mood -- AND every piece of text in the "
+            "image, quoted exactly, with its position, font, weight, colour and size, e.g. "
+            "'a bold white sans-serif headline across the top reading \"START TODAY\"'."
         )
     )
     flux_midjourney_prompt: str = Field(
         description=(
-            "Prompt for FLUX / Midjourney / Leonardo. Same content as nano_banana_prompt "
-            "but with Midjourney-style suffixes: '--ar 9:16 --q 2 --style raw'. "
-            "Include the aspect ratio flag appropriate for the post."
+            "Prompt for FLUX / Midjourney / Leonardo: same content including the quoted text, ending "
+            "with '--ar <ratio> --q 2 --style raw'."
         )
     )
     stable_diffusion_prompt: str = Field(
         description=(
-            "Prompt for Stable Diffusion / ComfyUI / A1111. "
-            "Comma-separated token style. Include quality boosters: "
-            "'masterpiece, best quality, ultra-detailed, photorealistic, 8k'."
+            "Prompt for Stable Diffusion / ComfyUI / A1111. Comma-separated tokens, including the "
+            "quoted text, plus 'masterpiece, best quality, ultra-detailed'."
         )
     )
     negative_prompt: str = Field(
         description=(
-            "Negative prompt for SD / ComfyUI. Token-style. "
-            "Include: 'blurry, low quality, watermark, text, logo, ugly, deformed, "
-            "extra limbs, bad anatomy, nsfw'."
-        )
-    )
-
-    # Text overlay recreation
-    text_overlays: list[TextOverlay] = Field(
-        description="Recreated text overlays matching the original. "
-                    "Must match original if has_text=True. Empty list if no text."
-    )
-    canva_workflow: str = Field(
-        description=(
-            "Step-by-step Canva or CapCut workflow to add all text overlays. "
-            "Written as numbered steps. Include: canvas size, background, "
-            "font choices, colors, positions, effects."
+            "Negative prompt for SD / ComfyUI, token style: 'blurry, low quality, watermark, logo, ugly, "
+            "deformed, extra limbs, bad anatomy, nsfw' -- plus 'text' only when the image has no text."
         )
     )
 
@@ -359,16 +337,45 @@ def _with_aspect_flag(prompt: str, aspect: str) -> str:
     return f"{cleaned} --ar {aspect}"
 
 
+def _source_texts(analysis: ImageAnalysis) -> list[TextOverlay]:
+    return [overlay for overlay in analysis.text_overlays if overlay.text.strip()]
+
+
+def _normalise(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _with_texts(prompt: str, texts: list[TextOverlay]) -> str:
+    """Every source text in the prompt, word for word. Any that Gemini left
+    out is added as a sentence -- before Midjourney's '--' flags if present."""
+    missing = [t for t in texts if _normalise(t.text) not in _normalise(prompt)]
+    if not missing:
+        return prompt
+    addition = " ".join(f'The image shows the text "{t.text.strip()}" ({t.style.strip()}, {t.position.strip()}).'
+                        for t in missing)
+    head, flags = (prompt.split(" --", 1) + [""])[:2] if " --" in prompt else (prompt, "")
+    return f"{head.rstrip().rstrip('.')}. {addition}" + (f" --{flags}" if flags else "")
+
+
+_TEXT_NEGATIVES = {"text", "words", "letters", "lettering", "typography", "caption", "captions", "font", "fonts"}
+
+
+def _negative_for(negative: str, has_text: bool) -> str:
+    """The image's own text must not be in the negative prompt."""
+    if not has_text:
+        return negative
+    return ", ".join(token.strip() for token in negative.split(",")
+                     if token.strip() and token.strip().lower() not in _TEXT_NEGATIVES)
+
+
 def _plan_prompt_image(analysis: ImageAnalysis) -> str:
     aspect = _valid_aspect(analysis.aspect_ratio)
+    texts = _source_texts(analysis)
     overlays_desc = ""
-    if analysis.has_text and analysis.text_overlays:
-        overlay_lines = []
-        for i, ov in enumerate(analysis.text_overlays, 1):
-            overlay_lines.append(
-                f"  [{i}] Text: '{ov.text}' | Position: {ov.position} | Style: {ov.style}"
-            )
-        overlays_desc = "ORIGINAL TEXT OVERLAYS (must be preserved):\n" + "\n".join(overlay_lines) + "\n\n"
+    if texts:
+        overlay_lines = [f"  [{i}] \"{ov.text}\" | position: {ov.position} | style: {ov.style}"
+                         for i, ov in enumerate(texts, 1)]
+        overlays_desc = "TEXT IN THE IMAGE (must appear in the prompts, word for word):\n" + "\n".join(overlay_lines) + "\n\n"
 
     return (
         f"You are a viral content recreation expert specialising in Instagram image posts.\n"
@@ -390,20 +397,28 @@ def _plan_prompt_image(analysis: ImageAnalysis) -> str:
         f"{overlays_desc}"
 
         "=== IMAGE GENERATION RULES ===\n"
-        "- nano_banana_prompt: natural language, most important elements first, very detailed.\n"
+        "- nano_banana_prompt: ONE complete prompt in natural language, most important elements first, very "
+        "detailed. The image generator makes the whole image including its text -- there is no separate "
+        "text or design step.\n"
         f"- flux_midjourney_prompt: same content + append '--ar {aspect} --q 2 --style raw'.\n"
         "- stable_diffusion_prompt: comma-separated tokens, include 'masterpiece, best quality'.\n"
-        "- negative_prompt: always include 'blurry, low quality, watermark, text, ugly, deformed'.\n\n"
-
-        "=== TEXT OVERLAY RULES ===\n"
-        "- If has_text=True: text_overlays MUST recreate all original text exactly.\n"
-        "- Each overlay needs: text, position, style, purpose, canva_instruction.\n"
-        "- canva_workflow: numbered steps to recreate all overlays in Canva/CapCut.\n"
-        "- If has_text=False: text_overlays=[]. canva_workflow='No text overlays needed.'.\n\n"
-
-        "=== AVOID RULES ===\n"
-        "- Include specific avoid items: wrong color palette, style drift, unwanted text\n"
-        "  (if original has no text, note 'no text overlays — pure visual image').\n"
+        + (
+            "- negative_prompt: 'blurry, low quality, watermark, logo, ugly, deformed' -- NOT 'text' (the "
+            "image has text).\n\n"
+            "=== TEXT RULES ===\n"
+            "- Write every text above into nano_banana_prompt, flux_midjourney_prompt and "
+            "stable_diffusion_prompt, inside double quotes, exactly as written (same language and script, "
+            "same spelling and capitals), each with its position, font, weight, colour, size and effects. "
+            "Example: 'a bold white sans-serif headline across the top reading \"START TODAY\", with a soft "
+            "black drop shadow'.\n"
+            "- Add no other text.\n\n"
+            if texts else
+            "- negative_prompt: 'blurry, low quality, watermark, text, logo, ugly, deformed'.\n"
+            "- The image has no text: the prompts must not ask for any.\n\n"
+        )
+        + "=== AVOID RULES ===\n"
+        "- Include specific avoid items: wrong colour palette, style drift, wrong composition"
+        + (", misspelt or missing text.\n" if texts else ", any text or lettering.\n")
     )
 
 
@@ -465,10 +480,21 @@ def generate_image_plan(
         return _parse_structured(response, ImageRecreationPlan)
 
     plan = call_gemini(run, notify, task="text", label="image-plan")
+    return finalise_image_plan(plan, analysis)
+
+
+def finalise_image_plan(plan: ImageRecreationPlan, analysis: ImageAnalysis) -> ImageRecreationPlan:
+    """Fixes what Gemini may get wrong: the Midjourney --ar flag, every
+    source text present word for word, and no 'text' in the negative prompt
+    of an image that has text."""
     aspect = _valid_aspect(analysis.aspect_ratio)
+    texts = _source_texts(analysis)
     return plan.model_copy(update={
         "aspect_ratio": aspect,
-        "flux_midjourney_prompt": _with_aspect_flag(plan.flux_midjourney_prompt, aspect),
+        "nano_banana_prompt": _with_texts(plan.nano_banana_prompt, texts),
+        "flux_midjourney_prompt": _with_aspect_flag(_with_texts(plan.flux_midjourney_prompt, texts), aspect),
+        "stable_diffusion_prompt": _with_texts(plan.stable_diffusion_prompt, texts),
+        "negative_prompt": _negative_for(plan.negative_prompt, bool(texts)),
     })
 
 
@@ -550,37 +576,6 @@ def render_image_prompts(plan: ImageRecreationPlan, analysis: ImageAnalysis) -> 
         "─" * 55,
         "",
     ]
-
-    if analysis.has_text and plan.text_overlays:
-        lines += [
-            "=== TEXT OVERLAYS (add in Canva / CapCut) ===",
-            "(The original image has text — recreate these overlays after generating the base image)",
-            "",
-        ]
-        for i, ov in enumerate(plan.text_overlays, 1):
-            lines += [
-                f"[{i}] Text: '{ov.text}'",
-                f"    Position: {ov.position}",
-                f"    Style: {ov.style}",
-                f"    Purpose: {ov.purpose}",
-                f"    Canva step: {ov.canva_instruction}",
-                "",
-            ]
-        lines += [
-            "--- Canva / CapCut Full Workflow ---",
-            plan.canva_workflow,
-            "",
-            "─" * 55,
-            "",
-        ]
-    else:
-        lines += [
-            "=== TEXT OVERLAYS ===",
-            "No text overlays in the original image — generate the base image as-is.",
-            "",
-            "─" * 55,
-            "",
-        ]
 
     lines.append(render_audio_section(plan.suggested_audio))
     return "\n".join(lines)
@@ -817,7 +812,7 @@ def run_app() -> None:
     st.caption(
         "Paste a public Instagram image post URL. "
         "Gemini analyses it and writes copy-paste prompts for "
-        "Nano Banana, Nano Banana Pro, FLUX, Midjourney, SD — plus text overlays, "
+        "Nano Banana, Nano Banana Pro, FLUX, Midjourney, SD (with any text in the image built in), "
         "audio recommendation, and social media metadata."
     )
 
@@ -877,7 +872,7 @@ def run_app() -> None:
                 f"{analysis.aspect_ratio}"
             )
             if analysis.has_text:
-                st.markdown(f":orange[**Text overlays detected:** {len(analysis.text_overlays)}]")
+                st.markdown(f":orange[**Text in the image:** {len(analysis.text_overlays)} — written into the prompts]")
             st.write(analysis.summary)
             st.caption(f"**Hook:** {analysis.hook}")
             audio = analysis.suggested_audio
@@ -914,18 +909,17 @@ def run_app() -> None:
 
     if CONFIG.show_prompt:
         # ── Results tabs ──────────────────────────────────────────────────────
-        tab_nb, tab_flux, tab_sd, tab_text, tab_audio, tab_social = st.tabs([
+        tab_nb, tab_flux, tab_sd, tab_audio, tab_social = st.tabs([
             "🍌 Nano Banana",
             "🌀 FLUX / MJ",
             "🖥️ Stable Diffusion",
-            "✍️ Text Overlays",
             "🎵 Audio",
             "📲 Social",
         ])
 
         with tab_nb:
             st.subheader("Nano Banana / Nano Banana Pro Prompt")
-            st.caption("Paste this directly into Nano Banana or Nano Banana Pro.")
+            st.caption("One complete prompt, including any text in the image. Paste it as-is.")
             _show_copyable(st, plan.nano_banana_prompt)
 
         with tab_flux:
@@ -938,29 +932,6 @@ def run_app() -> None:
             _show_copyable(st, plan.stable_diffusion_prompt)
             st.markdown("**Negative prompt:**")
             _show_copyable(st, plan.negative_prompt)
-
-        with tab_text:
-            st.subheader("Text Overlay Recreation")
-            if analysis.has_text and plan.text_overlays:
-                st.info(
-                    f"The original has {len(plan.text_overlays)} text overlay(s). "
-                    "Add these AFTER generating your base image in Canva or CapCut."
-                )
-                for i, ov in enumerate(plan.text_overlays, 1):
-                    with st.container(border=True):
-                        st.markdown(f"**[{i}] Text:**")
-                        _show_copyable(st, ov.text)
-                        st.markdown(
-                            f"**Position:** {ov.position} | "
-                            f"**Style:** {ov.style} | "
-                            f"**Purpose:** {ov.purpose}"
-                        )
-                        st.caption(f"Canva step: {ov.canva_instruction}")
-                st.divider()
-                st.markdown("**Full Canva / CapCut Workflow:**")
-                _show_copyable(st, plan.canva_workflow)
-            else:
-                st.info("No text overlays in the original — generate the base image as-is.")
 
         with tab_audio:
             st.subheader("Recommended Audio for Instagram Reel")

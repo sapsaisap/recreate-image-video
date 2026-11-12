@@ -173,9 +173,6 @@ class TestTextOverlay:
     def test_position_not_empty(self, mock_overlay):
         assert mock_overlay.position
 
-    def test_canva_instruction_not_empty(self, mock_overlay):
-        assert mock_overlay.canva_instruction
-
     def test_style_not_empty(self, mock_overlay):
         assert mock_overlay.style
 
@@ -238,26 +235,48 @@ class TestRenderImagePromptsAllSections:
         assert "blurry" in text
 
 
-# ── Text overlay preservation ─────────────────────────────────────────────────
+# ── Text inside the prompts (no separate overlay step) ───────────────────────
 
-class TestTextOverlayPreservation:
+class TestTextInsidePrompts:
 
-    def test_text_overlay_section_present_when_has_text(self, mock_plan_with_text, mock_analysis_with_text):
+    def test_missing_text_is_added_to_every_prompt(self, mock_plan_with_text, mock_analysis_with_text):
+        from recreate_image import finalise_image_plan
+        plan = finalise_image_plan(mock_plan_with_text, mock_analysis_with_text)
+        for prompt in (plan.nano_banana_prompt, plan.flux_midjourney_prompt, plan.stable_diffusion_prompt):
+            assert '"Phones in 2070:"' in prompt
+            assert "bold white sans-serif with black drop shadow" in prompt
+
+    def test_text_goes_before_midjourney_flags(self, mock_plan_with_text, mock_analysis_with_text):
+        from recreate_image import finalise_image_plan
+        flux = finalise_image_plan(mock_plan_with_text, mock_analysis_with_text).flux_midjourney_prompt
+        assert flux.index('"Phones in 2070:"') < flux.index("--q 2") and flux.endswith("--ar 9:16")
+
+    def test_text_already_present_is_not_repeated(self, mock_plan_with_text, mock_analysis_with_text):
+        from recreate_image import finalise_image_plan
+        plan = mock_plan_with_text.model_copy(update={
+            "nano_banana_prompt": 'phone hovering, bold white headline at the top reading "Phones in 2070:"'})
+        assert finalise_image_plan(plan, mock_analysis_with_text).nano_banana_prompt.count("Phones in 2070") == 1
+
+    def test_text_removed_from_negative_prompt_when_image_has_text(self, mock_plan_with_text, mock_analysis_with_text):
+        from recreate_image import finalise_image_plan
+        negative = finalise_image_plan(mock_plan_with_text, mock_analysis_with_text).negative_prompt
+        assert "text" not in [token.strip() for token in negative.split(",")] and "watermark" in negative
+
+    def test_no_text_image_keeps_text_in_negative(self, mock_plan_no_text, mock_analysis_no_text):
+        from recreate_image import finalise_image_plan
+        plan = finalise_image_plan(mock_plan_no_text, mock_analysis_no_text)
+        assert "text" in plan.negative_prompt and plan.nano_banana_prompt == mock_plan_no_text.nano_banana_prompt
+
+    def test_plan_prompt_asks_for_text_inside_the_prompt(self, mock_analysis_with_text, mock_analysis_no_text):
+        from recreate_image import _plan_prompt_image
+        with_text = _plan_prompt_image(mock_analysis_with_text)
+        assert '"Phones in 2070:"' in with_text and "inside double quotes, exactly as written" in with_text
+        assert "NOT 'text'" in with_text and "canva" not in with_text.lower()
+        assert "must not ask for any" in _plan_prompt_image(mock_analysis_no_text)
+
+    def test_output_has_no_separate_overlay_section(self, mock_plan_with_text, mock_analysis_with_text):
         text = render_image_prompts(mock_plan_with_text, mock_analysis_with_text)
-        assert "TEXT OVERLAYS" in text
-
-    def test_original_text_content_preserved(self, mock_plan_with_text, mock_analysis_with_text):
-        text = render_image_prompts(mock_plan_with_text, mock_analysis_with_text)
-        assert "Phones in 2070" in text
-
-    def test_canva_workflow_present_when_has_text(self, mock_plan_with_text, mock_analysis_with_text):
-        text = render_image_prompts(mock_plan_with_text, mock_analysis_with_text)
-        assert "Canva" in text or "CapCut" in text
-
-    def test_text_overlay_no_section_when_no_text(self, mock_plan_no_text, mock_analysis_no_text):
-        text = render_image_prompts(mock_plan_no_text, mock_analysis_no_text)
-        # Should say no overlays needed, not the full Canva workflow
-        assert "No text overlays" in text
+        assert "TEXT OVERLAYS" not in text and "Canva" not in text
 
     def test_no_text_flag_false_means_empty_overlays(self, mock_analysis_no_text):
         assert mock_analysis_no_text.has_text is False

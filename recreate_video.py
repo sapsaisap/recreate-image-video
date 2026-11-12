@@ -1555,7 +1555,7 @@ class PromptBeat(BaseModel):
     action: str = Field(description="What happens during this beat, in order.")
     camera: str = Field(description="Shot type + camera movement.")
     audio: str = Field(description="Music and sound effects for this beat, or 'none'. Never dialogue -- that goes in dialogue_line_ids.")
-    on_screen_text: str = Field(description="Short text overlay ONLY if the source relies on it (max ~5 words), else empty.")
+    # No on-screen text field on purpose: video prompts are always text-free.
     dialogue_line_ids: list[int] = Field(
         default_factory=list,
         description="Numbers of the transcript lines (L1 = 1, L2 = 2, ...) spoken during this beat, in order. "
@@ -1732,10 +1732,9 @@ def _plan_prompt(analysis: VideoAnalysis, media: MediaInfo, duration: int, beat_
         "mood, color palette, and camera style.\n\n"
 
         "=== NO TEXT RULE (mandatory) ===\n"
-        "- on_screen_text MUST be empty string '' for EVERY beat without exception.\n"
-        "- Do NOT reproduce any text overlays, captions, subtitles, or title cards from the source.\n"
-        "- Even if the source has meme text, caption text, or language text, set on_screen_text to ''.\n"
-        "- Only exception: dialogue text that is plot-essential (speech bubbles in animation). Still omit meme/caption text.\n\n"
+        "- The video is completely text-free: no captions, subtitles, title cards, labels, meme text or "
+        "text overlays of any kind, in any language, even if the source has them.\n"
+        "- Never describe on-screen text in visual, action or camera; describe only what is seen.\n\n"
 
         "=== SETTING CONSISTENCY (mandatory) ===\n"
         "- Every beat MUST be set in the EXACT same room/environment as the source.\n"
@@ -1919,8 +1918,6 @@ def render_prompt(
         for line_id in beat.dialogue_line_ids:
             if 1 <= line_id <= len(transcript):
                 lines.append(_dialogue_line(transcript[line_id - 1], language))
-        if beat.on_screen_text.strip():
-            lines.append(f"On-screen text: \"{beat.on_screen_text.strip()}\"")
         lines.append("")
         cursor = end
 
@@ -2975,7 +2972,8 @@ def run_app() -> None:
         st.title("Recreate any image post")
         st.caption(
             "Upload a screenshot of any Instagram image post (or paste a direct image URL). "
-            "Gemini analyses it and writes copy-paste prompts for image generators + text overlays + audio + social metadata."
+            "Gemini analyses it and writes copy-paste prompts for image generators (any text in the image "
+            "is built into the prompt) + audio + social metadata."
         )
     else:
         st.title("Recreate any video")
@@ -3258,7 +3256,7 @@ def _render_image_results(st, is_image_mode: bool) -> None:
             medium = analysis.visual_medium.replace("_", " ")
             st.markdown(f":blue[**{content}**] · :violet[**{medium}**] · {analysis.aspect_ratio}")
             if analysis.has_text:
-                st.markdown(f":orange[**Text overlays detected:** {len(analysis.text_overlays)}]")
+                st.markdown(f":orange[**Text in the image:** {len(analysis.text_overlays)} — written into the prompts]")
             st.write(analysis.summary)
             st.caption(f"**Hook:** {analysis.hook}")
             audio = analysis.suggested_audio
@@ -3293,12 +3291,12 @@ def _render_image_results(st, is_image_mode: bool) -> None:
     plan = _IRP.model_validate(gen.plan)
 
     if CONFIG.show_prompt:
-        tab_nb, tab_flux, tab_sd, tab_text, tab_audio, tab_social = st.tabs([
-            "🍌 Nano Banana", "🌀 FLUX / MJ", "🖥️ Stable Diffusion",
-            "✍️ Text Overlays", "🎵 Audio", "📲 Social",
+        tab_nb, tab_flux, tab_sd, tab_audio, tab_social = st.tabs([
+            "🍌 Nano Banana", "🌀 FLUX / MJ", "🖥️ Stable Diffusion", "🎵 Audio", "📲 Social",
         ])
         with tab_nb:
             st.subheader("Nano Banana / Nano Banana Pro")
+            st.caption("One complete prompt, including any text in the image. Paste it as-is.")
             _show_copyable(st, plan.nano_banana_prompt)
         with tab_flux:
             st.subheader("FLUX / Midjourney / Leonardo")
@@ -3309,21 +3307,6 @@ def _render_image_results(st, is_image_mode: bool) -> None:
             _show_copyable(st, plan.stable_diffusion_prompt)
             st.markdown("**Negative:**")
             _show_copyable(st, plan.negative_prompt)
-        with tab_text:
-            st.subheader("Text Overlay Recreation")
-            if analysis.has_text and plan.text_overlays:
-                st.info(f"{len(plan.text_overlays)} text overlay(s) — add these in Canva/CapCut after generating the base image.")
-                for i, ov in enumerate(plan.text_overlays, 1):
-                    with st.container(border=True):
-                        st.markdown(f"**[{i}] Text:**")
-                        _show_copyable(st, ov.text)
-                        st.markdown(f"**Position:** {ov.position} | **Style:** {ov.style}")
-                        st.caption(f"Canva step: {ov.canva_instruction}")
-                st.divider()
-                st.markdown("**Full Canva / CapCut Workflow:**")
-                _show_copyable(st, plan.canva_workflow)
-            else:
-                st.info("No text overlays — generate the base image as-is.")
         with tab_audio:
             st.subheader("Recommended Audio")
             audio = plan.suggested_audio

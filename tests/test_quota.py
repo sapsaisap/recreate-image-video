@@ -128,6 +128,11 @@ def busy_error():
                                        "message": "The model is overloaded. Please try again later."}})
 
 
+def server_error():
+    from google.genai.errors import ServerError
+    return ServerError(500, {"error": {"code": 500, "status": "INTERNAL", "message": "Internal error encountered."}})
+
+
 def single_model_chain(monkeypatch):
     monkeypatch.setattr(rv, "CONFIG", dataclasses.replace(
         rv.CONFIG, task_models={**rv.CONFIG.task_models, "analysis": ("gemini-2.5-flash",)}))
@@ -150,16 +155,22 @@ class TestPerMinute:
 
 
 class TestBusyModels:
-    def test_one_quick_retry_on_the_same_model(self, env):
-        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()]})
+    def test_other_server_error_gets_one_quick_retry(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [server_error()]})
         assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-2.5-flash"
         assert calls == ["gemini-2.5-flash", "gemini-2.5-flash"]
         assert len(env) == 1 and env[0] <= 2.5
 
-    def test_still_busy_switches_and_cools_down(self, env):
-        fn, calls = failing_on({"gemini-2.5-flash": [busy_error(), busy_error()]})
+    def test_other_server_error_twice_switches_and_cools_down(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [server_error(), server_error()]})
         assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-3.5-flash-lite"
         assert calls == ["gemini-2.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite"]
+        assert rv._cooling_models()["gemini-2.5-flash"] == pytest.approx(rv.COOLDOWN_BUSY_SECONDS, abs=2)
+
+    def test_high_demand_switches_at_once(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()]})
+        assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-3.5-flash-lite"
+        assert calls == ["gemini-2.5-flash", "gemini-3.5-flash-lite"] and env == []  # no retry, no wait
         assert rv._cooling_models()["gemini-2.5-flash"] == pytest.approx(rv.COOLDOWN_BUSY_SECONDS, abs=2)
 
     def test_next_call_starts_on_a_model_that_is_answering(self, env):
@@ -177,12 +188,12 @@ class TestBusyModels:
         assert calls == ["gemini-2.5-flash"]
 
     def test_every_model_busy_backs_off_instead_of_failing(self, env):
-        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()] * 2, "gemini-3.5-flash-lite": [busy_error()] * 2})
+        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()], "gemini-3.5-flash-lite": [busy_error()] * 2})
         # Last model standing: it backs off (5 s, 10 s) on that model until it answers.
         assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-3.5-flash-lite"
-        assert calls == ["gemini-2.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite",
-                         "gemini-3.5-flash-lite", "gemini-3.5-flash-lite"]
-        assert env[0] <= 2.5 and min(env[1:]) >= 5
+        assert calls == ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash-lite",
+                         "gemini-3.5-flash-lite"]
+        assert len(env) == 2 and min(env) >= 5
 
     def test_sidebar_shows_cooling_models(self, env):
         rv._cool_down("gemini-2.5-flash", 120)

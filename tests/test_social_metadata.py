@@ -231,6 +231,23 @@ class TestGenerateMetadata:
         assert calls[0]["model"] == "gemini-3.5-flash-lite" and calls[0]["search"] is False
         assert not meta.youtube_title.endswith("#Shorts")
 
+    def test_answer_without_searching_is_asked_again(self, fake):
+        calls, replies = fake
+        ungrounded = SimpleNamespace(parsed=None, text=make_draft().model_dump_json(), prompt_feedback=None,
+                                     candidates=[SimpleNamespace(finish_reason="STOP", grounding_metadata=None)])
+        replies.extend([ungrounded, grounded_response(make_draft())])
+        meta = rv.generate_metadata("Content: biryani", "video", "English")
+        assert len(calls) == 2 and all(c["search"] for c in calls)
+        assert "run Google Search now" in calls[1]["prompt"] and meta.grounded
+
+    def test_keeps_the_answer_if_it_still_does_not_search(self, fake):
+        calls, replies = fake
+        ungrounded = lambda: SimpleNamespace(parsed=None, text=make_draft().model_dump_json(), prompt_feedback=None,
+                                             candidates=[SimpleNamespace(finish_reason="STOP", grounding_metadata=None)])
+        replies.extend([ungrounded(), ungrounded()])
+        meta = rv.generate_metadata("Content: biryani", "video", "English")
+        assert len(calls) == 2 and not meta.grounded and meta.youtube_title
+
 
 class TestHashtagFill:
     def test_fills_up_to_five_from_keyword_ideas(self):

@@ -748,6 +748,12 @@ def _is_search_quota(exc: Exception) -> bool:
     return "grounding" in str(exc).lower()
 
 
+def _is_overloaded(exc: Exception) -> bool:
+    """503 'This model is currently experiencing high demand' / UNAVAILABLE."""
+    text = str(exc).lower()
+    return _error_code(exc) == 503 or "high demand" in text or "overloaded" in text
+
+
 def _is_model_missing(exc: Exception) -> bool:
     """404 "models/... is not found": renamed, retired or never existed."""
     return _error_code(exc) == 404
@@ -886,7 +892,9 @@ def call_gemini(
                 logger.warning(f"[GEMINI] {label} model={model} per-minute limit, switching: {exc}")
                 notify(f"{model} is rate-limited -- using the next model")
                 continue
-            if can_switch and kind == "transient" and failures_on_model >= 2:
+            # "High demand" (503) spells last minutes and a 503 can take ~45 s
+            # to arrive, so retrying the same model only adds delay: switch now.
+            if can_switch and kind == "transient" and (failures_on_model >= 2 or _is_overloaded(exc)):
                 _cool_down(model, COOLDOWN_BUSY_SECONDS)
                 passed_over.add(model)
                 logger.warning(f"[GEMINI] {label} model={model} busy, switching: {exc}")
@@ -1981,7 +1989,7 @@ def render_prompt(
             + ("." if _is_english(language) else ", and do not switch to English."),
         ]
         if audio.voice_character.strip() and audio.voice_character.strip().lower() != "none":
-            lines.append(f"- Voice: {audio.voice_character.strip()}.")
+            lines.append(f"- Voice: {audio.voice_character.strip().rstrip('.')}.")
         lines.append("")
     if plan.reference_images:
         lines.append("REFERENCE IMAGES (attached)")
@@ -2134,7 +2142,9 @@ def _dialogue_warnings(beats: list[PromptBeat], transcript: list[Utterance], dur
     warnings = []
     missing = _missing_lines(beats, len(transcript))
     if missing:
-        dropped = "; ".join(f"L{n}: {transcript[n - 1].english.strip()}" for n in missing)
+        dropped = "; ".join(f"L{n}: {transcript[n - 1].english.strip()}" for n in missing[:3])
+        if len(missing) > 3:
+            dropped += f"; ...and {len(missing) - 3} more"
         reason = (
             f"the source has {_speech_seconds(transcript):.1f}s of speech, more than {duration}s"
             if _speech_seconds(transcript) > duration
@@ -2445,6 +2455,7 @@ def generate_with_optional_search(
     contents_before: list | None = None,
     temperature: float = 0.7,
     thinking_budget: int | None = None,
+    timeout_seconds: int | None = None,
 ) -> tuple[BaseModel, list[str], list[dict[str, str]]]:
     """One free-tier Gemini call, grounded in Google Search when it can be.
 
@@ -2455,15 +2466,22 @@ def generate_with_optional_search(
     schema enforced. Returns (result, searches run, sources used); both lists
     are empty when nothing was searched. `contents_before` (e.g. images) is
     sent ahead of the prompt. `thinking_budget` caps gemini-2.5-flash's
-    thinking (faster replies); other models ignore it.
+    thinking (faster replies); other models ignore it. If a search-capable
+    model answers without searching, it is asked once more, insisting.
     """
     from google.genai import types as genai_types
 
     client = get_client()
 
-    def ask(model: str, search: bool):
+    def ask(model: str, search: bool, insist: bool = False):
+        prompt = build_prompt(search)
+        if insist:
+            prompt += ("\n\nIMPORTANT: run Google Search now, before you answer. An answer that was not "
+                       "checked with Google Search cannot be used.")
         options: dict[str, Any] = {
-            "http_options": gemini_http_options(TIMEOUT_SEARCH_SECONDS if search else TIMEOUT_TEXT_SECONDS),
+            "http_options": gemini_http_options(
+                timeout_seconds or (TIMEOUT_SEARCH_SECONDS if search else TIMEOUT_TEXT_SECONDS)
+            ),
             "temperature": temperature,
             "automatic_function_calling": genai_types.AutomaticFunctionCallingConfig(disable=True),
         }
@@ -2475,7 +2493,7 @@ def generate_with_optional_search(
             options.update(response_mime_type="application/json", response_schema=schema)
         response = client.models.generate_content(
             model=model,
-            contents=[*(contents_before or []), build_prompt(search)],
+            contents=[*(contents_before or []), prompt],
             config=genai_types.GenerateContentConfig(**options),
         )
         if not search:
@@ -2486,7 +2504,17 @@ def generate_with_optional_search(
     def run(model: str):
         if model in FREE_SEARCH_MODELS and not _search_used_up():
             try:
-                return ask(model, search=True)
+                result = ask(model, search=True)
+                if result[1] or result[2]:
+                    return result
+                # Search was available but Gemini answered from memory: ask
+                # once more, insisting (a measured case: "confirmed" fact
+                # checks with zero searches run).
+                logger.info(f"[GEMINI] {label} model={model} answered without searching -- asking again")
+                notify("Gemini answered without searching -- asking it to check with Google Search")
+                _record_call(model)
+                again = ask(model, search=True, insist=True)
+                return again if (again[1] or again[2]) else result
             except Exception as exc:
                 if not _is_search_quota(exc):
                     raise

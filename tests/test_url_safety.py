@@ -225,3 +225,23 @@ class TestInstagramDownloader:
         with pytest.raises(URLVideoError, match="not an Instagram link"):
             rv.download_instagram_image("https://evil.example/?instagram.com", tmp_path / "out")
         assert calls == []
+
+
+class TestDirectImageDownload:
+    def test_image_link_is_fetched_directly(self, fake_web, tmp_path):
+        import recreate_image as ri
+        pages, calls = fake_web
+        response = FakeResponse(body=b"PNGDATA")
+        response.headers = {"Content-Type": "image/png"}
+        pages["https://images.example/photo"] = response
+        downloaded = ri.download_direct_image("https://images.example/photo", tmp_path)
+        assert downloaded.path.read_bytes() == b"PNGDATA" and downloaded.path.suffix == ".png"
+        assert "Mozilla" in calls[0]["headers"]["User-Agent"]  # some hosts refuse non-browser clients
+
+    def test_web_page_is_left_to_yt_dlp(self, fake_web, tmp_path):
+        import recreate_image as ri
+        pages, _ = fake_web
+        page = FakeResponse(body=b"<html></html>")
+        page.headers = {"Content-Type": "text/html; charset=utf-8"}
+        pages["https://site.example/post"] = page
+        assert ri.download_direct_image("https://site.example/post", tmp_path) is None

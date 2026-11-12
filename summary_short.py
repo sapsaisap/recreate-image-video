@@ -64,6 +64,9 @@ WORDS_PER_SECOND = {"te": 1.4, "ta": 1.4, "ml": 1.3, "kn": 1.5, "mr": 1.8, "gu":
                     "hi": 2.3, "en": 2.5}
 DEFAULT_WORDS_PER_SECOND = 2.0
 TRANSCRIPT_CHARS_IN_PROMPT = 8000
+# The script call searches Google and reads ~15 frame images: 74 s was
+# measured on a 160 s video, too close to the usual 90 s limit.
+STORY_TIMEOUT_SECONDS = 180
 VISUAL_TYPES = ("real_frame", "ai_from_reference", "ai")
 TYPE_LABELS = {"real_frame": "📷 Real frame", "ai_from_reference": "🎨 AI from reference", "ai": "✨ Full AI"}
 
@@ -256,8 +259,11 @@ def story_prompt(analysis: SourceAnalysis, source_seconds: float, duration: int,
         "person's face.\n"
         "  * ai_from_reference: show what a source moment shows, cleaner or more striking; that moment's frame "
         "is attached as the reference in the image generator.\n"
-        "  * ai: ideas, emotions, or things the video does not show.\n"
-        f"- At most {max_real_frames(most)} real_frame scenes. Use each moment at most once; moment = 0 when none.\n"
+        "  * ai: ONLY for an idea the video never shows (normally at most one scene).\n"
+        "- The Short must show what the video shows: every scene about something on screen in the video MUST "
+        "set moment to that moment's number -- real_frame where allowed, otherwise ai_from_reference (faces, "
+        "on-screen text and watermarks are fine as a reference; the new image replaces them).\n"
+        f"- At most {max_real_frames(most)} real_frame scenes. Use each moment at most once; moment = 0 only for ai.\n"
         "- image_prompt, in English, for EVERY scene (also real_frame, as a fallback): ONE single full-frame "
         "vertical 9:16 shot -- subject, setting, composition, lighting, colours, lens, mood; photorealistic "
         "unless the source is animated. "
@@ -336,7 +342,8 @@ def analyse_source(path: Path, media: MediaInfo, notify: Notify = _noop_notify) 
         "language and its own script (never translated); the look of the footage; and 8-15 of the clearest, "
         "most informative visual moments spread across the whole video, each at the single sharpest instant, "
         "with a focus box around the main subject and flags for on-screen text, watermarks/app UI and "
-        f"clearly visible real faces. Known facts: {media.duration_seconds:.0f}s, {media.width}x{media.height}. "
+        f"clearly visible real faces. Known facts: {media.duration_seconds:.0f}s, {media.width}x{media.height}; "
+        f"every timestamp is between 0 and {media.duration_seconds:.0f} seconds. "
         "Never name real people; describe them by appearance."
     )
     try:
@@ -361,7 +368,8 @@ def analyse_source(path: Path, media: MediaInfo, notify: Notify = _noop_notify) 
             return _parse_structured(response, SourceAnalysis)
 
         notify("Analysing the video with Gemini...")
-        return call_gemini(run, notify, task="analysis", label="summary-analysis")
+        analysis = call_gemini(run, notify, task="analysis", label="summary-analysis")
+        return drop_moments_outside(analysis, media.duration_seconds)
     finally:
         try:
             client.files.delete(name=uploaded.name)
@@ -413,8 +421,23 @@ def write_story(analysis: SourceAnalysis, source_seconds: float, duration: int, 
         label="summary-story",
         notify=notify,
         contents_before=_frame_thumbnails(frames),
+        timeout_seconds=STORY_TIMEOUT_SECONDS,
     )
+    logger.info("[SUMMARY] Gemini's visuals: " + ", ".join(f"{s.visual_type}/M{s.moment}" for s in plan.scenes))
     return drop_missing_frames(finalise_plan(plan, analysis, duration), frames), queries, sources
+
+
+def drop_moments_outside(analysis: SourceAnalysis, duration: float) -> SourceAnalysis:
+    """Moments timed after the video ends cannot be real (Gemini once gave
+    216 s for a 160 s video); keeping them would point scenes at no frame."""
+    kept = [m for m in analysis.visual_moments if 0 <= m.timestamp_seconds <= duration]
+    if len(kept) != len(analysis.visual_moments):
+        logger.info(f"[SUMMARY] dropped {len(analysis.visual_moments) - len(kept)} moment(s) outside 0-{duration:.0f}s")
+    return analysis.model_copy(update={"visual_moments": kept})
+
+
+def uses_source_frames(plan: StoryPlan) -> bool:
+    return any(scene.moment for scene in plan.scenes)
 
 
 def drop_missing_frames(plan: StoryPlan, frames: dict[int, Path]) -> StoryPlan:
@@ -592,6 +615,9 @@ def _page_prompts(st) -> None:
     state, plan, analysis, frames = _state(st), _plan(st), _analysis(st), _frames(st)
     st.subheader(plan.hook_title)
     st.caption(f"From: {state['title']} · {state['source_url']} · {state['duration']} s Short · {len(plan.scenes)} scenes")
+    if frames and not uses_source_frames(plan):
+        st.warning("No scene uses a frame from the video, so the images may drift from what it shows. "
+                   "Analyse again, or switch scenes to 🎨 AI from reference below.")
     with st.expander(f"Fact check ({'Google Search' if state['queries'] or state['sources'] else 'not grounded'})"):
         for check in plan.fact_checks:
             icon = {"confirmed": "✅", "disputed": "⚠️", "unverified": "❔"}[check.verdict]

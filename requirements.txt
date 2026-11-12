@@ -1,5 +1,9 @@
 google-genai>=1.20
-yt-dlp>=2025.1.1
+# [default] adds yt-dlp-ejs, which solves YouTube's player challenge (without
+# it YouTube only offers ~360p). It needs a JavaScript runtime: Deno >= 2.3 (below,
+# works on Streamlit Cloud with no system packages) or Node >= 22.
+yt-dlp[default]>=2025.11.12
+deno>=2.3
 streamlit>=1.37
 python-dotenv>=1.0
 pydantic>=2.6

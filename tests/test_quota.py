@@ -1,5 +1,6 @@
 """Free-tier guard, per-task model chains and daily-quota memory in call_gemini."""
 import dataclasses
+import sys
 from datetime import datetime
 
 import pytest
@@ -127,6 +128,11 @@ def busy_error():
                                        "message": "The model is overloaded. Please try again later."}})
 
 
+def server_error():
+    from google.genai.errors import ServerError
+    return ServerError(500, {"error": {"code": 500, "status": "INTERNAL", "message": "Internal error encountered."}})
+
+
 def single_model_chain(monkeypatch):
     monkeypatch.setattr(rv, "CONFIG", dataclasses.replace(
         rv.CONFIG, task_models={**rv.CONFIG.task_models, "analysis": ("gemini-2.5-flash",)}))
@@ -149,16 +155,22 @@ class TestPerMinute:
 
 
 class TestBusyModels:
-    def test_one_quick_retry_on_the_same_model(self, env):
-        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()]})
+    def test_other_server_error_gets_one_quick_retry(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [server_error()]})
         assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-2.5-flash"
         assert calls == ["gemini-2.5-flash", "gemini-2.5-flash"]
         assert len(env) == 1 and env[0] <= 2.5
 
-    def test_still_busy_switches_and_cools_down(self, env):
-        fn, calls = failing_on({"gemini-2.5-flash": [busy_error(), busy_error()]})
+    def test_other_server_error_twice_switches_and_cools_down(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [server_error(), server_error()]})
         assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-3.5-flash-lite"
         assert calls == ["gemini-2.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite"]
+        assert rv._cooling_models()["gemini-2.5-flash"] == pytest.approx(rv.COOLDOWN_BUSY_SECONDS, abs=2)
+
+    def test_high_demand_switches_at_once(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()]})
+        assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-3.5-flash-lite"
+        assert calls == ["gemini-2.5-flash", "gemini-3.5-flash-lite"] and env == []  # no retry, no wait
         assert rv._cooling_models()["gemini-2.5-flash"] == pytest.approx(rv.COOLDOWN_BUSY_SECONDS, abs=2)
 
     def test_next_call_starts_on_a_model_that_is_answering(self, env):
@@ -176,12 +188,12 @@ class TestBusyModels:
         assert calls == ["gemini-2.5-flash"]
 
     def test_every_model_busy_backs_off_instead_of_failing(self, env):
-        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()] * 2, "gemini-3.5-flash-lite": [busy_error()] * 2})
+        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()], "gemini-3.5-flash-lite": [busy_error()] * 2})
         # Last model standing: it backs off (5 s, 10 s) on that model until it answers.
         assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-3.5-flash-lite"
-        assert calls == ["gemini-2.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite",
-                         "gemini-3.5-flash-lite", "gemini-3.5-flash-lite"]
-        assert env[0] <= 2.5 and min(env[1:]) >= 5
+        assert calls == ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash-lite",
+                         "gemini-3.5-flash-lite"]
+        assert len(env) == 2 and min(env) >= 5
 
     def test_sidebar_shows_cooling_models(self, env):
         rv._cool_down("gemini-2.5-flash", 120)
@@ -211,3 +223,63 @@ class TestFreeTierGuard:
         assert "gemini-2.5-flash" in rv.CONFIG.models_for("analysis")
         monkeypatch.setattr(rv, "_pacific_now", lambda: datetime(2026, 12, 1, 0, 0, tzinfo=rv._PACIFIC))
         assert rv.CONFIG.models_for("analysis") == ["gemini-3.5-flash-lite"]
+
+
+class TestModelOrder:
+    def test_newest_working_model_leads_and_slow_lite_is_last(self):
+        chain = rv.DEFAULT_MODEL_CHAIN.split(",")
+        assert chain[0] == "gemini-3.6-flash" and chain[-1] == "gemini-3.1-flash-lite"
+        assert "gemini-3.8-flash" not in chain and "gemini-3.7-flash" not in chain
+
+    def test_search_steps_start_on_the_models_with_free_search(self):
+        assert rv.METADATA_MODEL_CHAIN.split(",") == ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+        story = rv.STORY_MODEL_CHAIN.split(",")
+        assert story[:3] == ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.6-flash"]
+        assert set(rv.METADATA_MODEL_CHAIN.split(",")) == rv.FREE_SEARCH_MODELS
+        assert rv.TASK_MODEL_ENV["metadata"][1] == rv.METADATA_MODEL_CHAIN
+        assert rv.TASK_MODEL_ENV["story"][1] == rv.STORY_MODEL_CHAIN
+        assert rv.TASK_MODEL_ENV["analysis"][1] == rv.TASK_MODEL_ENV["text"][1] == rv.DEFAULT_MODEL_CHAIN
+
+    def test_metadata_list_without_a_search_model_is_reported(self):
+        cfg = dataclasses.replace(rv.CONFIG, task_models={
+            **rv.CONFIG.task_models, "metadata": ("gemini-3.6-flash", "gemini-3.5-flash")})
+        assert any("GEMINI_METADATA_MODELS has no model that can use Google Search" in p for p in cfg.problems())
+
+    def test_every_default_model_is_accepted(self):
+        for _, default in rv.TASK_MODEL_ENV.values():
+            assert set(default.split(",")) <= rv.FREE_TIER_MODELS
+
+
+class TestStaleModules:
+    @pytest.fixture(autouse=True)
+    def restore_app_modules(self, monkeypatch):
+        """drop_stale_app_modules removes the app modules from sys.modules;
+        registering them first makes pytest put every one of them back, so
+        later tests keep using the same module objects."""
+        for name in rv.APP_MODULES:
+            if name in sys.modules:
+                monkeypatch.setitem(sys.modules, name, sys.modules[name])
+            else:
+                monkeypatch.delitem(sys.modules, name, raising=False)
+
+    def test_changed_files_are_reimported(self, monkeypatch):
+        import types
+        stale = types.ModuleType("summary_short")
+        stale.__file__ = rv.__file__
+        stale._LOADED_MTIME = 0.0  # loaded before the file last changed
+        monkeypatch.setitem(sys.modules, "summary_short", stale)
+        assert "summary_short" in rv.drop_stale_app_modules()
+        assert "summary_short" not in sys.modules
+
+    def test_nothing_dropped_when_up_to_date(self, monkeypatch):
+        for name in rv.APP_MODULES:
+            monkeypatch.delitem(sys.modules, name, raising=False)
+        monkeypatch.setitem(sys.modules, "recreate_video", rv)
+        monkeypatch.setattr(rv, "_LOADED_MTIME", rv.Path(rv.__file__).stat().st_mtime)
+        assert rv.drop_stale_app_modules() == []
+
+
+class TestYoutubeFormat:
+    def test_limit_is_on_the_short_side(self):
+        fmt = rv.video_format(720)
+        assert "[height<=1280][width<=1280]" in fmt and "[height<=720]" not in fmt

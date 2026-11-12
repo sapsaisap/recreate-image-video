@@ -49,6 +49,8 @@ from recreate_video import (
     generate_metadata,
     get_client,
     host_is,
+    js_runtimes,
+    safe_get,
     render_social,
     render_social_metadata,
     validate_public_video_url,
@@ -62,6 +64,7 @@ from recreate_video import (
 )
 
 logger = logging.getLogger(__name__)
+_LOADED_MTIME = Path(__file__).stat().st_mtime  # see recreate_video.drop_stale_app_modules
 Notify = Callable[[str], None]
 
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -196,6 +199,32 @@ class DownloadedMedia:
     media_type: Literal["image", "video"]
 
 
+IMAGE_CONTENT_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif",
+                       "image/heic": ".heic", "image/heif": ".heif"}
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/png,image/*;q=0.9,*/*;q=0.8",
+}
+
+
+def download_direct_image(url: str, destination: Path) -> DownloadedMedia | None:
+    """Fetches a link that serves an image file itself (any host, with or
+    without an image extension). Returns None when the link is a web page
+    instead, so the caller can hand it to yt-dlp."""
+    fetched = safe_get(url, max_bytes=CONFIG.max_download_mb * 1024 * 1024, timeout=30, headers=BROWSER_HEADERS)
+    content_type = (fetched.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if not content_type.startswith("image/"):
+        return None
+    suffix = IMAGE_CONTENT_TYPES.get(content_type) or Path(urlsplit(fetched.url).path).suffix.lower() or ".jpg"
+    destination.mkdir(parents=True, exist_ok=True)
+    path = destination / f"source{suffix}"
+    path.write_bytes(fetched.content)
+    name = Path(urlsplit(fetched.url).path).name or "Image"
+    logger.info(f"[IMAGE] direct download {name} ({len(fetched.content) / 1024:.0f} KB, {content_type})")
+    return DownloadedMedia(path=path, title=name, source_url=fetched.url, extractor="direct", media_type="image")
+
+
 def download_media(url: str, destination: Path, notify: Notify = _noop_notify) -> DownloadedMedia:
     """Download any public URL (video or image) using yt-dlp.
     Auto-detects whether the result is an image or video by file extension."""
@@ -229,12 +258,7 @@ def download_media(url: str, destination: Path, notify: Notify = _noop_notify) -
         "retries": 2,
         "logger": _YtdlpLogger(),
         "ffmpeg_location": ffmpeg_exe(),
-        "js_runtimes": {"node": {}},
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "web"],
-            }
-        },
+        "js_runtimes": js_runtimes(),
     }
     if CONFIG.cookies_file:
         options["cookiefile"] = CONFIG.cookies_file
@@ -431,7 +455,7 @@ def analyze_image(path: Path, notify: Notify = _noop_notify) -> ImageAnalysis:
     image_bytes = path.read_bytes()
     suffix = path.suffix.lower().lstrip(".")
     mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                "webp": "image/webp", "gif": "image/gif"}
+                "webp": "image/webp", "gif": "image/gif", "heic": "image/heic", "heif": "image/heif"}
     mime = mime_map.get(suffix, "image/jpeg")
 
     def run(model: str) -> ImageAnalysis:
@@ -707,9 +731,10 @@ def analyze_image_url(url: str, notify: Notify = _noop_notify) -> ImageAnalysisR
             source_url = dl_img.source_url
             extractor = "Instagram"
         else:
-            # Other URLs: use yt-dlp as before
+            # A plain image link is fetched directly; yt-dlp is for pages
+            # that wrap media (it got HTTP 403 from e.g. Wikimedia images).
             notify("Downloading image...")
-            downloaded = download_media(safe_url, temp_dir, notify)
+            downloaded = download_direct_image(safe_url, temp_dir) or download_media(safe_url, temp_dir, notify)
             if downloaded.media_type != "image":
                 raise URLVideoError(
                     "This URL points to a video, not an image. "

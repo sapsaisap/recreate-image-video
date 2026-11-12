@@ -125,7 +125,7 @@ WRAPPER = textwrap.dedent('''
             ss.FactCheck(claim="Walking helps", verdict="confirmed", note="WHO")], scenes=[
             ss.StoryScene(narration=f"line {{i}}", visual_type="real_frame", type_reason="clear picture",
                           moment=i, image_prompt="prompt") for i in (1, 2, 3)])
-        return plan, ["walking benefits"], [{{"title": "who.int", "uri": "https://example.com"}}]
+        return plan, ["walking benefits"], [{{"title": "who.int", "uri": "https://example.com"}}], "gemini-2.5-flash"
 
     def fake_fit(scenes, voice, target, notify=None, shorten=None):
         audio = work / "tone.mp3"
@@ -225,3 +225,17 @@ class TestOnScreenTextSwitch:
     def test_switch_allows_quoted_source_text(self):
         prompt = story_prompt(analysis(), 120, 15, search=False, allow_text=True)
         assert "NO text, letters" not in prompt and "inside double quotes, word for word" in prompt
+
+
+class TestSourceFramesUsed:
+    def test_story_prompt_requires_moments_for_what_the_video_shows(self):
+        prompt = story_prompt(analysis(), 160, 15, search=True)
+        assert "MUST set moment to that moment's number" in prompt and "ONLY for an idea the video never shows" in prompt
+
+    def test_moments_after_the_end_are_dropped(self):
+        kept = ss.drop_moments_outside(analysis([moment(10.0), moment(216.0)]), 160.0)
+        assert [m.timestamp_seconds for m in kept.visual_moments] == [10.0]
+
+    def test_detects_a_plan_without_source_frames(self):
+        assert not ss.uses_source_frames(plan(scene("ai", 0), scene("ai", 0)))
+        assert ss.uses_source_frames(plan(scene("ai", 0), scene("ai_from_reference", 2)))

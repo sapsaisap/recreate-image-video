@@ -52,7 +52,7 @@ from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR / ".env")
@@ -101,6 +101,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("recreate_video")
+_LOADED_MTIME = Path(__file__).stat().st_mtime  # see recreate_video.drop_stale_app_modules
 
 T = TypeVar("T")
 Notify = Callable[[str], None]
@@ -142,11 +143,14 @@ def _seconds_until_quota_reset() -> int:
     return max(0, int((midnight - now).total_seconds()))
 
 
-# Models the Gemini API free tier serves at no cost (AI Studio pricing page,
-# Nov 2026). Paid-only models such as gemini-3.8-flash are deliberately not
-# here: a free-tier key only gets "limit: 0" errors from them. Add a model
-# only once the pricing page lists it as "Free of charge" on the free tier.
-FREE_TIER_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite"})
+# Models a free-tier key can use (each one answered on a free key, 2026-11-12).
+# gemini-3.8-flash and gemini-3.7-flash are left out: on the free key they
+# hung for 60-110 s and then answered 503 "high demand". gemini-2.5-pro is
+# gone for new users (404). Add a model only once it answers on a free key.
+FREE_TIER_MODELS = frozenset({
+    "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+    "gemini-2.5-flash", "gemini-2.5-flash-lite",
+})
 
 # Shutdown dates from the deprecations page. From that date the model is
 # dropped from every chain: Google routes its requests to another model, so
@@ -160,14 +164,32 @@ MODEL_SHUTDOWN = {"gemini-2.5-flash": date(2026, 12, 1)}
 #   text:     writes the recreation prompt from the analysis JSON
 #   metadata: writes the YouTube / Instagram metadata (Google Search)
 #   story:    Summarise to Short's fact-checked script (Google Search)
-# gemini-2.5-flash leads (best quality, free Google Search) until its
-# shutdown on 2026-12-01, after which it drops out automatically.
-DEFAULT_MODEL_CHAIN = "gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"
+# Newest full model first; gemini-3.1-flash-lite last (works, but took ~25 s
+# for a one-word reply). Google Search runs only on the 2.5 models
+# (FREE_SEARCH_MODELS; the 3.x free tier refuses it with a 429), so the steps
+# that search start on them: metadata uses nothing else -- it is only written
+# from real search results -- and the summary script falls back to the newest
+# models without search. gemini-2.5-flash drops out automatically at its
+# shutdown on 2026-12-01.
+DEFAULT_MODEL_CHAIN = (
+    "gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite,"
+    "gemini-3.1-flash-lite"
+)
+METADATA_MODEL_CHAIN = "gemini-2.5-flash,gemini-2.5-flash-lite"
+STORY_MODEL_CHAIN = (
+    "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,"
+    "gemini-3.1-flash-lite"
+)
+# Free-tier models whose quota includes Grounding with Google Search (500
+# requests/day, shared by both). Every 3.x model answers 429 with search on.
+FREE_SEARCH_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite"})
+# Steps whose result is only used when it came from a real Google Search.
+SEARCH_ONLY_TASKS = frozenset({"metadata"})
 TASK_MODEL_ENV = {
     "analysis": ("GEMINI_ANALYSIS_MODELS", DEFAULT_MODEL_CHAIN),
     "text": ("GEMINI_TEXT_MODELS", DEFAULT_MODEL_CHAIN),
-    "metadata": ("GEMINI_METADATA_MODELS", DEFAULT_MODEL_CHAIN),
-    "story": ("GEMINI_STORY_MODELS", DEFAULT_MODEL_CHAIN),
+    "metadata": ("GEMINI_METADATA_MODELS", METADATA_MODEL_CHAIN),
+    "story": ("GEMINI_STORY_MODELS", STORY_MODEL_CHAIN),
 }
 
 # Per-request time limits (seconds). A request that hangs fails at this
@@ -252,6 +274,11 @@ class Config:
                 )
             elif not self.models_for(task):
                 issues.append(f"Every model in {env_name} has been shut down -- add a current free-tier model.")
+            elif task in SEARCH_ONLY_TASKS and not set(self.models_for(task)) & FREE_SEARCH_MODELS:
+                issues.append(
+                    f"{env_name} has no model that can use Google Search on the free tier "
+                    f"({', '.join(sorted(FREE_SEARCH_MODELS))}), and metadata is only written from search results."
+                )
         if self.cookies_file and not Path(self.cookies_file).is_file():
             issues.append(f"COOKIES_FILE points to a missing file: {self.cookies_file}")
         return issues
@@ -647,6 +674,11 @@ class _RetryableResponse(RuntimeError):
     """A 200 response whose body was empty/unparsable -- usually transient."""
 
 
+class _NotGrounded(RuntimeError):
+    """A step that must be grounded got an answer without Google Search: try
+    the next model in the chain (the model itself is not busy)."""
+
+
 def _throttle() -> None:
     """Keeps at least 60/GEMINI_RPM seconds between Gemini calls so the
     free-tier per-minute limit is rarely hit in the first place."""
@@ -735,6 +767,12 @@ def _is_search_quota(exc: Exception) -> bool:
     return "grounding" in str(exc).lower()
 
 
+def _is_overloaded(exc: Exception) -> bool:
+    """503 'This model is currently experiencing high demand' / UNAVAILABLE."""
+    text = str(exc).lower()
+    return _error_code(exc) == 503 or "high demand" in text or "overloaded" in text
+
+
 def _is_model_missing(exc: Exception) -> bool:
     """404 "models/... is not found": renamed, retired or never existed."""
     return _error_code(exc) == 404
@@ -796,6 +834,7 @@ def call_gemini(
     task: str | None,
     label: str = "Gemini",
     throttle: bool = True,
+    only_models: frozenset[str] | None = None,
 ) -> T:
     """Runs fn(model_name) until it succeeds, walking the free-tier model
     chain of `task` ("analysis", "text", "metadata", "story"; TASK_MODEL_ENV).
@@ -813,10 +852,21 @@ def call_gemini(
       other model is left does it back off (5/10/20/40/60 s).
     - Anything else (bad key, bad request, safety block): GeminiCallError now.
 
+    - _NotGrounded from fn: on to the next model at once; GeminiCallError
+      once every model has answered without searching.
+
     task=None is for Files API calls: they use no model and no daily quota,
     so fn gets "" and only the per-minute / transient handling applies.
+    `only_models` limits the chain (e.g. to the models that can search).
     """
     chain = CONFIG.models_for(task) if task else [""]
+    if only_models is not None:
+        chain = [model for model in chain if model in only_models]
+        if not chain:
+            raise GeminiCallError(
+                f"No model set for this step can do it on the free tier (it needs one of "
+                f"{', '.join(sorted(only_models))}). Check the step's model list in .env."
+            )
     passed_over: set[str] = set()  # set aside for the rest of this call
     current = None
     failures_on_model = 0
@@ -853,6 +903,16 @@ def call_gemini(
             return result
         except (GeminiCallError, QuotaExhaustedError):
             raise
+        except _NotGrounded as exc:
+            logger.warning(f"[GEMINI] {label} model={model} {exc}")
+            passed_over.add(model)
+            if not any(m not in passed_over for m in available):
+                raise GeminiCallError(
+                    f"{exc} on every model that can search ({', '.join(available)}), so nothing was "
+                    "written: it is only written from real Google Search results. Try again in a minute."
+                ) from exc
+            notify(f"{model} did not search Google -- trying the next model")
+            continue
         except Exception as exc:
             kind = _classify(exc)
             reason = _unusable_reason(exc) if task else None
@@ -873,7 +933,9 @@ def call_gemini(
                 logger.warning(f"[GEMINI] {label} model={model} per-minute limit, switching: {exc}")
                 notify(f"{model} is rate-limited -- using the next model")
                 continue
-            if can_switch and kind == "transient" and failures_on_model >= 2:
+            # "High demand" (503) spells last minutes and a 503 can take ~45 s
+            # to arrive, so retrying the same model only adds delay: switch now.
+            if can_switch and kind == "transient" and (failures_on_model >= 2 or _is_overloaded(exc)):
                 _cool_down(model, COOLDOWN_BUSY_SECONDS)
                 passed_over.add(model)
                 logger.warning(f"[GEMINI] {label} model={model} busy, switching: {exc}")
@@ -1133,6 +1195,37 @@ class DownloadedVideo:
     extractor: str
 
 
+def video_format(max_height: int) -> str:
+    """yt-dlp format: best video + audio up to `max_height`p, measured on the
+    picture's SHORT side -- a vertical 720p Short is 720x1280, so limiting
+    the height to 720 would have cut it to 360x640."""
+    long_side = round(max_height * 16 / 9)
+    limit = f"[height<={long_side}][width<={long_side}]"
+    return f"bv*[ext=mp4]{limit}+ba[ext=m4a]/b[ext=mp4]{limit}/bv*{limit}+ba/b{limit}/bv*+ba/b"
+
+
+def js_runtimes() -> dict[str, dict]:
+    """JavaScript runtimes yt-dlp may use to solve YouTube's player challenge
+    (needs Deno >= 2.3 or Node >= 22). The `deno` pip package installs Deno
+    next to Python's scripts, which may not be on PATH (e.g. Streamlit Cloud)."""
+    import sysconfig
+
+    runtimes: dict[str, dict] = {}
+    deno_name = "deno.exe" if os.name == "nt" else "deno"
+    scripts = [Path(sysconfig.get_path("scripts"))]
+    try:
+        scripts.append(Path(sysconfig.get_path("scripts", f"{os.name}_user")))
+    except KeyError:
+        pass
+    deno = shutil.which("deno") or next((str(p / deno_name) for p in scripts if (p / deno_name).is_file()), None)
+    if deno:
+        runtimes["deno"] = {"path": deno}
+    node = shutil.which("node")
+    if node:
+        runtimes["node"] = {"path": node}
+    return runtimes or {"deno": {}, "node": {}}
+
+
 def download_video(
     url: str,
     destination: Path,
@@ -1175,12 +1268,7 @@ def download_video(
             notify(f"Downloading video... {min(done / total, 0.99) * 100:.0f}%")
 
     options: dict[str, Any] = {
-        # Capped (720p by default): Gemini samples video at low resolution
-        # anyway, and a smaller file uploads faster.
-        "format": (
-            f"bv*[ext=mp4][height<={max_height}]+ba[ext=m4a]/b[ext=mp4][height<={max_height}]/"
-            f"bv*[height<={max_height}]+ba/b[height<={max_height}]/bv*+ba/b"
-        ),
+        "format": video_format(max_height),
         "outtmpl": str(destination / "source.%(ext)s"),
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -1196,12 +1284,9 @@ def download_video(
         "fragment_retries": 2,
         "logger": _YtdlpLogger(),
         "ffmpeg_location": ffmpeg_exe(),
-        "js_runtimes": {"node": {}},
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "web"],
-            }
-        },
+        # yt-dlp picks its own YouTube player clients: forcing android/ios
+        # left only an old 360p combined format.
+        "js_runtimes": js_runtimes(),
     }
     if CONFIG.cookies_file:
         options["cookiefile"] = CONFIG.cookies_file
@@ -1620,6 +1705,17 @@ class SocialMetadataDraft(BaseModel):
     instagram_caption: str = Field(description="Instagram caption without hashtags.")
     instagram_hashtags: list[str] = Field(description="Exactly 5 niche Instagram hashtags, best first.")
 
+    @field_validator("search_insights", mode="before")
+    @classmethod
+    def _insights_as_text(cls, value: Any) -> Any:
+        # gemini-2.5-flash-lite sometimes sends this as {"youtube_searches": [...], ...}.
+        if isinstance(value, dict):
+            return " ".join(f"{key}: {', '.join(map(str, v)) if isinstance(v, list) else v}."
+                            for key, v in value.items())
+        if isinstance(value, list):
+            return " ".join(map(str, value))
+        return value
+
 
 class SocialMetadata(BaseModel):
     """Ready-to-paste YouTube and Instagram metadata, already fitted to each
@@ -1634,6 +1730,16 @@ class SocialMetadata(BaseModel):
     grounded: bool = False  # True when Gemini actually ran Google searches for it
     search_queries: list[str] = Field(default_factory=list)
     sources: list[dict[str, str]] = Field(default_factory=list)  # {"title", "uri"}
+    model: str = ""  # the Gemini model that wrote it
+
+
+def grounding_label(queries: list[str], sources: list[dict[str, str]], model: str) -> str:
+    """One line saying whether a result came from Google Search, and from which model."""
+    by = f" · {model}" if model else ""
+    if queries or sources:
+        return f"🔎 Researched with Google Search{by} ({len(queries)} searches, {len(sources)} sources)"
+    return (f"⚠️ Not grounded{by} -- written without Google Search (the 2.5 models were busy or "
+            "today's 500 free searches are used up)")
 
 
 # How each reference purpose is attached to a video generator. Kept in code
@@ -1945,7 +2051,7 @@ def render_prompt(
             + ("." if _is_english(language) else ", and do not switch to English."),
         ]
         if audio.voice_character.strip() and audio.voice_character.strip().lower() != "none":
-            lines.append(f"- Voice: {audio.voice_character.strip()}.")
+            lines.append(f"- Voice: {audio.voice_character.strip().rstrip('.')}.")
         lines.append("")
     if plan.reference_images:
         lines.append("REFERENCE IMAGES (attached)")
@@ -2098,7 +2204,9 @@ def _dialogue_warnings(beats: list[PromptBeat], transcript: list[Utterance], dur
     warnings = []
     missing = _missing_lines(beats, len(transcript))
     if missing:
-        dropped = "; ".join(f"L{n}: {transcript[n - 1].english.strip()}" for n in missing)
+        dropped = "; ".join(f"L{n}: {transcript[n - 1].english.strip()}" for n in missing[:3])
+        if len(missing) > 3:
+            dropped += f"; ...and {len(missing) - 3} more"
         reason = (
             f"the source has {_speech_seconds(transcript):.1f}s of speech, more than {duration}s"
             if _speech_seconds(transcript) > duration
@@ -2188,10 +2296,6 @@ GENERIC_HASHTAGS = frozenset({
     "#viral", "#reels", "#explorepage", "#explore", "#fyp", "#foryou", "#foryoupage",
     "#trending", "#instagood", "#reelsinstagram", "#viralreels", "#viralvideo", "#reelitfeelit",
 })
-# Free-tier models whose quota includes Grounding with Google Search (500
-# requests/day on the pricing page). gemini-3.5-flash-lite has none for free.
-FREE_SEARCH_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite"})
-
 
 def _metadata_language_rule(language: str) -> str:
     if _is_english(language) or CONFIG.metadata_language == "english":
@@ -2344,7 +2448,7 @@ def _fit_title(title: str, shorts: bool) -> str:
 
 
 def _finish_metadata(
-    draft: SocialMetadataDraft, kind: str, queries: list[str], sources: list[dict[str, str]],
+    draft: SocialMetadataDraft, kind: str, queries: list[str], sources: list[dict[str, str]], model: str = "",
 ) -> SocialMetadata:
     """Fits Gemini's draft to each platform's limits."""
     description = draft.youtube_description.strip()
@@ -2366,6 +2470,7 @@ def _finish_metadata(
         grounded=bool(queries or sources),
         search_queries=queries,
         sources=sources,
+        model=model,
     )
 
 
@@ -2390,11 +2495,14 @@ def _parse_json_reply(response: Any, schema: type[BaseModel]) -> BaseModel:
         return _parse_structured(response, schema)
     except _RetryableResponse:
         text = getattr(response, "text", None) or ""
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
+        start = text.find("{")
+        if start < 0:
             raise
         try:
-            return schema.model_validate_json(text[start:end + 1])
+            # The first complete object; gemini-2.5-flash-lite sometimes
+            # adds a stray "}" or a second copy after it.
+            data, _ = json.JSONDecoder().raw_decode(text, start)
+            return schema.model_validate(data)
         except ValueError as exc:
             raise _RetryableResponse(f"Gemini returned invalid JSON: {exc}") from exc
 
@@ -2409,25 +2517,42 @@ def generate_with_optional_search(
     contents_before: list | None = None,
     temperature: float = 0.7,
     thinking_budget: int | None = None,
-) -> tuple[BaseModel, list[str], list[dict[str, str]]]:
+    timeout_seconds: int | None = None,
+    require_search: bool = False,
+) -> tuple[BaseModel, list[str], list[dict[str, str]], str]:
     """One free-tier Gemini call, grounded in Google Search when it can be.
 
     On a model whose free tier includes Google Search (FREE_SEARCH_MODELS) the
     call searches; 2.5 models cannot combine search with a response schema, so
     build_prompt(True) must ask for JSON as plain text. Otherwise -- or once
     today's free search quota is used up -- build_prompt(False) runs with the
-    schema enforced. Returns (result, searches run, sources used); both lists
-    are empty when nothing was searched. `contents_before` (e.g. images) is
-    sent ahead of the prompt. `thinking_budget` caps gemini-2.5-flash's
-    thinking (faster replies); other models ignore it.
+    schema enforced. Returns (result, searches run, sources used, model);
+    both lists are empty when nothing was searched. `contents_before` (e.g.
+    images) is sent ahead of the prompt. `thinking_budget` caps
+    gemini-2.5-flash's thinking (faster replies); other models ignore it. If
+    a search-capable model answers without searching, it is asked once more,
+    insisting.
+
+    require_search: only a grounded answer is returned. Only the search
+    models are tried, an answer that still did not search moves on to the
+    next one, and with today's search quota used up QuotaExhaustedError is
+    raised instead of answering from memory.
     """
     from google.genai import types as genai_types
 
+    if require_search and _search_used_up():
+        raise QuotaExhaustedError(_search_used_up_message())
     client = get_client()
 
-    def ask(model: str, search: bool):
+    def ask(model: str, search: bool, insist: bool = False):
+        prompt = build_prompt(search)
+        if insist:
+            prompt += ("\n\nIMPORTANT: run Google Search now, before you answer. An answer that was not "
+                       "checked with Google Search cannot be used.")
         options: dict[str, Any] = {
-            "http_options": gemini_http_options(TIMEOUT_SEARCH_SECONDS if search else TIMEOUT_TEXT_SECONDS),
+            "http_options": gemini_http_options(
+                timeout_seconds or (TIMEOUT_SEARCH_SECONDS if search else TIMEOUT_TEXT_SECONDS)
+            ),
             "temperature": temperature,
             "automatic_function_calling": genai_types.AutomaticFunctionCallingConfig(disable=True),
         }
@@ -2439,44 +2564,74 @@ def generate_with_optional_search(
             options.update(response_mime_type="application/json", response_schema=schema)
         response = client.models.generate_content(
             model=model,
-            contents=[*(contents_before or []), build_prompt(search)],
+            contents=[*(contents_before or []), prompt],
             config=genai_types.GenerateContentConfig(**options),
         )
         if not search:
-            return _parse_structured(response, schema), [], []
+            return _parse_structured(response, schema), [], [], model
         queries, sources = _grounding_info(response)
-        return _parse_json_reply(response, schema), queries, sources
+        return _parse_json_reply(response, schema), queries, sources, model
 
     def run(model: str):
         if model in FREE_SEARCH_MODELS and not _search_used_up():
             try:
-                return ask(model, search=True)
+                result = ask(model, search=True)
+                if result[1] or result[2]:
+                    return result
+                # Search was available but Gemini answered from memory: ask
+                # once more, insisting (a measured case: "confirmed" fact
+                # checks with zero searches run).
+                logger.info(f"[GEMINI] {label} model={model} answered without searching -- asking again")
+                notify("Gemini answered without searching -- asking it to check with Google Search")
+                _record_call(model)
+                again = ask(model, search=True, insist=True)
+                if again[1] or again[2]:
+                    return again
+                if require_search:
+                    raise _NotGrounded("Gemini answered without running Google Search")
+                return result
+            except _NotGrounded:
+                raise
             except Exception as exc:
                 if not _is_search_quota(exc):
                     raise
                 logger.warning(f"[GEMINI] {label} model={model} search quota used up: {exc}")
                 _mark_search_used_up()
+                if require_search:
+                    raise QuotaExhaustedError(_search_used_up_message()) from exc
                 notify("Today's free Google Search quota is used up -- continuing without search")
                 _record_call(model)
+        if require_search:  # another session used up the search quota meanwhile
+            raise QuotaExhaustedError(_search_used_up_message())
         return ask(model, search=False)
 
-    return call_gemini(run, notify, task=task, label=label)
+    return call_gemini(run, notify, task=task, label=label,
+                       only_models=FREE_SEARCH_MODELS if require_search else None)
+
+
+def _search_used_up_message() -> str:
+    return (
+        "Metadata is only written from Google Search results, and today's free Google Search quota "
+        "(500 searches a day, shared by gemini-2.5-flash and gemini-2.5-flash-lite) is used up. "
+        f"It resets at midnight Pacific time, in about {_format_reset_wait()}."
+    )
 
 
 def generate_metadata(context: str, kind: str, language: str, notify: Notify = _noop_notify) -> SocialMetadata:
-    """One free-tier Gemini call for YouTube + Instagram metadata, grounded in
-    Google Search when today's free quota allows; SocialMetadata.grounded
-    says whether it was."""
-    notify("Researching keywords and writing social media metadata...")
-    draft, queries, sources = generate_with_optional_search(
+    """YouTube + Instagram metadata, written only from Google Search results
+    (gemini-2.5-flash, then gemini-2.5-flash-lite). With no grounded answer it
+    raises GeminiCallError / QuotaExhaustedError instead of guessing."""
+    notify("Researching keywords with Google Search and writing the metadata...")
+    draft, queries, sources, model = generate_with_optional_search(
         lambda search: _metadata_prompt(context, kind, language, search),
         SocialMetadataDraft,
         task="metadata",
         label=f"{kind}-metadata",
         notify=notify,
         thinking_budget=METADATA_THINKING_BUDGET,
+        require_search=True,
     )
-    return _finish_metadata(draft, kind, queries, sources)
+    return _finish_metadata(draft, kind, queries, sources, model)
 
 
 def generate_social_metadata(
@@ -2507,9 +2662,7 @@ def render_social_metadata(meta: "SocialMetadata") -> str:
     """Render the social metadata into a copy-paste ready text block."""
     tag_cost = youtube_tags_cost(split_tags(meta.youtube_tags))
     lines = [
-        (f"🔎 Keywords researched with Google Search ({len(meta.search_queries)} searches)"
-         if meta.grounded else
-         "⚠️ Not grounded in Google Search -- keywords come from Gemini's own knowledge"),
+        grounding_label(meta.search_queries, meta.sources, meta.model),
         "",
         "=== YOUTUBE ===",
         "",
@@ -3049,13 +3202,7 @@ def render_social(st, social: "SocialMetadata | None") -> None:
     if not social:
         st.warning("Social metadata generation failed — try regenerating.")
         return
-    if social.grounded:
-        st.caption(f"🔎 Keywords researched with Google Search ({len(social.search_queries)} searches). Edit before posting.")
-    else:
-        st.caption(
-            "⚠️ Not grounded in Google Search (today's free search quota is used up, or the search "
-            "model was unavailable) — keywords come from Gemini's own knowledge. Edit before posting."
-        )
+    st.caption(grounding_label(social.search_queries, social.sources, social.model) + ". Edit before posting.")
     tab_yt, tab_ig = st.tabs(["▶️ YouTube", "📸 Instagram"])
     with tab_yt:
         st.markdown("**📌 Title** — paste into the YouTube title field")
@@ -3240,15 +3387,46 @@ def _render_quota_sidebar(st) -> None:
             else ":green[available]"
         )
         st.caption(f"`{model}` · {snapshot['calls'].get(model, 0)} call(s) · {status}")
-    search = ":red[used up]" if snapshot["search_used_up"] else ":green[available]"
-    st.caption(f"Google Search for metadata · {search}")
+    search_models = [m for m in CONFIG.models_for("metadata") if m in FREE_SEARCH_MODELS]
+    search = (":red[used up -- metadata waits for the reset]" if snapshot["search_used_up"]
+              else ":green[available]" if search_models else ":red[no search model left]")
+    st.caption(f"Google Search ({', '.join(search_models) or 'none'}; 500 free a day) · {search}")
     st.caption(
         f"Counts are this app's requests only. Free quotas reset at midnight "
         f"Pacific time (in {_format_reset_wait()})."
     )
 
 
+APP_MODULES = ("recreate_video", "recreate_image", "image_to_video", "summary_short", "voiceover", "slideshow")
+
+
+def drop_stale_app_modules() -> list[str]:
+    """Streamlit re-runs this script on every interaction, but modules it
+    imports stay loaded in the process. After an in-place update (a git push
+    to Streamlit Cloud), a newer module importing a name that the still-loaded
+    older recreate_video lacks fails with ImportError. When any app module's
+    file changed since it was loaded, all of them are dropped so this run
+    imports them fresh. Returns the dropped names."""
+    stale = False
+    for name in APP_MODULES:
+        module = sys.modules.get(name)
+        path = getattr(module, "__file__", None)
+        if module is None or not path:
+            continue
+        try:
+            changed = getattr(module, "_LOADED_MTIME", None) != Path(path).stat().st_mtime
+        except OSError:
+            changed = True
+        stale = stale or changed
+    if not stale:
+        return []
+    dropped = [name for name in APP_MODULES if sys.modules.pop(name, None) is not None]
+    logger.info(f"[RELOAD] app files changed since they were loaded -- re-importing {', '.join(dropped)}")
+    return dropped
+
+
 def run_app() -> None:
+    drop_stale_app_modules()
     import streamlit as st
     # Lazy import of image pipeline — only needed when image mode is active.
     from recreate_image import (

@@ -100,9 +100,11 @@ GEMINI_API_KEY=your_actual_gemini_api_key_here
 
 #### Free tier only
 The app is built for a **free** Gemini key and accepts only free-tier models
-(`gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3.5-flash-lite`).
+(`gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`,
+`gemini-2.5-flash`, `gemini-2.5-flash-lite`).
 - **Never link a billing account** to the key's Google Cloud project. A project without billing cannot be charged; when a limit is hit, Gemini returns an error and the app waits or switches model.
-- Each step has its own model chain (`GEMINI_ANALYSIS_MODELS`, `GEMINI_TEXT_MODELS`, `GEMINI_METADATA_MODELS`). A model whose daily quota is used up is skipped until the reset at midnight Pacific time; the sidebar shows today's usage.
+- Each step has its own model chain (`GEMINI_ANALYSIS_MODELS`, `GEMINI_TEXT_MODELS`, `GEMINI_METADATA_MODELS`, `GEMINI_STORY_MODELS`). A model whose daily quota is used up is skipped until the reset at midnight Pacific time; the sidebar shows today's usage.
+- **Google Search** is free only on `gemini-2.5-flash` and `gemini-2.5-flash-lite` (500 searches a day, shared). YouTube / Instagram metadata is only written from real search results, so it uses just those two; if neither can search (busy, or the day's searches are used up), the app says so with a Retry button instead of guessing. The Summarise to Short script starts on them and falls back to the newest models without search, marked "not grounded". Analysis and prompts don't search and start on `gemini-3.6-flash`.
 - Limits are per Google Cloud project, not per key — extra keys in the same project add no quota.
 - On the free tier, Google may use what you send to improve its products. Don't upload confidential material.
 

@@ -101,6 +101,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("recreate_video")
+_LOADED_MTIME = Path(__file__).stat().st_mtime  # see recreate_video.drop_stale_app_modules
 
 T = TypeVar("T")
 Notify = Callable[[str], None]
@@ -142,11 +143,14 @@ def _seconds_until_quota_reset() -> int:
     return max(0, int((midnight - now).total_seconds()))
 
 
-# Models the Gemini API free tier serves at no cost (AI Studio pricing page,
-# Nov 2026). Paid-only models such as gemini-3.8-flash are deliberately not
-# here: a free-tier key only gets "limit: 0" errors from them. Add a model
-# only once the pricing page lists it as "Free of charge" on the free tier.
-FREE_TIER_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite"})
+# Models a free-tier key can use (each one answered on a free key, 2026-11-12).
+# gemini-3.8-flash and gemini-3.7-flash are left out: on the free key they
+# hung for 60-110 s and then answered 503 "high demand". gemini-2.5-pro is
+# gone for new users (404). Add a model only once it answers on a free key.
+FREE_TIER_MODELS = frozenset({
+    "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+    "gemini-2.5-flash", "gemini-2.5-flash-lite",
+})
 
 # Shutdown dates from the deprecations page. From that date the model is
 # dropped from every chain: Google routes its requests to another model, so
@@ -160,14 +164,23 @@ MODEL_SHUTDOWN = {"gemini-2.5-flash": date(2026, 12, 1)}
 #   text:     writes the recreation prompt from the analysis JSON
 #   metadata: writes the YouTube / Instagram metadata (Google Search)
 #   story:    Summarise to Short's fact-checked script (Google Search)
-# gemini-2.5-flash leads (best quality, free Google Search) until its
-# shutdown on 2026-12-01, after which it drops out automatically.
-DEFAULT_MODEL_CHAIN = "gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"
+# Newest full model first; gemini-3.1-flash-lite last (works, but took ~25 s
+# for a one-word reply). Steps that use Google Search start on the 2.5
+# models, the only ones whose free tier includes it. gemini-2.5-flash drops
+# out automatically at its shutdown on 2026-12-01.
+DEFAULT_MODEL_CHAIN = (
+    "gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite,"
+    "gemini-3.1-flash-lite"
+)
+SEARCH_MODEL_CHAIN = (
+    "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,"
+    "gemini-3.1-flash-lite"
+)
 TASK_MODEL_ENV = {
     "analysis": ("GEMINI_ANALYSIS_MODELS", DEFAULT_MODEL_CHAIN),
     "text": ("GEMINI_TEXT_MODELS", DEFAULT_MODEL_CHAIN),
-    "metadata": ("GEMINI_METADATA_MODELS", DEFAULT_MODEL_CHAIN),
-    "story": ("GEMINI_STORY_MODELS", DEFAULT_MODEL_CHAIN),
+    "metadata": ("GEMINI_METADATA_MODELS", SEARCH_MODEL_CHAIN),
+    "story": ("GEMINI_STORY_MODELS", SEARCH_MODEL_CHAIN),
 }
 
 # Per-request time limits (seconds). A request that hangs fails at this
@@ -1133,6 +1146,37 @@ class DownloadedVideo:
     extractor: str
 
 
+def video_format(max_height: int) -> str:
+    """yt-dlp format: best video + audio up to `max_height`p, measured on the
+    picture's SHORT side -- a vertical 720p Short is 720x1280, so limiting
+    the height to 720 would have cut it to 360x640."""
+    long_side = round(max_height * 16 / 9)
+    limit = f"[height<={long_side}][width<={long_side}]"
+    return f"bv*[ext=mp4]{limit}+ba[ext=m4a]/b[ext=mp4]{limit}/bv*{limit}+ba/b{limit}/bv*+ba/b"
+
+
+def js_runtimes() -> dict[str, dict]:
+    """JavaScript runtimes yt-dlp may use to solve YouTube's player challenge
+    (needs Deno >= 2.3 or Node >= 22). The `deno` pip package installs Deno
+    next to Python's scripts, which may not be on PATH (e.g. Streamlit Cloud)."""
+    import sysconfig
+
+    runtimes: dict[str, dict] = {}
+    deno_name = "deno.exe" if os.name == "nt" else "deno"
+    scripts = [Path(sysconfig.get_path("scripts"))]
+    try:
+        scripts.append(Path(sysconfig.get_path("scripts", f"{os.name}_user")))
+    except KeyError:
+        pass
+    deno = shutil.which("deno") or next((str(p / deno_name) for p in scripts if (p / deno_name).is_file()), None)
+    if deno:
+        runtimes["deno"] = {"path": deno}
+    node = shutil.which("node")
+    if node:
+        runtimes["node"] = {"path": node}
+    return runtimes or {"deno": {}, "node": {}}
+
+
 def download_video(
     url: str,
     destination: Path,
@@ -1175,12 +1219,7 @@ def download_video(
             notify(f"Downloading video... {min(done / total, 0.99) * 100:.0f}%")
 
     options: dict[str, Any] = {
-        # Capped (720p by default): Gemini samples video at low resolution
-        # anyway, and a smaller file uploads faster.
-        "format": (
-            f"bv*[ext=mp4][height<={max_height}]+ba[ext=m4a]/b[ext=mp4][height<={max_height}]/"
-            f"bv*[height<={max_height}]+ba/b[height<={max_height}]/bv*+ba/b"
-        ),
+        "format": video_format(max_height),
         "outtmpl": str(destination / "source.%(ext)s"),
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -1196,12 +1235,9 @@ def download_video(
         "fragment_retries": 2,
         "logger": _YtdlpLogger(),
         "ffmpeg_location": ffmpeg_exe(),
-        "js_runtimes": {"node": {}},
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "web"],
-            }
-        },
+        # yt-dlp picks its own YouTube player clients: forcing android/ios
+        # left only an old 360p combined format.
+        "js_runtimes": js_runtimes(),
     }
     if CONFIG.cookies_file:
         options["cookiefile"] = CONFIG.cookies_file
@@ -3248,7 +3284,36 @@ def _render_quota_sidebar(st) -> None:
     )
 
 
+APP_MODULES = ("recreate_video", "recreate_image", "image_to_video", "summary_short", "voiceover", "slideshow")
+
+
+def drop_stale_app_modules() -> list[str]:
+    """Streamlit re-runs this script on every interaction, but modules it
+    imports stay loaded in the process. After an in-place update (a git push
+    to Streamlit Cloud), a newer module importing a name that the still-loaded
+    older recreate_video lacks fails with ImportError. When any app module's
+    file changed since it was loaded, all of them are dropped so this run
+    imports them fresh. Returns the dropped names."""
+    stale = False
+    for name in APP_MODULES:
+        module = sys.modules.get(name)
+        path = getattr(module, "__file__", None)
+        if module is None or not path:
+            continue
+        try:
+            changed = getattr(module, "_LOADED_MTIME", None) != Path(path).stat().st_mtime
+        except OSError:
+            changed = True
+        stale = stale or changed
+    if not stale:
+        return []
+    dropped = [name for name in APP_MODULES if sys.modules.pop(name, None) is not None]
+    logger.info(f"[RELOAD] app files changed since they were loaded -- re-importing {', '.join(dropped)}")
+    return dropped
+
+
 def run_app() -> None:
+    drop_stale_app_modules()
     import streamlit as st
     # Lazy import of image pipeline — only needed when image mode is active.
     from recreate_image import (

@@ -53,6 +53,7 @@ from recreate_video import (
 )
 
 logger = logging.getLogger(__name__)
+_LOADED_MTIME = Path(__file__).stat().st_mtime  # see recreate_video.drop_stale_app_modules
 
 DURATIONS = (10, 15, 20)
 DEFAULT_DURATION = 15

@@ -27,6 +27,7 @@ from typing import Callable
 from recreate_video import ffmpeg_exe
 
 logger = logging.getLogger(__name__)
+_LOADED_MTIME = Path(__file__).stat().st_mtime  # see recreate_video.drop_stale_app_modules
 
 OUTPUT_WIDTH, OUTPUT_HEIGHT = 1080, 1920
 FPS = 30

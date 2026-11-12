@@ -32,6 +32,7 @@ from typing import Callable
 from recreate_video import ffmpeg_exe
 
 logger = logging.getLogger(__name__)
+_LOADED_MTIME = Path(__file__).stat().st_mtime  # see recreate_video.drop_stale_app_modules
 
 TICKS_PER_SECOND = 10_000_000  # edge-tts word offsets are in 100 ns units
 MAX_SPEEDUP_PERCENT = 25  # faster than this starts to sound rushed

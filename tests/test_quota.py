@@ -1,5 +1,6 @@
 """Free-tier guard, per-task model chains and daily-quota memory in call_gemini."""
 import dataclasses
+import sys
 from datetime import datetime
 
 import pytest
@@ -211,3 +212,54 @@ class TestFreeTierGuard:
         assert "gemini-2.5-flash" in rv.CONFIG.models_for("analysis")
         monkeypatch.setattr(rv, "_pacific_now", lambda: datetime(2026, 12, 1, 0, 0, tzinfo=rv._PACIFIC))
         assert rv.CONFIG.models_for("analysis") == ["gemini-3.5-flash-lite"]
+
+
+class TestModelOrder:
+    def test_newest_working_model_leads_and_slow_lite_is_last(self):
+        chain = rv.DEFAULT_MODEL_CHAIN.split(",")
+        assert chain[0] == "gemini-3.6-flash" and chain[-1] == "gemini-3.1-flash-lite"
+        assert "gemini-3.8-flash" not in chain and "gemini-3.7-flash" not in chain
+
+    def test_search_steps_start_on_models_with_free_search(self):
+        chain = rv.SEARCH_MODEL_CHAIN.split(",")
+        assert set(chain[:2]) == rv.FREE_SEARCH_MODELS
+        assert rv.TASK_MODEL_ENV["metadata"][1] == rv.TASK_MODEL_ENV["story"][1] == rv.SEARCH_MODEL_CHAIN
+
+    def test_every_default_model_is_accepted(self):
+        for _, default in rv.TASK_MODEL_ENV.values():
+            assert set(default.split(",")) <= rv.FREE_TIER_MODELS
+
+
+class TestStaleModules:
+    @pytest.fixture(autouse=True)
+    def restore_app_modules(self, monkeypatch):
+        """drop_stale_app_modules removes the app modules from sys.modules;
+        registering them first makes pytest put every one of them back, so
+        later tests keep using the same module objects."""
+        for name in rv.APP_MODULES:
+            if name in sys.modules:
+                monkeypatch.setitem(sys.modules, name, sys.modules[name])
+            else:
+                monkeypatch.delitem(sys.modules, name, raising=False)
+
+    def test_changed_files_are_reimported(self, monkeypatch):
+        import types
+        stale = types.ModuleType("summary_short")
+        stale.__file__ = rv.__file__
+        stale._LOADED_MTIME = 0.0  # loaded before the file last changed
+        monkeypatch.setitem(sys.modules, "summary_short", stale)
+        assert "summary_short" in rv.drop_stale_app_modules()
+        assert "summary_short" not in sys.modules
+
+    def test_nothing_dropped_when_up_to_date(self, monkeypatch):
+        for name in rv.APP_MODULES:
+            monkeypatch.delitem(sys.modules, name, raising=False)
+        monkeypatch.setitem(sys.modules, "recreate_video", rv)
+        monkeypatch.setattr(rv, "_LOADED_MTIME", rv.Path(rv.__file__).stat().st_mtime)
+        assert rv.drop_stale_app_modules() == []
+
+
+class TestYoutubeFormat:
+    def test_limit_is_on_the_short_side(self):
+        fmt = rv.video_format(720)
+        assert "[height<=1280][width<=1280]" in fmt and "[height<=720]" not in fmt

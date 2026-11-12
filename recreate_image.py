@@ -49,6 +49,7 @@ from recreate_video import (
     generate_metadata,
     get_client,
     host_is,
+    js_runtimes,
     render_social,
     render_social_metadata,
     validate_public_video_url,
@@ -62,6 +63,7 @@ from recreate_video import (
 )
 
 logger = logging.getLogger(__name__)
+_LOADED_MTIME = Path(__file__).stat().st_mtime  # see recreate_video.drop_stale_app_modules
 Notify = Callable[[str], None]
 
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -229,12 +231,7 @@ def download_media(url: str, destination: Path, notify: Notify = _noop_notify) -
         "retries": 2,
         "logger": _YtdlpLogger(),
         "ffmpeg_location": ffmpeg_exe(),
-        "js_runtimes": {"node": {}},
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "web"],
-            }
-        },
+        "js_runtimes": js_runtimes(),
     }
     if CONFIG.cookies_file:
         options["cookiefile"] = CONFIG.cookies_file

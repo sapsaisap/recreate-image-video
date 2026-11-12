@@ -21,6 +21,7 @@ def env(tmp_path, monkeypatch):
     cfg = dataclasses.replace(rv.CONFIG, work_dir=tmp_path, max_wait_seconds=600, task_models=dict(CHAINS))
     monkeypatch.setattr(rv, "CONFIG", cfg)
     monkeypatch.setattr(rv._STATE, "quota", None)
+    monkeypatch.setattr(rv._STATE, "cooldowns", {})
     monkeypatch.setattr(rv, "_pacific_now", lambda: NOV_11)
     waits = []
     monkeypatch.setattr(rv, "_wait_with_countdown", lambda seconds, reason, notify: waits.append(seconds))
@@ -120,13 +121,71 @@ class TestUnusableModels:
         assert rv._unavailable_models() == {}
 
 
+def busy_error():
+    from google.genai.errors import ServerError
+    return ServerError(503, {"error": {"code": 503, "status": "UNAVAILABLE",
+                                       "message": "The model is overloaded. Please try again later."}})
+
+
+def single_model_chain(monkeypatch):
+    monkeypatch.setattr(rv, "CONFIG", dataclasses.replace(
+        rv.CONFIG, task_models={**rv.CONFIG.task_models, "analysis": ("gemini-2.5-flash",)}))
+
+
 class TestPerMinute:
-    def test_waits_google_retry_delay_on_same_model(self, env):
+    def test_switches_at_once_when_another_model_is_free(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [quota_error(PER_MINUTE, retry="37s")]})
+        assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-3.5-flash-lite"
+        assert calls == ["gemini-2.5-flash", "gemini-3.5-flash-lite"] and env == []  # no waiting
+        assert rv._cooling_models()["gemini-2.5-flash"] == pytest.approx(37, abs=1)
+        assert rv._unavailable_models() == {}  # only a short cooldown, not "used up"
+
+    def test_waits_google_retry_delay_when_no_other_model(self, env, monkeypatch):
+        single_model_chain(monkeypatch)
         fn, calls = failing_on({"gemini-2.5-flash": [quota_error(PER_MINUTE, retry="37s")]})
         assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-2.5-flash"
         assert calls == ["gemini-2.5-flash", "gemini-2.5-flash"]
         assert len(env) == 1 and 38.0 <= env[0] <= 40.0
-        assert rv._unavailable_models() == {}
+
+
+class TestBusyModels:
+    def test_one_quick_retry_on_the_same_model(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()]})
+        assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-2.5-flash"
+        assert calls == ["gemini-2.5-flash", "gemini-2.5-flash"]
+        assert len(env) == 1 and env[0] <= 2.5
+
+    def test_still_busy_switches_and_cools_down(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [busy_error(), busy_error()]})
+        assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-3.5-flash-lite"
+        assert calls == ["gemini-2.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite"]
+        assert rv._cooling_models()["gemini-2.5-flash"] == pytest.approx(rv.COOLDOWN_BUSY_SECONDS, abs=2)
+
+    def test_next_call_starts_on_a_model_that_is_answering(self, env):
+        rv._cool_down("gemini-2.5-flash", 300)
+        fn, calls = failing_on({})
+        rv.call_gemini(fn, task="analysis", throttle=False)
+        assert calls == ["gemini-3.5-flash-lite"]
+
+    def test_cooldown_ends(self, env, monkeypatch):
+        rv._cool_down("gemini-2.5-flash", 300)
+        clock = rv.time.monotonic() + 301
+        monkeypatch.setattr(rv.time, "monotonic", lambda: clock)
+        fn, calls = failing_on({})
+        rv.call_gemini(fn, task="analysis", throttle=False)
+        assert calls == ["gemini-2.5-flash"]
+
+    def test_every_model_busy_backs_off_instead_of_failing(self, env):
+        fn, calls = failing_on({"gemini-2.5-flash": [busy_error()] * 2, "gemini-3.5-flash-lite": [busy_error()] * 2})
+        # Last model standing: it backs off (5 s, 10 s) on that model until it answers.
+        assert rv.call_gemini(fn, task="analysis", throttle=False) == "gemini-3.5-flash-lite"
+        assert calls == ["gemini-2.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite",
+                         "gemini-3.5-flash-lite", "gemini-3.5-flash-lite"]
+        assert env[0] <= 2.5 and min(env[1:]) >= 5
+
+    def test_sidebar_shows_cooling_models(self, env):
+        rv._cool_down("gemini-2.5-flash", 120)
+        assert "gemini-2.5-flash" in rv.quota_snapshot()["cooling"]
 
 
 class TestFilesCalls:

@@ -153,19 +153,38 @@ FREE_TIER_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemi
 # keeping it would only spend that other model's quota twice.
 MODEL_SHUTDOWN = {"gemini-2.5-flash": date(2026, 12, 1)}
 
-# Which models each kind of Gemini call tries, in order. Spreading the steps
-# of one run over different models stretches the per-model daily quotas.
-#   analysis: watches the video / looks at the image (needs the best vision)
+# Which models each kind of Gemini call tries, in order. call_gemini starts
+# with the first model that is not used up today and not cooling down after
+# a "busy" / timeout, so a struggling model costs seconds, not minutes.
+#   analysis: watches the video / looks at the image
 #   text:     writes the recreation prompt from the analysis JSON
-#   metadata: writes the YouTube / Instagram metadata
+#   metadata: writes the YouTube / Instagram metadata (Google Search)
+#   story:    Summarise to Short's fact-checked script (Google Search)
+# gemini-2.5-flash leads (best quality, free Google Search) until its
+# shutdown on 2026-12-01, after which it drops out automatically.
+DEFAULT_MODEL_CHAIN = "gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"
 TASK_MODEL_ENV = {
-    "analysis": ("GEMINI_ANALYSIS_MODELS", "gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
-    "text": ("GEMINI_TEXT_MODELS", "gemini-3.5-flash-lite,gemini-2.5-flash-lite"),
-    "metadata": ("GEMINI_METADATA_MODELS", "gemini-2.5-flash-lite,gemini-3.5-flash-lite"),
-    # Summarise to Short: fact-checked script + image prompts. Starts on a
-    # model whose free tier includes Google Search.
-    "story": ("GEMINI_STORY_MODELS", "gemini-2.5-flash-lite,gemini-3.5-flash-lite"),
+    "analysis": ("GEMINI_ANALYSIS_MODELS", DEFAULT_MODEL_CHAIN),
+    "text": ("GEMINI_TEXT_MODELS", DEFAULT_MODEL_CHAIN),
+    "metadata": ("GEMINI_METADATA_MODELS", DEFAULT_MODEL_CHAIN),
+    "story": ("GEMINI_STORY_MODELS", DEFAULT_MODEL_CHAIN),
 }
+
+# Per-request time limits (seconds). A request that hangs fails at this
+# point and the next model is tried, instead of waiting ~90 s or more.
+TIMEOUT_TEXT_SECONDS = 90  # a full recreation plan with thinking can take ~60 s
+TIMEOUT_SEARCH_SECONDS = 90  # Google Search grounding adds a few searches
+TIMEOUT_IMAGE_SECONDS = 90
+TIMEOUT_VIDEO_SECONDS = 180
+TIMEOUT_LONG_VIDEO_SECONDS = 300  # Summarise to Short: sources up to 5 minutes
+# Metadata needs little reasoning: a small thinking budget on gemini-2.5-flash
+# makes it noticeably faster.
+METADATA_THINKING_BUDGET = 512
+
+
+def gemini_http_options(timeout_seconds: int) -> dict:
+    """http_options for one generate_content call (google-genai wants ms)."""
+    return {"api_version": "v1beta", "timeout": int(timeout_seconds * 1000)}
 
 
 @dataclass(frozen=True)
@@ -475,6 +494,8 @@ if _STATE is None:
 if not hasattr(_STATE, "quota_lock"):  # stash created by an older version of this file
     _STATE.quota_lock = threading.Lock()
     _STATE.quota = None
+if not hasattr(_STATE, "cooldowns"):
+    _STATE.cooldowns = {}  # model -> time.monotonic() until which it is set aside
 
 
 def get_client():
@@ -578,13 +599,40 @@ def _mark_search_used_up() -> None:
         _save_quota_state(state)
 
 
+# ── Short-term cooldowns ────────────────────────────────────────────────────
+# A model that is "busy" (503), timed out or hit a per-minute limit is set
+# aside for a while, for every session, so the next request starts on a
+# model that is answering. In memory only: a restart forgets it.
+COOLDOWN_BUSY_SECONDS = 300
+QUICK_RETRY_SECONDS = 2.0
+
+
+def _cooling_models() -> dict[str, float]:
+    """Models still cooling down -> seconds left."""
+    now = time.monotonic()
+    with _STATE.quota_lock:
+        return {model: until - now for model, until in _STATE.cooldowns.items() if until > now}
+
+
+def _cool_down(model: str, seconds: float) -> None:
+    with _STATE.quota_lock:
+        _STATE.cooldowns[model] = max(_STATE.cooldowns.get(model, 0.0), time.monotonic() + seconds)
+
+
+def _clear_cooldown(model: str) -> None:
+    with _STATE.quota_lock:
+        _STATE.cooldowns.pop(model, None)
+
+
 def quota_snapshot() -> dict:
-    """For the UI: today's calls and unusable models, and time to the reset."""
+    """For the UI: today's calls, unusable and cooling models, time to the reset."""
+    cooling = _cooling_models()
     with _STATE.quota_lock:
         state = _quota_state()
         return {
             "calls": dict(state["calls"]),
             "unavailable": dict(state["unavailable"]),
+            "cooling": cooling,
             "search_used_up": bool(state.get("search_used_up")),
             "reset_in_seconds": _seconds_until_quota_reset(),
         }
@@ -750,39 +798,44 @@ def call_gemini(
     throttle: bool = True,
 ) -> T:
     """Runs fn(model_name) until it succeeds, walking the free-tier model
-    chain of `task` ("analysis", "text" or "metadata", see TASK_MODEL_ENV).
+    chain of `task` ("analysis", "text", "metadata", "story"; TASK_MODEL_ENV).
 
-    - Models already known to be unusable today are skipped without sending
-      a request. That memory is shared by all sessions and lasts until the
-      daily reset at midnight Pacific.
+    - Models used up today are skipped without sending a request (shared by
+      all sessions until the daily reset at midnight Pacific). Models cooling
+      down after "busy" / timeouts / per-minute limits go to the back.
     - 429 per-day limit, 429 "limit: 0" (model not on the free tier) or model
-      not found: waiting cannot help, so mark the model unusable and move to
-      the next one; QuotaExhaustedError once the chain is empty.
-    - 429 per-minute limits: wait Google's retryDelay (or 5/10/20/40/60 s
-      backoff) and retry the same model, until RATE_LIMIT_MAX_WAIT_SECONDS.
-    - 5xx/overloaded/timeout: backoff on the same model, moving to the next
-      model after 3 consecutive failures (free-tier 503 "high demand" spells
-      often last minutes, and each failed call can itself take ~90 s).
+      not found: mark the model unusable for today and move on;
+      QuotaExhaustedError once the chain is empty.
+    - 429 per-minute limit: if another model is available, cool this one
+      down for Google's retryDelay and switch at once; otherwise wait it out.
+    - 5xx / overloaded / timeout: one quick retry (~2 s) on the same model,
+      then cool it down for COOLDOWN_BUSY_SECONDS and switch. Only when no
+      other model is left does it back off (5/10/20/40/60 s).
     - Anything else (bad key, bad request, safety block): GeminiCallError now.
 
     task=None is for Files API calls: they use no model and no daily quota,
     so fn gets "" and only the per-minute / transient handling applies.
     """
     chain = CONFIG.models_for(task) if task else [""]
-    passed_over: set[str] = set()  # transient failures: skipped for this call only
+    passed_over: set[str] = set()  # set aside for the rest of this call
     current = None
     failures_on_model = 0
     deadline = time.monotonic() + CONFIG.max_wait_seconds
 
     while True:
         unusable = _unavailable_models() if task else {}
-        candidates = [m for m in chain if m not in unusable and m not in passed_over]
-        if not candidates:
+        available = [m for m in chain if m not in unusable]
+        if not available:
             details = "; ".join(f"{m}: {unusable.get(m, 'unavailable')}" for m in chain)
             raise QuotaExhaustedError(
                 f"No free-tier Gemini model is left for this step today ({details}). "
                 f"The free quota resets at midnight Pacific time, in about {_format_reset_wait()}."
             )
+        # Every model already set aside in this call: keep going with backoff.
+        candidates = [m for m in available if m not in passed_over] or available
+        if task:
+            cooling = _cooling_models()
+            candidates = [m for m in candidates if m not in cooling] + [m for m in candidates if m in cooling]
         model = candidates[0]
         if model != current:
             if current is not None:
@@ -794,7 +847,10 @@ def call_gemini(
         if task:
             _record_call(model)
         try:
-            return fn(model)
+            result = fn(model)
+            if task:
+                _clear_cooldown(model)
+            return result
         except (GeminiCallError, QuotaExhaustedError):
             raise
         except Exception as exc:
@@ -810,15 +866,27 @@ def call_gemini(
                 raise GeminiCallError(_readable_error(exc)) from exc
 
             failures_on_model += 1
-            if kind == "transient" and failures_on_model > 2 and len(candidates) > 1:
-                logger.warning(f"[GEMINI] {label} model={model} keeps failing, switching to {candidates[1]}")
+            can_switch = bool(task) and any(m != model and m not in passed_over for m in available)
+            if can_switch and kind == "rate":
+                _cool_down(model, _retry_delay_seconds(exc) or 30.0)
                 passed_over.add(model)
+                logger.warning(f"[GEMINI] {label} model={model} per-minute limit, switching: {exc}")
+                notify(f"{model} is rate-limited -- using the next model")
+                continue
+            if can_switch and kind == "transient" and failures_on_model >= 2:
+                _cool_down(model, COOLDOWN_BUSY_SECONDS)
+                passed_over.add(model)
+                logger.warning(f"[GEMINI] {label} model={model} busy, switching: {exc}")
+                notify(f"{model} is busy -- using the next model")
                 continue
 
             delay = _retry_delay_seconds(exc) if kind == "rate" else None
-            if delay is None:
-                delay = min(60.0, 5.0 * 2 ** (failures_on_model - 1))
-            delay += random.uniform(1.0, 3.0)
+            if delay is None and can_switch:  # first transient failure: one quick retry
+                delay = QUICK_RETRY_SECONDS + random.uniform(0.0, 0.5)
+            elif delay is None:
+                delay = min(60.0, 5.0 * 2 ** (failures_on_model - 1)) + random.uniform(1.0, 3.0)
+            else:
+                delay += random.uniform(1.0, 3.0)
             remaining = deadline - time.monotonic()
             if delay > remaining:
                 raise GeminiCallError(
@@ -1206,6 +1274,42 @@ class MediaInfo:
     height: int
     has_audio: bool
     aspect_ratio: str
+    cuts: list[float] = field(default_factory=list)  # measured scene cuts (s), see detect_scene_cuts
+
+
+SCENE_CUT_THRESHOLD = 0.3  # ffmpeg scene score; 0.3 catches hard cuts, not camera moves
+MIN_CUT_GAP_SECONDS = 0.3  # closer "cuts" are flashes / glitches
+MAX_CUTS = 200
+
+
+def detect_scene_cuts(path: Path, threshold: float = SCENE_CUT_THRESHOLD) -> list[float]:
+    """Times (seconds) where the picture changes sharply -- the real cuts,
+    measured by ffmpeg, so scene boundaries are not left to Gemini's guess."""
+    try:
+        output = subprocess.run(
+            [ffmpeg_exe(), "-hide_banner", "-nostdin", "-i", str(path),
+             "-vf", f"select='gt(scene,{threshold})',showinfo", "-an", "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        ).stderr
+    except subprocess.TimeoutExpired:
+        logger.warning("[CUTS] scene detection timed out -- continuing without measured cuts")
+        return []
+    cuts: list[float] = []
+    for value in re.findall(r"pts_time:(\d+(?:\.\d+)?)", output):
+        moment = round(float(value), 2)
+        if moment > 0 and (not cuts or moment - cuts[-1] >= MIN_CUT_GAP_SECONDS):
+            cuts.append(moment)
+    return cuts[:MAX_CUTS]
+
+
+def analysis_fps(duration_seconds: float) -> float:
+    """Frames per second Gemini looks at: more for short clips, where every
+    fast cut and gesture matters; Gemini's default is 1."""
+    if duration_seconds <= 20:
+        return 4.0
+    if duration_seconds <= 40:
+        return 3.0
+    return 2.0
 
 
 _ASPECT_RATIOS = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5, "4:3": 4 / 3, "3:4": 3 / 4}
@@ -1333,6 +1437,20 @@ class VideoAnalysis(BaseModel):
     why_it_works: str = Field(description="What makes this video engaging/viral/effective -- the elements a recreation must keep.")
 
 
+def _cut_rule(media: MediaInfo) -> str:
+    if not media.cuts:
+        return (
+            "- Split the timeline into chronological scenes at each cut or major change; "
+            "scene times must cover 0 to the end without gaps.\n"
+        )
+    boundaries = ", ".join(f"{t:g}" for t in [0.0, *media.cuts, media.duration_seconds])
+    return (
+        f"- The video's cuts were measured exactly: scene boundaries at {boundaries} seconds. Make one "
+        "scene per interval between consecutive boundaries, with start/end times exactly at these points "
+        "(split a long interval further only at a clear change). Never merge two intervals.\n"
+    )
+
+
 def _analysis_prompt(media: MediaInfo) -> str:
     return (
         "You are a video director's assistant. Watch and listen to this entire video "
@@ -1346,8 +1464,9 @@ def _analysis_prompt(media: MediaInfo) -> str:
         "Rules:\n"
         "- Be concrete and visual: colors, materials, framing, lens feel, motion direction, "
         "timing. Avoid vague words like 'nice' or 'engaging' when you can describe what you see.\n"
-        "- Split the timeline into chronological scenes at each cut or major change; "
-        "scene times must cover 0 to the end without gaps.\n"
+        + _cut_rule(media)
+        + "- Watch every second: record every action, object, gesture and on-screen change, in order. "
+        "Nothing that happens may be left out.\n"
         "- Describe only what is actually seen and heard. Do not invent dialogue or sounds.\n"
         "- Never identify real people by name; describe them by appearance only.\n"
         "- SPEECH: transcribe every spoken line into audio.transcript word for word, with start/end "
@@ -1364,11 +1483,14 @@ def _analysis_prompt(media: MediaInfo) -> str:
 def _upload_and_wait(path: Path, notify: Notify):
     from google.genai import types as genai_types
 
+    import mimetypes
+
     client = get_client()
+    mime_type = mimetypes.guess_type(path.name)[0] or "video/mp4"
     uploaded = call_gemini(
         lambda _model: client.files.upload(
             file=str(path),
-            config=genai_types.UploadFileConfig(mime_type="video/mp4", display_name=path.name),
+            config=genai_types.UploadFileConfig(mime_type=mime_type, display_name=path.name),
         ),
         notify,
         task=None,
@@ -1395,60 +1517,29 @@ def _upload_and_wait(path: Path, notify: Notify):
         )
 
 
-def _resample_for_gemini(path: Path, notify: Notify) -> Path:
-    """Re-encodes the video at 2fps before uploading to Gemini.
-
-    Gemini's free-tier File API samples uploaded video at 1fps (static mode).
-    By pre-sampling to 2fps we double effective frame coverage: sub-second cuts
-    in fast-cut videos (which land between Gemini's 1fps samples) become visible
-    in the resampled stream. The temp file is placed next to the original and
-    cleaned up after the Gemini call completes.
-    """
-    out_path = path.with_name(f"{path.stem}_2fps.mp4")
-    if out_path.exists():
-        return out_path
-    notify("Pre-processing video for Gemini analysis (2fps resample)...")
-    try:
-        subprocess.run(
-            [
-                ffmpeg_exe(), "-y", "-i", str(path),
-                "-vf", "fps=2",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                "-c:a", "aac", "-b:a", "64k",
-                str(out_path),
-            ],
-            capture_output=True,
-            check=True,
-        )
-        size_mb = out_path.stat().st_size / 1_048_576
-        logger.info(f"[RESAMPLE] 2fps pre-sample: {out_path.name} ({size_mb:.1f} MB)")
-        return out_path
-    except subprocess.CalledProcessError as exc:
-        logger.warning(
-            f"[RESAMPLE] ffmpeg 2fps resample failed, uploading original: "
-            f"{(exc.stderr or b'').decode()[:200]}"
-        )
-        return path
-
-
 def analyze_video(path: Path, media: MediaInfo, notify: Notify = _noop_notify) -> VideoAnalysis:
+    """One Gemini call over the original video file (no re-encode, which only
+    lost detail), sampled at analysis_fps() instead of Gemini's default 1 fps,
+    with the measured cuts in the prompt."""
     from google.genai import types as genai_types
 
     client = get_client()
-    # Pre-sample at 2fps to double Gemini's effective frame coverage on fast-cut videos.
-    analysis_path = _resample_for_gemini(path, notify)
     notify("Uploading video to Gemini...")
-    uploaded = _upload_and_wait(analysis_path, notify)
+    uploaded = _upload_and_wait(path, notify)
     try:
         notify("Analysing video with Gemini...")
         prompt = _analysis_prompt(media)
+        video_part = genai_types.Part(
+            file_data=genai_types.FileData(file_uri=uploaded.uri, mime_type=uploaded.mime_type),
+            video_metadata=genai_types.VideoMetadata(fps=analysis_fps(media.duration_seconds)),
+        )
 
         def run(model: str) -> VideoAnalysis:
             response = client.models.generate_content(
                 model=model,
-                contents=[uploaded, prompt],
+                contents=[video_part, prompt],
                 config=genai_types.GenerateContentConfig(
-                    http_options={"api_version": "v1beta"},
+                    http_options=gemini_http_options(TIMEOUT_VIDEO_SECONDS),
                     response_mime_type="application/json",
                     response_schema=VideoAnalysis,
                     temperature=0.3,
@@ -1468,12 +1559,6 @@ def analyze_video(path: Path, media: MediaInfo, notify: Notify = _noop_notify) -
             client.files.delete(name=uploaded.name)
         except Exception as exc:
             logger.warning(f"[ANALYZE] could not delete uploaded file {uploaded.name}: {exc}")
-        # Clean up the temp 2fps file (never the original).
-        if analysis_path != path and analysis_path.exists():
-            try:
-                analysis_path.unlink()
-            except OSError:
-                pass
 
 
 # ============================================================================
@@ -1487,11 +1572,15 @@ class PromptBeat(BaseModel):
     action: str = Field(description="What happens during this beat, in order.")
     camera: str = Field(description="Shot type + camera movement.")
     audio: str = Field(description="Music and sound effects for this beat, or 'none'. Never dialogue -- that goes in dialogue_line_ids.")
-    on_screen_text: str = Field(description="Short text overlay ONLY if the source relies on it (max ~5 words), else empty.")
+    # No on-screen text field on purpose: video prompts are always text-free.
     dialogue_line_ids: list[int] = Field(
         default_factory=list,
         description="Numbers of the transcript lines (L1 = 1, L2 = 2, ...) spoken during this beat, in order. "
                     "Empty if nobody speaks in this beat.",
+    )
+    source_scenes: list[int] = Field(
+        default_factory=list,
+        description="Numbers of the source scenes (S1 = 1, S2 = 2, ...) this beat shows.",
     )
 
 
@@ -1622,64 +1711,72 @@ def _dialogue_rules(analysis: VideoAnalysis, duration: int) -> str:
     )
 
 
-def _plan_prompt(analysis: VideoAnalysis, media: MediaInfo, duration: int, beat_count: int) -> str:
-    """Build the Gemini prompt that turns a VideoAnalysis into a RecreationPlan.
+FAITHFUL, VIRAL, FULL_LENGTH = "faithful", "viral", "full_length"
 
-    Improvements over original:
-    - Hook-first mandatory structure (Beat 1 = scroll-stopper, max 1.5 s).
-    - Scene list passed explicitly so Gemini groups real cuts, not guesses.
-    - Camera-precision rules that override Veo/Omni zoom-bias defaults.
-    - Per-beat audio timestamps for tighter sound sync.
-    - Global AVOID list baked in so model defaults are suppressed.
-    """
-    # Numbered scene list: gives Gemini real cut points to group from.
-    scene_lines = "\n".join(
-        f"  S{i + 1} [{s.start_seconds:.1f}s-{s.end_seconds:.1f}s] "
-        f"{s.shot_type} | {s.camera_movement} | {s.action[:80].strip()}"
-        for i, s in enumerate(analysis.scenes)
+
+def _structure_rules(analysis: VideoAnalysis, media: MediaInfo, duration: int, beat_count: int, mode: str) -> str:
+    if mode == VIRAL:
+        hook_text = (analysis.hook or "the most visually dramatic moment").strip()
+        return (
+            "=== HOOK-FIRST STRUCTURE (mandatory for viral social media) ===\n"
+            f"- Beat 1 label MUST be 'HOOK'. Duration: 1.0-1.5s maximum.\n"
+            f"- Beat 1 must show the single most visually dramatic or satisfying shot: \"{hook_text}\".\n"
+            "- Beat 1 MUST work with AUDIO MUTED -- it is a visual-only scroll-stopper.\n"
+            "- If the payoff/result appears at the END of the source, move it to Beat 1 here.\n"
+            "- Last beat: hold on the final payoff/result (the CTA frame, 1.0-2.0s).\n"
+            "- Middle beats: compress the key process steps in source chronological order.\n\n"
+            "=== BEAT RULES ===\n"
+            f"- Exactly {beat_count} beats. Durations must sum to exactly {duration}s. "
+            f"Beat 1 max 1.5s, all others min 1.0s.\n"
+            "- Use the SCENE LIST below to group scenes into beats. Do not merge scenes "
+            "separated by a hard cut unless both are under 0.5s each.\n"
+            "- source_scenes: the S numbers each beat shows.\n"
+            "- Keep the source's visual medium, art style, characters, setting, "
+            "mood, color palette, and camera style.\n\n"
+        )
+    timing = (
+        "- The source is about as long as the output: keep its timing -- each beat lasts as long as its "
+        "scenes do in the source.\n"
+        if media.duration_seconds <= duration * 1.2 else
+        f"- The source ({media.duration_seconds:.0f}s) is longer than {duration}s: compress every scene in "
+        "proportion -- shorten scenes, never drop one.\n"
     )
-    hook_text = (analysis.hook or "the most visually dramatic moment").strip()
-    why_works = (analysis.why_it_works or "").strip()
-
     return (
-        f"Below is a JSON analysis of a {media.duration_seconds:.0f}-second source video "
-        f"({len(analysis.scenes)} scenes detected, {media.aspect_ratio} aspect ratio).\n"
-        f"Write a recreation plan for ONE {duration}-second {media.aspect_ratio} video "
-        f"optimised for Instagram Reels / YouTube Shorts.\n\n"
-
-        "=== HOOK-FIRST STRUCTURE (mandatory for viral social media) ===\n"
-        f"- Beat 1 label MUST be 'HOOK'. Duration: 1.0-1.5s maximum.\n"
-        f"- Beat 1 must show the single most visually dramatic or satisfying shot: \"{hook_text}\".\n"
-        "- Beat 1 MUST work with AUDIO MUTED -- it is a visual-only scroll-stopper.\n"
-        "- If the payoff/result appears at the END of the source, move it to Beat 1 here.\n"
-        "- Last beat: hold on the final payoff/result (the CTA frame, 1.0-2.0s).\n"
-        "- Middle beats: compress the key process steps in source chronological order.\n\n"
-
+        "=== FAITHFUL STRUCTURE (mandatory) ===\n"
+        "- Recreate the source as it is: the same scenes, in the same order, with the same events.\n"
+        "- Beat 1 is the source's own opening and the last beat is the source's own ending. Never move "
+        "the ending to the front.\n"
+        f"{timing}\n"
         "=== BEAT RULES ===\n"
-        f"- Exactly {beat_count} beats. Durations must sum to exactly {duration}s. "
-        f"Beat 1 max 1.5s, all others min 1.0s.\n"
-        "- Use the SCENE LIST below to group scenes into beats. Do not merge scenes "
-        "separated by a hard cut unless both are under 0.5s each.\n"
-        "- Keep the source's visual medium, art style, characters, setting, "
-        "mood, color palette, and camera style.\n\n"
+        f"- About {beat_count} beats (more if needed to keep every scene). Durations must sum to exactly "
+        f"{duration}s, each at least 1.0s.\n"
+        "- Use the SCENE LIST below: consecutive scenes may share a beat, but keep their order.\n"
+        "- source_scenes: the S numbers each beat shows. EVERY S number must appear in at least one beat.\n"
+        "- Keep the source's visual medium, art style, characters, settings, mood, colour palette and "
+        "camera style.\n\n"
+    )
 
+
+def _shared_rules(media: MediaInfo, dialogue: str) -> str:
+    """Rules every recreation prompt shares (faithful, viral and full length)."""
+    return (
         "=== NO TEXT RULE (mandatory) ===\n"
-        "- on_screen_text MUST be empty string '' for EVERY beat without exception.\n"
-        "- Do NOT reproduce any text overlays, captions, subtitles, or title cards from the source.\n"
-        "- Even if the source has meme text, caption text, or language text, set on_screen_text to ''.\n"
-        "- Only exception: dialogue text that is plot-essential (speech bubbles in animation). Still omit meme/caption text.\n\n"
+        "- The video is completely text-free: no captions, subtitles, title cards, labels, meme text or "
+        "text overlays of any kind, in any language, even if the source has them.\n"
+        "- Never describe on-screen text in visual, action or camera; describe only what is seen.\n\n"
 
         "=== SETTING CONSISTENCY (mandatory) ===\n"
-        "- Every beat MUST be set in the EXACT same room/environment as the source.\n"
-        "- Describe the setting once in detail and reuse it verbatim in every beat's visual field.\n"
-        "- Do NOT change the floor type, wall colour, furniture, or background between beats.\n"
-        "- If a beat shows a close-up of an object, the background must still match the same room.\n\n"
+        "- Keep every scene's setting exactly as in the source. Describe each setting once in detail and "
+        "reuse those exact words whenever it appears again.\n"
+        "- If the source stays in one place, every beat keeps that identical setting (same floor, walls, "
+        "furniture, background), close-ups included.\n"
+        "- If the source moves between places, change the setting only where the source does.\n\n"
 
         "=== PHYSICS & OBJECT STATE PRECISION ===\n"
         "- For any object in motion (falling, flying, rotating), describe its exact state at the\n"
         "  START and END of each beat: position (height, distance), orientation (tilt angle), speed.\n"
-        "- Example for a falling phone: 'Beat start: phone is 1.2m above floor, screen facing down,\n"
-        "  tilted 15 degrees. Beat end: phone is 3cm above floor, flat horizontal, thrusters firing.'\n"
+        "- Example: 'Beat start: the ball is 1.2 m above the floor, spinning clockwise. Beat end: it\n"
+        "  touches the floor 10 cm to the left of where it started.'\n"
         "- Do NOT leave physics implied -- state every axis of orientation explicitly.\n\n"
 
         "=== CAMERA RULES (override model zoom-bias) ===\n"
@@ -1691,10 +1788,10 @@ def _plan_prompt(analysis: VideoAnalysis, media: MediaInfo, duration: int, beat_
 
         "=== AUDIO RULES ===\n"
         "- Per beat: timestamp each distinct sound from beat start. Example: "
-        "'0.0s: knife impact; 0.3s: chicken slide; 0.8s: whoosh transition'.\n"
+        "'0.0s: door slam; 0.3s: footsteps; 0.8s: whoosh transition'.\n"
         "- Preserve the source audio character (ASMR, SFX, voice, music genre).\n\n"
 
-        f"{_dialogue_rules(analysis, duration)}"
+        f"{dialogue}"
 
         "=== CHARACTER & REFERENCE RULES ===\n"
         "- Describe each character once in `characters`; reuse those exact words in every beat.\n"
@@ -1706,12 +1803,12 @@ def _plan_prompt(analysis: VideoAnalysis, media: MediaInfo, duration: int, beat_
         f"neutral pose, plain background, same visual medium, {media.aspect_ratio} for first_frame.\n"
         "- IMPORTANT: When you generate the reference image prompts, describe the object with full "
         "physical precision: exact orientation (face-up/face-down/vertical/horizontal), "
-        "exact colour, material, and any attached elements (e.g. thruster nozzles at corners).\n\n"
+        "exact colour, material, and any attached parts (handles, straps, buttons).\n\n"
 
         "=== AVOID (global + video-specific) ===\n"
         "- `avoid` MUST include these global items:\n"
         "  * 'On-screen text, captions, subtitles, or title cards of any kind -- video must be completely text-free'\n"
-        "  * 'Changing room, background, floor, or setting between beats -- identical setting in every beat'\n"
+        "  * 'Changing a scene's setting where the source does not -- each scene keeps the source's own setting'\n"
         "  * 'Unprompted camera zoom or pan -- camera is fixed unless the Camera line explicitly says so'\n"
         "  * 'Slow-motion unless the scene label explicitly says slow motion'\n"
         "  * 'Fade-in or fade-out at start; begin on the first frame at full energy'\n"
@@ -1719,6 +1816,39 @@ def _plan_prompt(analysis: VideoAnalysis, media: MediaInfo, duration: int, beat_
         "  * 'Letterboxing or pillarboxing; fill the full frame edge-to-edge'\n"
         "- Also add video-specific failure modes (style drift, wrong character count, wrong object orientation).\n"
         "- No real person names, no brand logos, no platform UI or watermarks.\n\n"
+    )
+
+
+def _plan_prompt(analysis: VideoAnalysis, media: MediaInfo, duration: int, beat_count: int,
+                 mode: str = VIRAL) -> str:
+    """Build the Gemini prompt that turns a VideoAnalysis into a RecreationPlan.
+
+    mode: FAITHFUL keeps the source's scenes, order and events (what the app
+    uses by default); VIRAL restructures it hook-first for Reels / Shorts.
+    VIRAL stays this function's default so direct callers keep their old
+    behaviour; generate_prompt passes the mode explicitly.
+    - Scene list passed explicitly so Gemini groups real cuts, not guesses.
+    - Camera-precision rules that override Veo/Omni zoom-bias defaults.
+    - Per-beat audio timestamps for tighter sound sync.
+    - Global AVOID list baked in so model defaults are suppressed.
+    """
+    # Numbered scene list: gives Gemini real cut points to group from.
+    scene_lines = "\n".join(
+        f"  S{i + 1} [{s.start_seconds:.1f}s-{s.end_seconds:.1f}s] "
+        f"{s.shot_type} | {s.camera_movement} | {s.action[:80].strip()}"
+        for i, s in enumerate(analysis.scenes)
+    )
+    why_works = (analysis.why_it_works or "").strip()
+    purpose = "optimised for Instagram Reels / YouTube Shorts" if mode == VIRAL else "that recreates it faithfully"
+
+    return (
+        f"Below is a JSON analysis of a {media.duration_seconds:.0f}-second source video "
+        f"({len(analysis.scenes)} scenes detected, {media.aspect_ratio} aspect ratio).\n"
+        f"Write a recreation plan for ONE {duration}-second {media.aspect_ratio} video {purpose}.\n\n"
+
+        f"{_structure_rules(analysis, media, duration, beat_count, mode)}"
+
+        f"{_shared_rules(media, _dialogue_rules(analysis, duration))}"
 
         f"=== WHY THE ORIGINAL WORKS (preserve these elements) ===\n"
         f"{why_works}\n\n"
@@ -1755,7 +1885,7 @@ _GLOBAL_AVOID = [
     "Background music unless the AUDIO section specifies it",
     "Letterboxing, pillarboxing, or black bars -- fill the full frame edge-to-edge",
     "On-screen text, captions, subtitles, or title cards of any kind in any frame -- the video must be completely text-free",
-    "Changing the room, background, floor type, or setting between scenes -- all beats must share the identical setting",
+    "Changing a scene's room, background or floor where the source does not -- each scene keeps the source's own setting",
 ]
 
 
@@ -1774,12 +1904,13 @@ def render_prompt(
     media: MediaInfo,
     duration: int,
     audio: AudioProfile | None = None,
+    mode: str = VIRAL,
 ) -> str:
     """Render the final text prompt that gets pasted into a video generator.
 
-    Improvements over original:
-    - SOCIAL MEDIA OPTIMISED header block so the model knows context.
-    - Scene 1 annotated as HOOK with sound-off and full-energy instructions.
+    - VIRAL: SOCIAL MEDIA OPTIMISED header, Scene 1 annotated as the HOOK.
+      FAITHFUL: a "faithful recreation" header, the source's own opening.
+      (VIRAL stays the default for direct callers; generate_prompt passes it.)
     - _GLOBAL_AVOID prepended before video-specific avoids to kill zoom bias.
     - With the source `audio`, each beat's transcript lines are written out
       word for word in the spoken language, plus a language + voice header.
@@ -1789,15 +1920,22 @@ def render_prompt(
     )
     transcript = audio.transcript if audio else []
     language = audio.spoken_language.strip() if audio else ""
-    lines = [
-        f"Create one {duration}-second {orientation} {media.aspect_ratio} video. {plan.logline.strip()}",
-        "",
-        "SOCIAL MEDIA OPTIMISED (Instagram Reels / YouTube Shorts)",
-        "- Scene 1 is the scroll-stopper hook: most dramatic visual, works with audio muted.",
-        "- Payoff-first structure: show the result first, then the process, then the CTA hold.",
-        "- No fade-in at the very start; begin on the first frame at full energy.",
-        "",
-    ]
+    lines = [f"Create one {duration}-second {orientation} {media.aspect_ratio} video. {plan.logline.strip()}", ""]
+    if mode == VIRAL:
+        lines += [
+            "SOCIAL MEDIA OPTIMISED (Instagram Reels / YouTube Shorts)",
+            "- Scene 1 is the scroll-stopper hook: most dramatic visual, works with audio muted.",
+            "- Payoff-first structure: show the result first, then the process, then the CTA hold.",
+            "- No fade-in at the very start; begin on the first frame at full energy.",
+            "",
+        ]
+    else:
+        lines += [
+            "FAITHFUL RECREATION",
+            "- The same scenes, in the same order, with the same events as the original.",
+            "- No fade-in at the very start; begin on the first frame at full energy.",
+            "",
+        ]
     if transcript:
         spoken = "English" if _is_english(language) else language
         lines += [
@@ -1831,7 +1969,7 @@ def render_prompt(
     for number, beat in enumerate(plan.beats, start=1):
         end = cursor + beat.duration_seconds
         label = beat.label.strip().upper()
-        if number == 1:
+        if number == 1 and mode == VIRAL:
             # Enforce hook label and sound-off annotation on the first beat.
             if "HOOK" not in label:
                 label = f"HOOK -- {label}"
@@ -1851,8 +1989,6 @@ def render_prompt(
         for line_id in beat.dialogue_line_ids:
             if 1 <= line_id <= len(transcript):
                 lines.append(_dialogue_line(transcript[line_id - 1], language))
-        if beat.on_screen_text.strip():
-            lines.append(f"On-screen text: \"{beat.on_screen_text.strip()}\"")
         lines.append("")
         cursor = end
 
@@ -1979,6 +2115,35 @@ def _dialogue_warnings(beats: list[PromptBeat], transcript: list[Utterance], dur
     return warnings
 
 
+def accuracy_report(beat_groups: list[list[PromptBeat]], analysis: VideoAnalysis) -> dict:
+    """How much of the source reached the prompt(s): spoken words kept and
+    source scenes shown, so dropped content is visible instead of guessed."""
+    transcript = analysis.audio.transcript
+    used = {n for beats in beat_groups for beat in beats for n in beat.dialogue_line_ids if 1 <= n <= len(transcript)}
+    scene_count = len(analysis.scenes)
+    covered = {n for beats in beat_groups for beat in beats for n in beat.source_scenes if 1 <= n <= scene_count}
+    return {
+        "words_kept": sum(len(transcript[n - 1].text.split()) for n in used),
+        "words_total": sum(len(line.text.split()) for line in transcript),
+        "scenes_covered": len(covered),
+        "scenes_total": scene_count,
+        "missing_scenes": sorted(set(range(1, scene_count + 1)) - covered),
+    }
+
+
+def accuracy_line(report: dict) -> str:
+    """'Words kept 97% (120/124) · Scenes covered 12/12'"""
+    if not report:
+        return ""
+    parts = []
+    if report["words_total"]:
+        share = 100 * report["words_kept"] / report["words_total"]
+        parts.append(f"Words kept {share:.0f}% ({report['words_kept']}/{report['words_total']})")
+    if report["scenes_total"]:
+        parts.append(f"Scenes covered {report['scenes_covered']}/{report['scenes_total']}")
+    return " · ".join(parts)
+
+
 @dataclass
 class GeneratedPrompt:
     duration: int
@@ -1990,6 +2155,9 @@ class GeneratedPrompt:
     social_metadata: "SocialMetadata | None" = None
     social_text: str = ""
     warnings: list[str] = field(default_factory=list)
+    mode: str = ""
+    accuracy: dict = field(default_factory=dict)  # see accuracy_report
+    parts: list[str] = field(default_factory=list)  # full length: one prompt per consecutive part
 
     def full_text(self) -> str:
         parts = [
@@ -2124,16 +2292,36 @@ def _pack_youtube_tags(candidates: list[str], target: int = YOUTUBE_TAGS_TARGET)
     return ", ".join(chosen)
 
 
-def _validate_instagram_hashtags(tags: str | list[str]) -> str:
-    """'#' + letters/marks/digits/underscore (so Telugu or Hindi tags keep their
-    vowel signs), deduplicated, generic tags dropped, at most 5."""
+MAX_FILLER_HASHTAG_LENGTH = 25  # "#telugubiryanirecipe"-length; longer ones nobody searches
+
+
+def _hashtag(text: str) -> str:
+    """'#' + letters/marks/digits/underscore, so Telugu or Hindi tags keep their
+    vowel signs; spaces and punctuation are dropped ('phone drop' -> '#phonedrop')."""
+    body = "".join(ch for ch in text.lstrip("#") if ch == "_" or unicodedata.category(ch)[0] in "LMN")
+    return f"#{body}" if body else ""
+
+
+def _validate_instagram_hashtags(tags: str | list[str], fill_from: list[str] | None = None) -> str:
+    """Exactly INSTAGRAM_HASHTAGS_MAX hashtags when possible: the given ones
+    (deduplicated, generic ones such as #viral dropped), topped up from
+    `fill_from` (ranked keyword ideas, turned into hashtags) when generic tags
+    were removed or Gemini wrote fewer than five."""
     tokens = tags.split() if isinstance(tags, str) else [t for tag in tags for t in tag.split()]
     result: list[str] = []
-    for token in tokens:
-        body = "".join(ch for ch in token.lstrip("#") if ch == "_" or unicodedata.category(ch)[0] in "LMN")
-        tag = f"#{body}"
-        if body and tag.casefold() not in GENERIC_HASHTAGS and tag.casefold() not in {t.casefold() for t in result}:
+
+    def add(tag: str) -> None:
+        if tag and tag.casefold() not in GENERIC_HASHTAGS and tag.casefold() not in {t.casefold() for t in result}:
             result.append(tag)
+
+    for token in tokens:
+        add(_hashtag(token))
+    for idea in fill_from or []:
+        if len(result) >= INSTAGRAM_HASHTAGS_MAX:
+            break
+        tag = _hashtag(idea)
+        if len(tag) <= MAX_FILLER_HASHTAG_LENGTH:
+            add(tag)
     return " ".join(result[:INSTAGRAM_HASHTAGS_MAX])
 
 
@@ -2171,7 +2359,9 @@ def _finish_metadata(
         youtube_description=description,
         youtube_tags=_pack_youtube_tags([draft.primary_keyword, *draft.youtube_tags]),
         instagram_caption=caption,
-        instagram_hashtags=_validate_instagram_hashtags(draft.instagram_hashtags),
+        instagram_hashtags=_validate_instagram_hashtags(
+            draft.instagram_hashtags, fill_from=[draft.primary_keyword, *draft.youtube_tags]
+        ),
         primary_keyword=draft.primary_keyword.strip(),
         grounded=bool(queries or sources),
         search_queries=queries,
@@ -2218,6 +2408,7 @@ def generate_with_optional_search(
     notify: Notify = _noop_notify,
     contents_before: list | None = None,
     temperature: float = 0.7,
+    thinking_budget: int | None = None,
 ) -> tuple[BaseModel, list[str], list[dict[str, str]]]:
     """One free-tier Gemini call, grounded in Google Search when it can be.
 
@@ -2227,7 +2418,8 @@ def generate_with_optional_search(
     today's free search quota is used up -- build_prompt(False) runs with the
     schema enforced. Returns (result, searches run, sources used); both lists
     are empty when nothing was searched. `contents_before` (e.g. images) is
-    sent ahead of the prompt.
+    sent ahead of the prompt. `thinking_budget` caps gemini-2.5-flash's
+    thinking (faster replies); other models ignore it.
     """
     from google.genai import types as genai_types
 
@@ -2235,10 +2427,12 @@ def generate_with_optional_search(
 
     def ask(model: str, search: bool):
         options: dict[str, Any] = {
-            "http_options": {"api_version": "v1beta"},
+            "http_options": gemini_http_options(TIMEOUT_SEARCH_SECONDS if search else TIMEOUT_TEXT_SECONDS),
             "temperature": temperature,
             "automatic_function_calling": genai_types.AutomaticFunctionCallingConfig(disable=True),
         }
+        if thinking_budget is not None and model == "gemini-2.5-flash":
+            options["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=thinking_budget)
         if search:
             options["tools"] = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
         else:
@@ -2280,6 +2474,7 @@ def generate_metadata(context: str, kind: str, language: str, notify: Notify = _
         task="metadata",
         label=f"{kind}-metadata",
         notify=notify,
+        thinking_budget=METADATA_THINKING_BUDGET,
     )
     return _finish_metadata(draft, kind, queries, sources)
 
@@ -2343,17 +2538,38 @@ def render_social_metadata(meta: "SocialMetadata") -> str:
         lines += ["", "SOURCES", *[f"- {source['title']}: {source['uri']}" for source in meta.sources]]
     return "\n".join(lines)
 
-def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _noop_notify) -> GeneratedPrompt:
+def add_social_metadata(generated: GeneratedPrompt, result: "AnalysisResult",
+                        notify: Notify = _noop_notify) -> GeneratedPrompt:
+    """The prompt plus its YouTube / Instagram metadata (one Gemini call),
+    also written next to the saved prompt."""
+    import dataclasses
+
+    plan = RecreationPlan.model_validate(generated.plan)
+    social = generate_social_metadata(result, plan, notify)
+    updated = dataclasses.replace(generated, social_metadata=social, social_text=render_social_metadata(social))
+    saved = Path(updated.saved_to)
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_text(updated.full_text(), encoding="utf-8")
+    saved.with_name(f"{saved.stem}_social.json").write_text(social.model_dump_json(indent=2), encoding="utf-8")
+    return updated
+
+
+def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _noop_notify,
+                    include_social: bool = True, mode: str = FAITHFUL) -> GeneratedPrompt:
+    """mode: FAITHFUL (default: same scenes and order), VIRAL (hook first) or
+    FULL_LENGTH (consecutive `duration`-second parts covering the whole video)."""
     from google.genai import types as genai_types
 
     if duration not in CONFIG.output_durations:
         raise ValueError(f"Duration must be one of {CONFIG.output_durations}.")
+    if mode == FULL_LENGTH:
+        return generate_full_length(result, duration, notify, include_social)
     client = get_client()
     analysis = VideoAnalysis.model_validate(result.analysis)
     media = MediaInfo(**result.media)
     beat_count = beats_for_duration(duration, len(analysis.scenes))
     transcript = analysis.audio.transcript
-    request = _plan_prompt(analysis, media, duration, beat_count)
+    request = _plan_prompt(analysis, media, duration, beat_count, mode=mode)
     contents = [request]
 
     def run(model: str) -> RecreationPlan:
@@ -2361,7 +2577,7 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
             model=model,
             contents=contents,
             config=genai_types.GenerateContentConfig(
-                http_options={"api_version": "v1beta"},
+                http_options=gemini_http_options(TIMEOUT_TEXT_SECONDS),
                 response_mime_type="application/json",
                 response_schema=RecreationPlan,
                 temperature=0.7,
@@ -2376,20 +2592,35 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
     notify(f"Writing the {duration}-second prompt...")
     plan = call_gemini(run, notify, task="text", label="prompt")
     plan = plan.model_copy(update={"beats": _clean_dialogue_ids(plan.beats, len(transcript))})
-    missing = _missing_lines(plan.beats, len(transcript))
-    if missing and _speech_seconds(transcript) <= duration:
-        # The speech fits, so a dropped line is Gemini's mistake: one retry.
-        logger.info(f"[PROMPT] dialogue lines {missing} missing -- retrying once")
-        notify("Some dialogue was left out -- asking Gemini to include every line...")
-        contents = [
-            request + "\n\n=== CORRECTION ===\n"
-            f"Your previous plan left out dialogue lines {', '.join(f'L{n}' for n in missing)}. "
-            f"All lines fit in {duration}s, so every line L1-L{len(transcript)} must appear in exactly "
-            "one beat's dialogue_line_ids, in increasing order. Return the complete corrected plan."
-        ]
-        retry = call_gemini(run, notify, task="text", label="prompt-dialogue-retry")
+
+    def gaps(candidate: RecreationPlan) -> tuple[list[int], list[int]]:
+        """Dropped dialogue lines that fit, and (faithful) source scenes not shown."""
+        lines = _missing_lines(candidate.beats, len(transcript)) if _speech_seconds(transcript) <= duration else []
+        scenes = accuracy_report([candidate.beats], analysis)["missing_scenes"] if mode == FAITHFUL else []
+        return lines, scenes
+
+    missing_lines, missing_scenes = gaps(plan)
+    if missing_lines or missing_scenes:
+        # Content that should be there is Gemini's mistake: one retry.
+        logger.info(f"[PROMPT] missing lines {missing_lines}, scenes {missing_scenes} -- retrying once")
+        notify("Some of the source was left out -- asking Gemini to include all of it...")
+        correction = []
+        if missing_lines:
+            correction.append(
+                f"You left out dialogue lines {', '.join(f'L{n}' for n in missing_lines)}. All lines fit in "
+                f"{duration}s, so every line L1-L{len(transcript)} must appear in exactly one beat's "
+                "dialogue_line_ids, in increasing order."
+            )
+        if missing_scenes:
+            correction.append(
+                f"You left out source scenes {', '.join(f'S{n}' for n in missing_scenes)}. Every scene must "
+                "appear in some beat's source_scenes: shorten scenes instead of dropping them."
+            )
+        contents = [request + "\n\n=== CORRECTION ===\n" + " ".join(correction) + " Return the complete corrected plan."]
+        retry = call_gemini(run, notify, task="text", label="prompt-retry")
         retry = retry.model_copy(update={"beats": _clean_dialogue_ids(retry.beats, len(transcript))})
-        if len(_missing_lines(retry.beats, len(transcript))) < len(missing):
+        retry_lines, retry_scenes = gaps(retry)
+        if len(retry_lines) + len(retry_scenes) < len(missing_lines) + len(missing_scenes):
             plan = retry
     if len(plan.beats) != beat_count:
         logger.info(f"[PROMPT] asked for {beat_count} beats, got {len(plan.beats)} -- keeping Gemini's split")
@@ -2398,49 +2629,216 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
         "reference_images": _normalize_references(plan.reference_images, len(plan.beats)),
     })
     warnings = _dialogue_warnings(plan.beats, transcript, duration) if transcript else []
-    prompt = render_prompt(plan, media, duration, analysis.audio)
-
-    prompts_dir = CONFIG.work_dir / "prompts"
-    prompts_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{result.video_sha[:12]}_{duration}s_{time.strftime('%Y%m%d-%H%M%S')}"
+    prompt = render_prompt(plan, media, duration, analysis.audio, mode=mode)
+    report = accuracy_report([plan.beats], analysis)
+    if mode == FAITHFUL and report["missing_scenes"]:
+        warnings.append(
+            f"Source scene(s) {', '.join(f'S{n}' for n in report['missing_scenes'])} are not in the prompt. "
+            "Full length mode covers the whole video."
+        )
     generated = GeneratedPrompt(
         duration=duration,
         prompt=prompt,
         plan=plan.model_dump(),
-        saved_to=str(prompts_dir / f"{stem}.txt"),
+        saved_to="",
         references=[ref.model_dump() for ref in plan.reference_images],
         reference_sheet=render_reference_sheet(plan),
         warnings=warnings,
+        mode=mode,
+        accuracy=report,
     )
-    # social metadata populated below
-    # Generate social metadata (one extra free-tier Gemini call)
-    try:
-        social_meta = generate_social_metadata(result, plan, notify)
-        social_text = render_social_metadata(social_meta)
-        generated = GeneratedPrompt(
-            duration=duration,
-            prompt=prompt,
-            plan=plan.model_dump(),
-            saved_to=str(prompts_dir / f"{stem}.txt"),
-            references=[ref.model_dump() for ref in plan.reference_images],
-            reference_sheet=render_reference_sheet(plan),
-            social_metadata=social_meta,
-            social_text=social_text,
-            warnings=warnings,
-        )
-        (prompts_dir / f"{stem}_social.json").write_text(
-            social_meta.model_dump_json(indent=2), encoding="utf-8"
-        )
-    except Exception as exc:
-        logger.warning(f"[SOCIAL] metadata generation failed: {exc} -- skipping")
-        # Keep generated as-is without social metadata
+    return _save_generated(generated, plan, result, notify, include_social, f"{duration}s_{mode}")
 
+
+def _save_generated(generated: GeneratedPrompt, plan: RecreationPlan, result: "AnalysisResult",
+                    notify: Notify, include_social: bool, label: str) -> GeneratedPrompt:
+    import dataclasses
+
+    prompts_dir = CONFIG.work_dir / "prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{result.video_sha[:12]}_{label}_{time.strftime('%Y%m%d-%H%M%S')}"
+    generated = dataclasses.replace(generated, saved_to=str(prompts_dir / f"{stem}.txt"))
+    if include_social:  # the UI does this separately, after showing the prompt
+        try:
+            generated = add_social_metadata(generated, result, notify)
+        except Exception as exc:
+            logger.warning(f"[SOCIAL] metadata generation failed: {exc} -- skipping")
     (prompts_dir / f"{stem}.txt").write_text(generated.full_text(), encoding="utf-8")
     (prompts_dir / f"{stem}.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
-    logger.info(
-        f"[PROMPT] saved {stem}.txt ({len(prompt)} chars, {len(plan.reference_images)} reference image(s))"
-    )
+    logger.info(f"[PROMPT] saved {stem}.txt ({len(generated.prompt)} chars, {accuracy_line(generated.accuracy)})")
     return generated
+
+
+# ── Full length: consecutive parts covering the whole video ─────────────────
+
+class PartPlan(BaseModel):
+    beats: list[PromptBeat]
+
+
+class FullLengthPlan(BaseModel):
+    """One shared look (characters, style, setting) and one beat list per part."""
+    title: str
+    logline: str = Field(description="One sentence describing the whole recreated video.")
+    visual_style: str
+    characters: list[str] = Field(description="One fixed, detailed visual description per character, reused verbatim.")
+    setting: str
+    color_and_lighting: str
+    mood: str
+    overall_audio: str
+    avoid: list[str]
+    reference_images: list[ReferenceImage] = Field(description="0-3 reference images shared by all parts.")
+    parts: list[PartPlan] = Field(description="One entry per part, in order.")
+
+
+def part_windows(source_seconds: float, cuts: list[float], part_seconds: int) -> list[tuple[float, float]]:
+    """Splits the source into consecutive windows of at most part_seconds,
+    ending each at a measured cut when one is within 1.5 s before the limit,
+    so no part starts mid-shot. A short remainder (< 1 s) joins the last part."""
+    windows: list[tuple[float, float]] = []
+    start = 0.0
+    while source_seconds - start > 0.05:
+        limit = start + part_seconds
+        if limit >= source_seconds - 1.0:
+            end = source_seconds
+        else:
+            nearby = [cut for cut in cuts if limit - 1.5 <= cut <= limit and cut > start + 1.0]
+            end = max(nearby) if nearby else limit
+        windows.append((round(start, 2), round(end, 2)))
+        start = end
+    return windows
+
+
+def _window_contents(analysis: VideoAnalysis, window: tuple[float, float], last: bool) -> tuple[list[int], list[int]]:
+    """(scene numbers, dialogue line numbers) belonging to one window."""
+    start, end = window
+    scenes = [n for n, s in enumerate(analysis.scenes, start=1) if s.start_seconds < end and s.end_seconds > start]
+    lines = [n for n, line in enumerate(analysis.audio.transcript, start=1)
+             if start <= line.start_seconds < end or (last and line.start_seconds >= end)]
+    return scenes, lines
+
+
+def _full_length_prompt(analysis: VideoAnalysis, media: MediaInfo, part_seconds: int,
+                        windows: list[tuple[float, float]]) -> str:
+    rows = []
+    for number, window in enumerate(windows, start=1):
+        scenes, lines = _window_contents(analysis, window, number == len(windows))
+        rows.append(
+            f"  Part {number}: source {window[0]:g}-{window[1]:g}s · scenes "
+            f"{', '.join(f'S{n}' for n in scenes) or 'none'} · dialogue {', '.join(f'L{n}' for n in lines) or 'none'}"
+        )
+    scene_lines = "\n".join(
+        f"  S{i + 1} [{s.start_seconds:.1f}s-{s.end_seconds:.1f}s] {s.shot_type} | {s.camera_movement} | "
+        f"{s.action[:100].strip()}"
+        for i, s in enumerate(analysis.scenes)
+    )
+    transcript = "\n".join(
+        f"  L{n} [{line.start_seconds:.1f}s] {line.speaker}: \"{line.text.strip()}\""
+        for n, line in enumerate(analysis.audio.transcript, start=1)
+    )
+    dialogue = (
+        "=== DIALOGUE ===\n"
+        "- Do NOT write dialogue yourself. Put the L numbers listed for each part into its beats' "
+        "dialogue_line_ids, in order -- every one of them; the original words are inserted later.\n"
+        "- Give every beat at least as many seconds as its lines took in the source.\n"
+        "- The beat `audio` field is for music and sound effects only.\n\n"
+        if analysis.audio.transcript else ""
+    )
+    return (
+        f"Below is a JSON analysis of a {media.duration_seconds:.0f}-second source video "
+        f"({len(analysis.scenes)} scenes, {media.aspect_ratio}). Recreate ALL of it, faithfully, as "
+        f"{len(windows)} consecutive {part_seconds}-second {media.aspect_ratio} clips that play back to back.\n\n"
+        "=== PARTS ===\n" + "\n".join(rows) + "\n\n"
+        "=== PART RULES (mandatory) ===\n"
+        f"- Return exactly {len(windows)} parts, in order. Each part's beat durations sum to exactly "
+        f"{part_seconds}s, each beat at least 1.0s.\n"
+        "- Each part recreates only its own source window: the same scenes, in the same order, with the same "
+        "events. List the S numbers each beat shows in source_scenes; every scene listed for a part must "
+        "appear in that part.\n"
+        "- Continuity: each part's first beat starts exactly where the previous part's last beat ends -- same "
+        "characters, pose, position, framing and lighting. No recap, no intro, no outro.\n"
+        "- Characters, visual style, setting and colour are written once at the top level and shared by every "
+        "part.\n\n"
+        + _shared_rules(media, dialogue)
+        + f"=== SOURCE SCENE LIST ({len(analysis.scenes)} scenes) ===\n{scene_lines}\n\n"
+        + (f"=== TRANSCRIPT ===\n{transcript}\n\n" if transcript else "")
+        + f"=== FULL SOURCE ANALYSIS (JSON) ===\n{analysis.model_dump_json(indent=2)}"
+    )
+
+
+def generate_full_length(result: "AnalysisResult", part_seconds: int, notify: Notify = _noop_notify,
+                         include_social: bool = True) -> GeneratedPrompt:
+    """The whole source as consecutive part_seconds prompts (one Gemini call):
+    each part covers its own window of the source, opens where the previous
+    part ended, and shares one character / style description."""
+    from google.genai import types as genai_types
+
+    client = get_client()
+    analysis = VideoAnalysis.model_validate(result.analysis)
+    media = MediaInfo(**result.media)
+    windows = part_windows(media.duration_seconds, media.cuts, part_seconds)
+    request = _full_length_prompt(analysis, media, part_seconds, windows)
+
+    def run(model: str) -> FullLengthPlan:
+        response = client.models.generate_content(
+            model=model,
+            contents=[request],
+            config=genai_types.GenerateContentConfig(
+                http_options=gemini_http_options(TIMEOUT_VIDEO_SECONDS),  # a long, multi-part reply
+                response_mime_type="application/json",
+                response_schema=FullLengthPlan,
+                temperature=0.5,
+                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
+            ),
+        )
+        plan = _parse_structured(response, FullLengthPlan)
+        if len(plan.parts) != len(windows) or any(not part.beats for part in plan.parts):
+            raise _RetryableResponse(f"Gemini returned {len(plan.parts)} parts instead of {len(windows)}.")
+        return plan
+
+    notify(f"Writing {len(windows)} consecutive {part_seconds}-second prompts...")
+    full = call_gemini(run, notify, task="text", label="full-length")
+    transcript = analysis.audio.transcript
+    shared = full.model_dump(exclude={"parts"})
+    shared["reference_images"] = _normalize_references(full.reference_images, 1 << 10)
+    prompts: list[str] = []
+    beat_groups: list[list[PromptBeat]] = []
+    warnings: list[str] = []
+    previous_end = ""
+    for number, (window, part) in enumerate(zip(windows, full.parts), start=1):
+        _, allowed = _window_contents(analysis, window, number == len(windows))
+        beats = [beat.model_copy(update={"dialogue_line_ids": [n for n in beat.dialogue_line_ids if n in allowed]})
+                 for beat in _clean_dialogue_ids(part.beats, len(transcript))]
+        beats = _normalize_durations(beats, part_seconds)
+        beat_groups.append(beats)
+        dropped = [n for n in allowed if n not in {i for b in beats for i in b.dialogue_line_ids}]
+        if dropped:
+            warnings.append(f"Part {number}: dialogue line(s) {', '.join(f'L{n}' for n in dropped)} left out.")
+        part_plan = RecreationPlan(**shared, beats=beats)
+        header = [f"PART {number} OF {len(windows)} -- recreates the source from {window[0]:g}s to {window[1]:g}s."]
+        if previous_end:
+            header.append(f"CONTINUITY: this clip continues directly from part {number - 1}; its first frame "
+                          f"matches that part's last frame exactly: {previous_end}")
+        prompts.append("\n".join(header) + "\n\n" + render_prompt(part_plan, media, part_seconds, analysis.audio,
+                                                                  mode=FAITHFUL))
+        previous_end = beats[-1].visual.strip()
+
+    first_plan = RecreationPlan(**shared, beats=beat_groups[0])
+    report = accuracy_report(beat_groups, analysis)
+    if report["missing_scenes"]:
+        warnings.append(f"Source scene(s) {', '.join(f'S{n}' for n in report['missing_scenes'])} are in no part.")
+    generated = GeneratedPrompt(
+        duration=part_seconds,
+        prompt="\n\n".join(f"=== PART {n} OF {len(prompts)} ===\n\n{p}" for n, p in enumerate(prompts, start=1)),
+        plan=first_plan.model_dump(),
+        saved_to="",
+        references=[ref.model_dump() for ref in first_plan.reference_images],
+        reference_sheet=render_reference_sheet(first_plan),
+        warnings=warnings,
+        mode=FULL_LENGTH,
+        accuracy=report,
+        parts=prompts,
+    )
+    return _save_generated(generated, first_plan, result, notify, include_social, f"{part_seconds}s_full")
 
 
 # ============================================================================
@@ -2457,6 +2855,13 @@ class AnalysisResult:
     media: dict
     analysis: dict
     from_cache: bool = field(default=False)
+    analysis_version: int = 0
+
+
+# Bumped when the analysis itself gets better, so older cached analyses are
+# redone once instead of being reused. 2: original file at 2-4 fps with
+# measured cuts (1 was a 2 fps CRF 28 re-encode with guessed cuts).
+ANALYSIS_VERSION = 2
 
 
 def _sha256(path: Path) -> str:
@@ -2493,6 +2898,9 @@ def _load_cached(video_sha: str) -> AnalysisResult | None:
     path = _cache_path(video_sha)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("analysis_version", 0) < ANALYSIS_VERSION:
+            logger.info(f"[CACHE] {video_sha[:12]} was analysed by an older, less accurate version -- re-analysing")
+            return None
         audio = payload.get("analysis", {}).get("audio", {})
         if "transcript" not in audio:
             # Cached before transcripts existed. With speech it must be
@@ -2543,8 +2951,11 @@ def analyze_url(url: str, notify: Notify = _noop_notify) -> AnalysisResult:
     if cached := _load_cached(video_sha):
         notify("Using saved analysis for this video")
         logger.info(f"[CACHE] hit by content sha={video_sha[:12]}")
+        final_path.unlink(missing_ok=True)
         return cached
 
+    notify("Measuring the cuts...")
+    media.cuts = detect_scene_cuts(final_path)
     analysis = analyze_video(final_path, media, notify)
 
     # Immediately delete the downloaded video — only the prompt text is kept.
@@ -2563,6 +2974,7 @@ def analyze_url(url: str, notify: Notify = _noop_notify) -> AnalysisResult:
         extractor=downloaded.extractor,
         media=asdict(media),
         analysis=analysis.model_dump(),
+        analysis_version=ANALYSIS_VERSION,
     )
     _cache_path(video_sha).parent.mkdir(parents=True, exist_ok=True)
     _cache_path(video_sha).write_text(json.dumps(asdict(result), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2583,6 +2995,8 @@ def analyze_local_video(path: Path, title: str = "Uploaded video", notify: Notif
             logger.info(f"[CACHE] hit by content sha={video_sha[:12]}")
             return cached
 
+        notify("Measuring the cuts...")
+        media.cuts = detect_scene_cuts(path)
         analysis = analyze_video(path, media, notify)
     finally:
         try:
@@ -2599,6 +3013,7 @@ def analyze_local_video(path: Path, title: str = "Uploaded video", notify: Notif
         extractor="upload",
         media=asdict(media),
         analysis=analysis.model_dump(),
+        analysis_version=ANALYSIS_VERSION,
     )
     _cache_path(video_sha).parent.mkdir(parents=True, exist_ok=True)
     _cache_path(video_sha).write_text(json.dumps(asdict(result), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2656,12 +3071,14 @@ def render_social(st, social: "SocialMetadata | None") -> None:
         )
         _show_copyable(st, social.youtube_tags)
     with tab_ig:
-        st.markdown("**✍️ Caption**")
-        _show_copyable(st, social.instagram_caption)
-        st.caption(f"{len(social.instagram_caption)}/{INSTAGRAM_CAPTION_MAX} characters")
-        st.markdown("**#️⃣ Hashtags** — paste after your caption")
-        _show_copyable(st, social.instagram_hashtags)
-        st.caption(f"{len(social.instagram_hashtags.split())}/{INSTAGRAM_HASHTAGS_MAX} hashtags")
+        st.markdown("**✍️ Caption + hashtags** — one copy, one paste on your phone")
+        _show_copyable(st, f"{social.instagram_caption.rstrip()}\n\n{social.instagram_hashtags}")
+        st.caption(
+            f"{len(social.instagram_caption)}/{INSTAGRAM_CAPTION_MAX} characters · "
+            f"{len(social.instagram_hashtags.split())}/{INSTAGRAM_HASHTAGS_MAX} hashtags"
+        )
+        with st.expander("Hashtags only (e.g. for the first comment)"):
+            _show_copyable(st, social.instagram_hashtags)
     if social.search_queries or social.sources:
         with st.expander("Searches and sources used"):
             if social.search_queries:
@@ -2670,10 +3087,38 @@ def render_social(st, social: "SocialMetadata | None") -> None:
                 st.markdown(f"- [{source['title']}]({source['uri']})")
 
 
-def _render_generated(st, generated: "GeneratedPrompt") -> None:
+def render_social_or_generate(st, social: "SocialMetadata | None", key: str,
+                              make: Callable[[Notify], "SocialMetadata"]) -> None:
+    """Shows the metadata. When it is missing, generates it here -- the
+    prompt is already on screen above -- and on failure shows why, with a
+    Retry button, instead of silently leaving it out. `make` generates and
+    stores it and returns the SocialMetadata."""
+    errors = st.session_state.setdefault("social_errors", {})
+    if social is None and key not in errors:
+        with st.status("Researching keywords and writing the metadata...", expanded=False) as status:
+            try:
+                social = make(lambda message: status.update(label=message))
+            except USER_FACING_ERRORS as exc:
+                errors[key] = str(exc)
+                status.update(label="Metadata failed", state="error")
+            else:
+                status.update(label="Metadata ready", state="complete")
+    if social is None:
+        st.warning(f"The metadata could not be generated: {errors.get(key, 'unknown error')}")
+        if st.button("Retry metadata", key=f"retry_social_{key}"):
+            errors.pop(key, None)
+            st.rerun()
+        return
+    render_social(st, social)
+
+
+def _render_generated(st, generated: "GeneratedPrompt", result: "AnalysisResult | None" = None,
+                      prompt_key: str | None = None) -> None:
     references = getattr(generated, "references", []) or []
     full_text = generated.full_text() if hasattr(generated, "full_text") else generated.prompt
     duration = generated.duration
+    parts = getattr(generated, "parts", []) or []
+    prompt_key = prompt_key or str(duration)
 
     if not CONFIG.show_prompt:
         st.success(
@@ -2681,14 +3126,24 @@ def _render_generated(st, generated: "GeneratedPrompt") -> None:
             "On-screen display is off (SHOW_PROMPT=false) -- download it below."
         )
     else:
-        st.subheader(f"Video generation prompt ({duration} s)")
+        title = f"{len(parts)} consecutive prompts ({duration} s each)" if parts else f"Video generation prompt ({duration} s)"
+        st.subheader(title)
         st.caption(
             "Free-tier Gemini only writes text -- no video or image is generated here. "
             "Paste this into your video generator (Seedance, Omni, Veo, Kling, ...)."
         )
+        score = accuracy_line(getattr(generated, "accuracy", {}) or {})
+        if score:
+            st.info(f"**Accuracy:** {score}")
         for warning in getattr(generated, "warnings", []) or []:
             st.warning(warning)
-        _show_copyable(st, generated.prompt)
+        if parts:
+            st.caption("Generate the parts in order; each one continues from the last frame of the previous one.")
+            for number, part in enumerate(parts, start=1):
+                with st.expander(f"Part {number} of {len(parts)}", expanded=number == 1):
+                    _show_copyable(st, part)
+        else:
+            _show_copyable(st, generated.prompt)
 
         st.subheader("Reference images to attach")
         if not references:
@@ -2717,13 +3172,22 @@ def _render_generated(st, generated: "GeneratedPrompt") -> None:
     # ── Social Media Metadata ──────────────────────────────────────────────
     st.divider()
     st.subheader("📲 Post to Social Media")
-    render_social(st, getattr(generated, "social_metadata", None))
+    social = getattr(generated, "social_metadata", None)
+    if result is None:
+        render_social(st, social)
+    else:
+        def make(notify: Notify) -> "SocialMetadata":
+            updated = add_social_metadata(generated, result, notify)
+            st.session_state.video_prompts[prompt_key] = updated
+            return updated.social_metadata
+
+        render_social_or_generate(st, social, f"video_{result.video_sha[:12]}_{prompt_key}", make)
 
     st.divider()
     st.download_button(
         "Download prompts + metadata",
         data=full_text,
-        file_name=f"recreate_{duration}s.txt",
+        file_name=f"recreate_{prompt_key}.txt",
         mime="text/plain",
         **_supported_kwargs(st.download_button, icon=":material/download:"),
     )
@@ -2769,7 +3233,12 @@ def _render_quota_sidebar(st) -> None:
     st.markdown("**Gemini free tier · today**")
     for model in CONFIG.all_models():
         reason = snapshot["unavailable"].get(model)
-        status = f":red[{reason}]" if reason else ":green[available]"
+        cooling = snapshot["cooling"].get(model)
+        status = (
+            f":red[{reason}]" if reason
+            else f":orange[busy -- retry in {int(cooling // 60)}m {int(cooling % 60)}s]" if cooling
+            else ":green[available]"
+        )
         st.caption(f"`{model}` · {snapshot['calls'].get(model, 0)} call(s) · {status}")
     search = ":red[used up]" if snapshot["search_used_up"] else ":green[available]"
     st.caption(f"Google Search for metadata · {search}")
@@ -2839,7 +3308,8 @@ def run_app() -> None:
         st.title("Recreate any image post")
         st.caption(
             "Upload a screenshot of any Instagram image post (or paste a direct image URL). "
-            "Gemini analyses it and writes copy-paste prompts for image generators + text overlays + audio + social metadata."
+            "Gemini analyses it and writes copy-paste prompts for image generators (any text in the image "
+            "is built into the prompt) + audio + social metadata."
         )
     else:
         st.title("Recreate any video")
@@ -3071,23 +3541,36 @@ def _render_video_results(st) -> None:
             key="duration",
         )
 
+    part_count = len(part_windows(media.duration_seconds, media.cuts, duration))
+    mode_labels = {
+        FAITHFUL: "Faithful — one prompt, same scenes and order as the source",
+        VIRAL: "Viral — one prompt, hook first",
+        FULL_LENGTH: f"Full length — {part_count} × {duration} s prompts covering the whole video",
+    }
+    modes = [FAITHFUL, VIRAL] + ([FULL_LENGTH] if part_count > 1 else [])
+    mode = st.radio("Recreation mode", modes, format_func=mode_labels.get, key="recreation_mode")
+    prompt_key = f"{mode}_{duration}"
+
     if st.button(
         "Generate prompt", type="primary",
         **_supported_kwargs(st.button, icon=":material/auto_awesome:"),
     ):
         with st.status(f"Writing the {duration}-second prompt...", expanded=True) as status:
             try:
-                generated = generate_prompt(result, duration, lambda msg: status.update(label=msg))
+                generated = generate_prompt(result, duration, lambda msg: status.update(label=msg),
+                                            include_social=False, mode=mode)
             except USER_FACING_ERRORS as exc:
                 status.update(label="Prompt generation failed", state="error")
                 st.error(str(exc))
             else:
-                st.session_state.video_prompts[duration] = generated
+                st.session_state.video_prompts[prompt_key] = generated
+                st.session_state.setdefault("social_errors", {}).pop(
+                    f"video_{result.video_sha[:12]}_{prompt_key}", None)
                 status.update(label="Prompt ready", state="complete", expanded=False)
 
-    generated: GeneratedPrompt | None = st.session_state.get("video_prompts", {}).get(duration)
+    generated: GeneratedPrompt | None = st.session_state.get("video_prompts", {}).get(prompt_key)
     if generated:
-        _render_generated(st, generated)
+        _render_generated(st, generated, result, prompt_key)
 
 
 def _render_image_results(st, is_image_mode: bool) -> None:
@@ -3120,7 +3603,7 @@ def _render_image_results(st, is_image_mode: bool) -> None:
             medium = analysis.visual_medium.replace("_", " ")
             st.markdown(f":blue[**{content}**] · :violet[**{medium}**] · {analysis.aspect_ratio}")
             if analysis.has_text:
-                st.markdown(f":orange[**Text overlays detected:** {len(analysis.text_overlays)}]")
+                st.markdown(f":orange[**Text in the image:** {len(analysis.text_overlays)} — written into the prompts]")
             st.write(analysis.summary)
             st.caption(f"**Hook:** {analysis.hook}")
             audio = analysis.suggested_audio
@@ -3138,12 +3621,13 @@ def _render_image_results(st, is_image_mode: bool) -> None:
     ):
         with st.status("Generating prompts...", expanded=True) as status:
             try:
-                gen = generate_image_recreation(result, lambda msg: status.update(label=msg))
+                gen = generate_image_recreation(result, lambda msg: status.update(label=msg), include_social=False)
             except IMAGE_USER_FACING_ERRORS as exc:
                 status.update(label="Generation failed", state="error")
                 st.error(str(exc))
             else:
                 st.session_state.image_generated = gen
+                st.session_state.setdefault("social_errors", {}).pop(f"image_{result.image_sha[:12]}", None)
                 status.update(label="Prompts ready", state="complete", expanded=False)
 
     gen: GeneratedImagePrompt | None = st.session_state.get("image_generated")
@@ -3154,12 +3638,12 @@ def _render_image_results(st, is_image_mode: bool) -> None:
     plan = _IRP.model_validate(gen.plan)
 
     if CONFIG.show_prompt:
-        tab_nb, tab_flux, tab_sd, tab_text, tab_audio, tab_social = st.tabs([
-            "🍌 Nano Banana", "🌀 FLUX / MJ", "🖥️ Stable Diffusion",
-            "✍️ Text Overlays", "🎵 Audio", "📲 Social",
+        tab_nb, tab_flux, tab_sd, tab_audio, tab_social = st.tabs([
+            "🍌 Nano Banana", "🌀 FLUX / MJ", "🖥️ Stable Diffusion", "🎵 Audio", "📲 Social",
         ])
         with tab_nb:
             st.subheader("Nano Banana / Nano Banana Pro")
+            st.caption("One complete prompt, including any text in the image. Paste it as-is.")
             _show_copyable(st, plan.nano_banana_prompt)
         with tab_flux:
             st.subheader("FLUX / Midjourney / Leonardo")
@@ -3170,21 +3654,6 @@ def _render_image_results(st, is_image_mode: bool) -> None:
             _show_copyable(st, plan.stable_diffusion_prompt)
             st.markdown("**Negative:**")
             _show_copyable(st, plan.negative_prompt)
-        with tab_text:
-            st.subheader("Text Overlay Recreation")
-            if analysis.has_text and plan.text_overlays:
-                st.info(f"{len(plan.text_overlays)} text overlay(s) — add these in Canva/CapCut after generating the base image.")
-                for i, ov in enumerate(plan.text_overlays, 1):
-                    with st.container(border=True):
-                        st.markdown(f"**[{i}] Text:**")
-                        _show_copyable(st, ov.text)
-                        st.markdown(f"**Position:** {ov.position} | **Style:** {ov.style}")
-                        st.caption(f"Canva step: {ov.canva_instruction}")
-                st.divider()
-                st.markdown("**Full Canva / CapCut Workflow:**")
-                _show_copyable(st, plan.canva_workflow)
-            else:
-                st.info("No text overlays — generate the base image as-is.")
         with tab_audio:
             st.subheader("Recommended Audio")
             audio = plan.suggested_audio
@@ -3199,7 +3668,14 @@ def _render_image_results(st, is_image_mode: bool) -> None:
                 _show_copyable(st, audio.alternative_search_query)
         with tab_social:
             st.subheader("📲 Social Media")
-            render_social(st, gen.social_metadata)
+            from recreate_image import add_image_social
+
+            def make(notify: Notify) -> "SocialMetadata":
+                updated = add_image_social(gen, result, notify)
+                st.session_state.image_generated = updated
+                return updated.social_metadata
+
+            render_social_or_generate(st, gen.social_metadata, f"image_{result.image_sha[:12]}", make)
 
     st.divider()
     st.download_button(
@@ -3220,6 +3696,9 @@ def run_cli() -> int:
     parser = argparse.ArgumentParser(description="Turn any video URL into a recreation prompt.")
     parser.add_argument("--url", required=True, help="Public video URL (max 60 s).")
     parser.add_argument("--duration", type=int, choices=CONFIG.output_durations, default=CONFIG.output_durations[0])
+    parser.add_argument("--mode", choices=[FAITHFUL, VIRAL, FULL_LENGTH], default=FAITHFUL,
+                        help="faithful: same scenes and order (default); viral: hook first; "
+                             "full_length: consecutive prompts covering the whole video.")
     args = parser.parse_args()
 
     for problem in CONFIG.problems():
@@ -3233,7 +3712,7 @@ def run_cli() -> int:
     try:
         result = analyze_url(args.url, notify)
         print(f"\rAnalysed: {result.title} ({'cache' if result.from_cache else 'fresh'}){' ' * 40}")
-        generated = generate_prompt(result, args.duration, notify)
+        generated = generate_prompt(result, args.duration, notify, mode=args.mode)
     except USER_FACING_ERRORS as exc:
         print(f"\nError: {exc}", file=sys.stderr)
         return 1

@@ -230,3 +230,46 @@ class TestGenerateMetadata:
         meta = rv.generate_metadata("Content: poster", "image", "English")
         assert calls[0]["model"] == "gemini-3.5-flash-lite" and calls[0]["search"] is False
         assert not meta.youtube_title.endswith("#Shorts")
+
+
+class TestHashtagFill:
+    def test_fills_up_to_five_from_keyword_ideas(self):
+        draft = make_draft(instagram_hashtags=["#viral", "#biryani", "#reels"])
+        tags = _finish_metadata(draft, "video", [], []).instagram_hashtags.split()
+        assert tags == ["#biryani", "#telugubiryanirecipe", "#biryanirecipetelugu", "#hyderabadibiryani",
+                        "#biryaniintelugu"]
+
+    def test_long_ideas_are_not_used_as_hashtags(self):
+        tags = _validate_instagram_hashtags("#food", fill_from=["a very long search phrase nobody types", "biryani"])
+        assert tags == "#food #biryani"
+
+
+class TestMetadataRetry:
+    def test_failure_shows_reason_and_retry_works(self):
+        from streamlit.testing.v1 import AppTest
+
+        def page(repo):
+            import sys
+            sys.path.insert(0, repo)
+            import streamlit as st
+            import recreate_video as rv
+
+            def make(notify):
+                st.session_state["attempts"] = st.session_state.get("attempts", 0) + 1
+                if st.session_state["attempts"] == 1:
+                    raise rv.GeminiCallError("gemini-2.5-flash is busy")
+                st.session_state["social"] = rv.SocialMetadata(
+                    youtube_title="T #Shorts", youtube_description="D", youtube_tags="a, b",
+                    instagram_caption="C", instagram_hashtags="#a #b #c #d #e")
+                return st.session_state["social"]
+
+            rv.render_social_or_generate(st, st.session_state.get("social"), "k", make)
+
+        app = AppTest.from_function(page, args=(str(rv.APP_DIR),), default_timeout=60).run()
+        assert any("gemini-2.5-flash is busy" in w.value for w in app.warning)
+        app = app.run()  # a plain rerun does not retry on its own
+        assert app.session_state.attempts == 1
+        next(b for b in app.button if b.label == "Retry metadata").click()
+        app = app.run()
+        assert app.session_state.attempts == 2 and not app.warning
+        assert [t.label for t in app.tabs] == ["▶️ YouTube", "📸 Instagram"]

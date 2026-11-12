@@ -20,6 +20,13 @@ An AI-powered content analysis and recreation studio built with Streamlit and Go
   - 🖥️ **Stable Diffusion / ComfyUI** (with positive and negative prompts)
 - **Text Overlay Extraction**: Detects on-screen typography, fonts, positions, and outputs a ready-to-use Canva / CapCut layout recreation workflow.
 
+### 🎯 Recreation modes and accuracy
+- **Faithful** (default): one prompt with the source's own scenes, order and events, compressed to 8/10 s. Every source scene must appear; if one is missing Gemini is asked once more.
+- **Viral**: one prompt restructured hook-first for Reels / Shorts.
+- **Full length**: the whole video as consecutive 8/10 s prompts, split at real cuts. Each part opens where the previous one ended and shares one character/style description.
+- Gemini watches the **original file** at 2–4 fps (Gemini's default is 1) and gets the **cuts measured by ffmpeg** as scene boundaries.
+- Every prompt shows an **accuracy score**, e.g. "Words kept 97% · Scenes covered 12/12", and lists anything left out.
+
 ### 📝 Summarise to Short
 Turn a YouTube / Instagram video of up to 5 minutes into a **10, 15 or 20-second** vertical Short that tells its content in brief — images + voice-over, no video model.
 1. **Video**: paste a link or upload, pick the length, click **Analyse**. Gemini watches the whole video (transcript, key points, the clearest visual moments) and writes a fact-checked script (Google Search on the free tier when available) in the source's language.

@@ -34,6 +34,8 @@ import slideshow
 import voiceover
 from recreate_video import (
     CONFIG,
+    TIMEOUT_LONG_VIDEO_SECONDS,
+    TIMEOUT_TEXT_SECONDS,
     USER_FACING_ERRORS,
     MediaInfo,
     Notify,
@@ -43,6 +45,7 @@ from recreate_video import (
     _upload_and_wait,
     call_gemini,
     download_video,
+    gemini_http_options,
     get_client,
     generate_with_optional_search,
     probe_video,
@@ -205,7 +208,11 @@ def _moment_lines(analysis: SourceAnalysis) -> str:
     return "\n".join(lines)
 
 
-def story_prompt(analysis: SourceAnalysis, source_seconds: float, duration: int, search: bool) -> str:
+def story_prompt(analysis: SourceAnalysis, source_seconds: float, duration: int, search: bool,
+                 allow_text: bool = False) -> str:
+    """allow_text: image prompts may carry the source's important on-screen
+    text (quoted); by default scene images are text-free, since they become
+    video frames."""
     fewest, most = scene_range(duration)
     language = analysis.spoken_language if analysis.spoken_language.lower() != "none" else "English"
     code = analysis.language_code or "en"
@@ -252,8 +259,15 @@ def story_prompt(analysis: SourceAnalysis, source_seconds: float, duration: int,
         f"- At most {max_real_frames(most)} real_frame scenes. Use each moment at most once; moment = 0 when none.\n"
         "- image_prompt, in English, for EVERY scene (also real_frame, as a fallback): ONE single full-frame "
         "vertical 9:16 shot -- subject, setting, composition, lighting, colours, lens, mood; photorealistic "
-        "unless the source is animated. NO text, letters, numbers, captions, logos, watermarks, split screens, "
-        "collages or panels. No real names or likenesses: describe people generically, and describe recurring "
+        "unless the source is animated. "
+        + (
+            "Where the source shows important on-screen text for this moment, put it in the prompt inside "
+            "double quotes, word for word in its own language and script, with position, font and colour; "
+            "no other text. No logos, watermarks, split screens, collages or panels. "
+            if allow_text else
+            "NO text, letters, numbers, captions, logos, watermarks, split screens, collages or panels. "
+        )
+        + "No real names or likenesses: describe people generically, and describe recurring "
         "characters identically in every scene.\n"
         "- For ai_from_reference, start the prompt with: \"Using the attached reference image, keep its layout "
         "and subject;\"\n"
@@ -335,7 +349,7 @@ def analyse_source(path: Path, media: MediaInfo, notify: Notify = _noop_notify) 
                 model=model,
                 contents=[video_part, prompt],
                 config=genai_types.GenerateContentConfig(
-                    http_options={"api_version": "v1beta"},
+                    http_options=gemini_http_options(TIMEOUT_LONG_VIDEO_SECONDS),
                     response_mime_type="application/json",
                     response_schema=SourceAnalysis,
                     media_resolution=genai_types.MediaResolution.MEDIA_RESOLUTION_LOW,
@@ -386,12 +400,13 @@ def _frame_thumbnails(frames: dict[int, Path]) -> list:
 
 
 def write_story(analysis: SourceAnalysis, source_seconds: float, duration: int, frames: dict[int, Path],
-                notify: Notify = _noop_notify) -> tuple[StoryPlan, list[str], list[dict[str, str]]]:
+                notify: Notify = _noop_notify, allow_text: bool = False,
+                ) -> tuple[StoryPlan, list[str], list[dict[str, str]]]:
     """The fact-checked script + per-scene visuals (one Gemini call, grounded
     in Google Search when the free quota allows)."""
     notify("Writing the script and image prompts (checking facts with Google Search)...")
     plan, queries, sources = generate_with_optional_search(
-        lambda search: story_prompt(analysis, source_seconds, duration, search),
+        lambda search: story_prompt(analysis, source_seconds, duration, search, allow_text),
         StoryPlan,
         task="story",
         label="summary-story",
@@ -428,7 +443,7 @@ def rewrite_script(narrations: list[str], instruction: str, notify: Notify = _no
         response = client.models.generate_content(
             model=model, contents=[request],
             config=genai_types.GenerateContentConfig(
-                http_options={"api_version": "v1beta"}, response_mime_type="application/json",
+                http_options=gemini_http_options(TIMEOUT_TEXT_SECONDS), response_mime_type="application/json",
                 response_schema=ScriptRewrite, temperature=0.4,
                 automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
             ),
@@ -533,6 +548,11 @@ def _page_input(st) -> None:
     uploaded = st.file_uploader("Or upload a video", type=["mp4", "mov", "webm", "m4v"], key="ss_upload")
     duration = st.radio("Length of the Short", DURATIONS, index=DURATIONS.index(DEFAULT_DURATION),
                         format_func=lambda s: f"{s} seconds", horizontal=True, key="ss_duration")
+    allow_text = st.checkbox(
+        "Include the source's on-screen text in the image prompts", value=False, key="ss_allow_text",
+        help="Off: scene images are text-free (they become video frames). On: important text from the "
+             "video (e.g. a title or figure) is written into the prompt, word for word.",
+    )
     if not st.button("Analyse", type="primary", disabled=bool(problems) or not (url.strip() or uploaded),
                      key="ss_analyse"):
         return
@@ -548,7 +568,8 @@ def _page_input(st) -> None:
             validate_media(media, CONFIG.summary_max_video_seconds)
             analysis = analyse_source(video, media, notify)
             frames = extract_moment_frames(video, analysis, job / "frames", media.duration_seconds, notify)
-            plan, queries, sources = write_story(analysis, media.duration_seconds, duration, frames, notify)
+            plan, queries, sources = write_story(analysis, media.duration_seconds, duration, frames, notify,
+                                                 allow_text=allow_text)
         except (*USER_FACING_ERRORS, slideshow.RenderError) as exc:
             status.update(label="Analysis failed", state="error")
             st.error(str(exc))

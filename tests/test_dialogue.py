@@ -55,7 +55,7 @@ def make_plan(dialogue=((), (1,), (2,)), durations=(1.5, 3.5, 3.0)):
     beats = [
         PromptBeat(label=label, duration_seconds=dur, visual="Kitchen.", action="Cooking.",
                    camera="Locked-off medium, zero camera movement.", audio="sizzling",
-                   on_screen_text="", dialogue_line_ids=list(ids))
+                   dialogue_line_ids=list(ids), source_scenes=[1])
         for label, dur, ids in zip(("HOOK", "ASK", "REVEAL"), durations, dialogue)
     ]
     return RecreationPlan(
@@ -149,12 +149,13 @@ class TestDialogueChecks:
 
 
 class TestOldCache:
-    def write(self, tmp_path, monkeypatch, audio):
+    def write(self, tmp_path, monkeypatch, audio, version=rv.ANALYSIS_VERSION):
         monkeypatch.setattr(rv, "CONFIG", dataclasses.replace(rv.CONFIG, work_dir=tmp_path))
         analysis = make_analysis(make_audio()).model_dump()
         analysis["audio"] = audio
         payload = {"video_sha": "abc", "video_path": "x.mp4", "source_url": "u", "title": "t",
-                   "extractor": "e", "media": dataclasses.asdict(MEDIA), "analysis": analysis}
+                   "extractor": "e", "media": dataclasses.asdict(MEDIA), "analysis": analysis,
+                   "analysis_version": version}
         rv._cache_path("abc").parent.mkdir(parents=True)
         rv._cache_path("abc").write_text(json.dumps(payload), encoding="utf-8")
 
@@ -169,6 +170,10 @@ class TestOldCache:
         del audio["transcript"]
         self.write(tmp_path, monkeypatch, audio)
         assert rv._load_cached("abc").from_cache is True
+
+    def test_cache_from_an_older_analysis_version_is_redone(self, tmp_path, monkeypatch):
+        self.write(tmp_path, monkeypatch, make_audio().model_dump(), version=rv.ANALYSIS_VERSION - 1)
+        assert rv._load_cached("abc") is None
 
 
 class TestGeneratePromptRetry:

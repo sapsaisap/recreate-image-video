@@ -4,10 +4,11 @@ packed to YouTube's own count, description in bytes, 5 niche hashtags), the
 search-grounded generation path and its no-search fallback. Zero API calls.
 """
 import dataclasses
+import json
 from types import SimpleNamespace
 
 import pytest
-from google.genai.errors import ClientError
+from google.genai.errors import ClientError, ServerError
 
 import recreate_video as rv
 from recreate_video import (
@@ -126,7 +127,7 @@ class TestRenderSocialMetadata:
         assert f"/{YOUTUBE_TAGS_LIMIT} as YouTube counts them" in render_social_metadata(mock_meta)
 
     def test_says_when_not_grounded(self, mock_meta):
-        assert "Not grounded in Google Search" in render_social_metadata(mock_meta)
+        assert "Not grounded -- written without Google Search" in render_social_metadata(mock_meta)
 
     def test_lists_searches_and_sources_when_grounded(self, mock_meta):
         meta = mock_meta.model_copy(update={
@@ -134,7 +135,7 @@ class TestRenderSocialMetadata:
             "sources": [{"title": "youtube.com", "uri": "https://example.com/x"}],
         })
         text = render_social_metadata(meta)
-        assert "Keywords researched with Google Search (1 searches)" in text
+        assert "Researched with Google Search (1 searches, 1 sources)" in text
         assert "phone drop shorts" in text and "https://example.com/x" in text
 
 
@@ -165,6 +166,16 @@ def grounded_response(draft):
                            candidates=[SimpleNamespace(finish_reason="STOP", grounding_metadata=grounding)])
 
 
+def ungrounded_response():
+    return SimpleNamespace(parsed=None, text=make_draft().model_dump_json(), prompt_feedback=None,
+                           candidates=[SimpleNamespace(finish_reason="STOP", grounding_metadata=None)])
+
+
+def busy_error():
+    return ServerError(503, {"error": {
+        "code": 503, "status": "UNAVAILABLE", "message": "This model is currently experiencing high demand."}})
+
+
 def search_quota_error():
     return ClientError(429, {"error": {
         "code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded.",
@@ -176,10 +187,14 @@ def search_quota_error():
 class TestGenerateMetadata:
     @pytest.fixture
     def fake(self, tmp_path, monkeypatch):
+        # A 3.x model in the metadata list must never be used: it cannot search.
         monkeypatch.setattr(rv, "CONFIG", dataclasses.replace(rv.CONFIG, work_dir=tmp_path, task_models={
-            **rv.CONFIG.task_models, "metadata": ("gemini-2.5-flash-lite", "gemini-3.5-flash-lite"),
+            **rv.CONFIG.task_models,
+            "metadata": ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite"),
+            "story": ("gemini-2.5-flash", "gemini-3.6-flash"),
         }))
         monkeypatch.setattr(rv._STATE, "quota", None)
+        monkeypatch.setattr(rv._STATE, "cooldowns", {})
         monkeypatch.setattr(rv, "_throttle", lambda: None)
         calls = []
         replies = []
@@ -200,53 +215,86 @@ class TestGenerateMetadata:
         calls, replies = fake
         replies.append(grounded_response(make_draft()))
         meta = rv.generate_metadata("Content: biryani", "video", "Telugu")
-        assert calls[0]["search"] and calls[0]["schema"] is None
+        assert calls[0]["model"] == "gemini-2.5-flash" and calls[0]["search"] and calls[0]["schema"] is None
         assert "use Google Search" in calls[0]["prompt"] and "Tenglish" in calls[0]["prompt"]
         assert meta.grounded and meta.search_queries == ["telugu biryani recipe shorts", "hyderabadi biryani"]
         assert meta.sources == [{"title": "youtube.com", "uri": "https://example.com/a"}]
-        assert meta.youtube_title.endswith("#Shorts")
+        assert meta.youtube_title.endswith("#Shorts") and meta.model == "gemini-2.5-flash"
+        assert "Google Search · gemini-2.5-flash (2 searches, 1 sources)" in rv.render_social_metadata(meta)
 
-    def test_search_quota_falls_back_without_search_on_same_model(self, fake):
+    def test_search_quota_used_up_stops_instead_of_guessing(self, fake):
         calls, replies = fake
-        replies += [search_quota_error(), SimpleNamespace(parsed=make_draft())]
-        meta = rv.generate_metadata("Content: biryani", "video", "English")
-        assert [(c["model"], c["search"]) for c in calls] == [
-            ("gemini-2.5-flash-lite", True), ("gemini-2.5-flash-lite", False)]
-        assert calls[1]["schema"] is SocialMetadataDraft
-        assert not meta.grounded
+        replies.append(search_quota_error())
+        with pytest.raises(rv.QuotaExhaustedError, match="only written from Google Search"):
+            rv.generate_metadata("Content: biryani", "video", "English")
+        assert [(c["model"], c["search"]) for c in calls] == [("gemini-2.5-flash", True)]
         assert rv._search_used_up() and rv._unavailable_models() == {}
 
-    def test_skips_search_once_used_up_today(self, fake):
-        calls, replies = fake
+    def test_no_request_once_search_used_up_today(self, fake):
+        calls, _ = fake
         rv._mark_search_used_up()
-        replies.append(SimpleNamespace(parsed=make_draft()))
-        rv.generate_metadata("Content: biryani", "image", "English")
-        assert calls[0]["search"] is False
+        with pytest.raises(rv.QuotaExhaustedError, match="resets at midnight Pacific"):
+            rv.generate_metadata("Content: biryani", "image", "English")
+        assert calls == []
 
-    def test_no_search_on_model_without_free_search(self, fake):
-        calls, replies = fake
+    def test_never_written_by_a_model_without_search(self, fake):
+        calls, _ = fake
+        rv._mark_unavailable("gemini-2.5-flash", "daily free quota used up")
         rv._mark_unavailable("gemini-2.5-flash-lite", "daily free quota used up")
-        replies.append(SimpleNamespace(parsed=make_draft()))
-        meta = rv.generate_metadata("Content: poster", "image", "English")
-        assert calls[0]["model"] == "gemini-3.5-flash-lite" and calls[0]["search"] is False
-        assert not meta.youtube_title.endswith("#Shorts")
+        with pytest.raises(rv.QuotaExhaustedError):
+            rv.generate_metadata("Content: poster", "image", "English")
+        assert calls == []
+
+    def test_busy_flash_hands_the_search_to_lite(self, fake):
+        calls, replies = fake
+        replies += [busy_error(), grounded_response(make_draft())]
+        meta = rv.generate_metadata("Content: biryani", "video", "English")
+        assert [(c["model"], c["search"]) for c in calls] == [
+            ("gemini-2.5-flash", True), ("gemini-2.5-flash-lite", True)]
+        assert meta.grounded and meta.model == "gemini-2.5-flash-lite"
 
     def test_answer_without_searching_is_asked_again(self, fake):
         calls, replies = fake
-        ungrounded = SimpleNamespace(parsed=None, text=make_draft().model_dump_json(), prompt_feedback=None,
-                                     candidates=[SimpleNamespace(finish_reason="STOP", grounding_metadata=None)])
-        replies.extend([ungrounded, grounded_response(make_draft())])
+        replies.extend([ungrounded_response(), grounded_response(make_draft())])
         meta = rv.generate_metadata("Content: biryani", "video", "English")
         assert len(calls) == 2 and all(c["search"] for c in calls)
         assert "run Google Search now" in calls[1]["prompt"] and meta.grounded
 
-    def test_keeps_the_answer_if_it_still_does_not_search(self, fake):
+    def test_still_not_searching_moves_to_the_next_search_model(self, fake):
         calls, replies = fake
-        ungrounded = lambda: SimpleNamespace(parsed=None, text=make_draft().model_dump_json(), prompt_feedback=None,
-                                             candidates=[SimpleNamespace(finish_reason="STOP", grounding_metadata=None)])
-        replies.extend([ungrounded(), ungrounded()])
+        replies.extend([ungrounded_response(), ungrounded_response(), grounded_response(make_draft())])
         meta = rv.generate_metadata("Content: biryani", "video", "English")
-        assert len(calls) == 2 and not meta.grounded and meta.youtube_title
+        assert [c["model"] for c in calls] == ["gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+        assert meta.grounded and meta.model == "gemini-2.5-flash-lite"
+
+    def test_no_metadata_when_no_model_searches(self, fake):
+        calls, replies = fake
+        replies.extend(ungrounded_response() for _ in range(4))
+        with pytest.raises(rv.GeminiCallError, match="nothing was written"):
+            rv.generate_metadata("Content: biryani", "video", "English")
+        assert len(calls) == 4 and {c["model"] for c in calls} == {"gemini-2.5-flash", "gemini-2.5-flash-lite"}
+
+    def test_lite_json_quirks_are_accepted(self, fake):
+        calls, replies = fake
+        data = make_draft().model_dump()
+        data["search_insights"] = {"youtube_searches": ["biryani recipe", "dum biryani"], "trend": "pot reveals"}
+        reply = grounded_response(make_draft())
+        reply.text = "Here it is:\n" + json.dumps(data) + "\n}\n" + json.dumps(data)
+        replies.append(reply)
+        meta = rv.generate_metadata("Content: biryani", "video", "English")
+        assert len(calls) == 1 and meta.grounded and meta.youtube_title
+        draft = SocialMetadataDraft.model_validate(data)
+        assert draft.search_insights == "youtube_searches: biryani recipe, dum biryani. trend: pot reveals."
+
+    def test_summary_script_still_falls_back_without_search(self, fake):
+        calls, replies = fake
+        rv._mark_unavailable("gemini-2.5-flash", "daily free quota used up")
+        replies.append(SimpleNamespace(parsed=make_draft()))
+        _, queries, sources, model = rv.generate_with_optional_search(
+            lambda search: "write it", SocialMetadataDraft, task="story", label="story")
+        assert [(c["model"], c["search"]) for c in calls] == [("gemini-3.6-flash", False)]
+        assert (queries, sources, model) == ([], [], "gemini-3.6-flash")
+        assert rv.grounding_label(queries, sources, model).startswith("⚠️ Not grounded · gemini-3.6-flash")
 
 
 class TestHashtagFill:

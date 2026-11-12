@@ -125,7 +125,7 @@ WRAPPER = textwrap.dedent('''
             ss.FactCheck(claim="Walking helps", verdict="confirmed", note="WHO")], scenes=[
             ss.StoryScene(narration=f"line {{i}}", visual_type="real_frame", type_reason="clear picture",
                           moment=i, image_prompt="prompt") for i in (1, 2, 3)])
-        return plan, ["walking benefits"], [{{"title": "who.int", "uri": "https://example.com"}}]
+        return plan, ["walking benefits"], [{{"title": "who.int", "uri": "https://example.com"}}], "gemini-2.5-flash"
 
     def fake_fit(scenes, voice, target, notify=None, shorten=None):
         audio = work / "tone.mp3"

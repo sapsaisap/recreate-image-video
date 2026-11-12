@@ -48,6 +48,7 @@ from recreate_video import (
     gemini_http_options,
     get_client,
     generate_with_optional_search,
+    grounding_label,
     probe_video,
     validate_media,
 )
@@ -410,11 +411,11 @@ def _frame_thumbnails(frames: dict[int, Path]) -> list:
 
 def write_story(analysis: SourceAnalysis, source_seconds: float, duration: int, frames: dict[int, Path],
                 notify: Notify = _noop_notify, allow_text: bool = False,
-                ) -> tuple[StoryPlan, list[str], list[dict[str, str]]]:
+                ) -> tuple[StoryPlan, list[str], list[dict[str, str]], str]:
     """The fact-checked script + per-scene visuals (one Gemini call, grounded
     in Google Search when the free quota allows)."""
     notify("Writing the script and image prompts (checking facts with Google Search)...")
-    plan, queries, sources = generate_with_optional_search(
+    plan, queries, sources, model = generate_with_optional_search(
         lambda search: story_prompt(analysis, source_seconds, duration, search, allow_text),
         StoryPlan,
         task="story",
@@ -424,7 +425,7 @@ def write_story(analysis: SourceAnalysis, source_seconds: float, duration: int, 
         timeout_seconds=STORY_TIMEOUT_SECONDS,
     )
     logger.info("[SUMMARY] Gemini's visuals: " + ", ".join(f"{s.visual_type}/M{s.moment}" for s in plan.scenes))
-    return drop_missing_frames(finalise_plan(plan, analysis, duration), frames), queries, sources
+    return drop_missing_frames(finalise_plan(plan, analysis, duration), frames), queries, sources, model
 
 
 def drop_moments_outside(analysis: SourceAnalysis, duration: float) -> SourceAnalysis:
@@ -592,7 +593,7 @@ def _page_input(st) -> None:
             validate_media(media, CONFIG.summary_max_video_seconds)
             analysis = analyse_source(video, media, notify)
             frames = extract_moment_frames(video, analysis, job / "frames", media.duration_seconds, notify)
-            plan, queries, sources = write_story(analysis, media.duration_seconds, duration, frames, notify,
+            plan, queries, sources, model = write_story(analysis, media.duration_seconds, duration, frames, notify,
                                                  allow_text=allow_text)
         except (*USER_FACING_ERRORS, slideshow.RenderError) as exc:
             status.update(label="Analysis failed", state="error")
@@ -606,6 +607,7 @@ def _page_input(st) -> None:
     st.session_state["ss"] = {
         "stage": "prompts", "job": str(job), "duration": duration, "title": title, "source_url": source_url,
         "analysis": analysis.model_dump(), "plan": plan.model_dump(), "queries": queries, "sources": sources,
+        "model": model,
         "frames": {str(k): str(v) for k, v in frames.items()}, "images": {},
     }
     st.rerun()
@@ -618,6 +620,7 @@ def _page_prompts(st) -> None:
     if frames and not uses_source_frames(plan):
         st.warning("No scene uses a frame from the video, so the images may drift from what it shows. "
                    "Analyse again, or switch scenes to 🎨 AI from reference below.")
+    st.caption(grounding_label(state["queries"], state["sources"], state.get("model", "")))
     with st.expander(f"Fact check ({'Google Search' if state['queries'] or state['sources'] else 'not grounded'})"):
         for check in plan.fact_checks:
             icon = {"confirmed": "✅", "disputed": "⚠️", "unverified": "❔"}[check.verdict]

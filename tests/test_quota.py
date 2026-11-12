@@ -231,8 +231,19 @@ class TestModelOrder:
         assert chain[0] == "gemini-3.6-flash" and chain[-1] == "gemini-3.1-flash-lite"
         assert "gemini-3.8-flash" not in chain and "gemini-3.7-flash" not in chain
 
-    def test_every_step_uses_the_same_order(self):
-        assert {default for _, default in rv.TASK_MODEL_ENV.values()} == {rv.DEFAULT_MODEL_CHAIN}
+    def test_search_steps_start_on_the_models_with_free_search(self):
+        assert rv.METADATA_MODEL_CHAIN.split(",") == ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+        story = rv.STORY_MODEL_CHAIN.split(",")
+        assert story[:3] == ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.6-flash"]
+        assert set(rv.METADATA_MODEL_CHAIN.split(",")) == rv.FREE_SEARCH_MODELS
+        assert rv.TASK_MODEL_ENV["metadata"][1] == rv.METADATA_MODEL_CHAIN
+        assert rv.TASK_MODEL_ENV["story"][1] == rv.STORY_MODEL_CHAIN
+        assert rv.TASK_MODEL_ENV["analysis"][1] == rv.TASK_MODEL_ENV["text"][1] == rv.DEFAULT_MODEL_CHAIN
+
+    def test_metadata_list_without_a_search_model_is_reported(self):
+        cfg = dataclasses.replace(rv.CONFIG, task_models={
+            **rv.CONFIG.task_models, "metadata": ("gemini-3.6-flash", "gemini-3.5-flash")})
+        assert any("GEMINI_METADATA_MODELS has no model that can use Google Search" in p for p in cfg.problems())
 
     def test_every_default_model_is_accepted(self):
         for _, default in rv.TASK_MODEL_ENV.values():

@@ -1233,15 +1233,20 @@ def download_video(
     *,
     max_seconds: int | None = None,
     max_height: int = 720,
+    max_mb: int | None = None,
+    too_long_message: str | None = None,
 ) -> DownloadedVideo:
-    """max_seconds defaults to MAX_VIDEO_SECONDS. max_height caps the picture:
-    720p is plenty for Gemini; modes that reuse real frames ask for more."""
+    """max_seconds defaults to MAX_VIDEO_SECONDS, max_mb to MAX_DOWNLOAD_MB.
+    max_height caps the picture: 720p is plenty for Gemini; modes that reuse
+    real frames ask for more. too_long_message replaces the default "too
+    long" text ({seconds} and {limit} are filled in)."""
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError
 
     safe_url = validate_public_video_url(url)
     destination.mkdir(parents=True, exist_ok=True)
-    max_bytes = CONFIG.max_download_mb * 1024 * 1024
+    size_limit_mb = max_mb or CONFIG.max_download_mb
+    max_bytes = size_limit_mb * 1024 * 1024
     limit = max_seconds or CONFIG.max_video_seconds
     rejection: dict[str, str] = {}
 
@@ -1251,10 +1256,11 @@ def download_video(
             reason = "Live streams are not supported."
         duration = info.get("duration")
         if not reason and duration and duration > limit:
-            reason = f"This video is {duration:.0f} seconds long. The maximum is {limit} seconds."
+            reason = (too_long_message.format(seconds=duration, limit=limit) if too_long_message
+                      else f"This video is {duration:.0f} seconds long. The maximum is {limit} seconds.")
         size = info.get("filesize") or info.get("filesize_approx")
         if not reason and size and size > max_bytes:
-            reason = f"This video is larger than the {CONFIG.max_download_mb} MB limit."
+            reason = f"This video is larger than the {size_limit_mb} MB limit."
         if reason:
             rejection["reason"] = reason
         return reason
@@ -1335,7 +1341,7 @@ def download_video(
     if size == 0:
         raise URLVideoError("The download produced an empty file -- the source may need sign-in or be unavailable.")
     if size > max_bytes:
-        raise URLVideoError(f"The downloaded video is larger than the {CONFIG.max_download_mb} MB limit.")
+        raise URLVideoError(f"The downloaded video is larger than the {size_limit_mb} MB limit.")
     logger.info(
         f"[DOWNLOAD] ok {size / 1048576:.1f}MB extractor={info.get('extractor_key') or 'generic'} "
         f"title={str(info.get('title') or '')[:60]}"
@@ -1463,6 +1469,39 @@ class Character(BaseModel):
     role: str = Field(description="What this character does in the video.")
 
 
+CAMERA_POSITION_HELP = (
+    "Camera height and angle, measured: e.g. 'about 5 m up in a corner, looking down at ~60 degrees', "
+    "'eye level, 1.5 m', 'directly overhead'."
+)
+COMPOSITION_HELP = (
+    "What fills which part of the frame, with shares: e.g. 'the bed fills the lower 65%, the windows the "
+    "top 35%; the woman starts bottom-left, about 1/12 of the bed's width'."
+)
+END_STATE_HELP = "Exactly where each character and key object is, and what they are doing, in the scene's last frame."
+HERO_HELP = (
+    "The 1-2 subjects the video is really about (what makes it worth watching), measured. Empty only if "
+    "nothing stands out."
+)
+
+
+class HeroSubject(BaseModel):
+    name: str = Field(description="Short name, e.g. 'giant pink sofa-bed', 'chocolate lava cake'.")
+    why_it_matters: str = Field(description="What makes it the point of the video: its size, shape, colour, motion...")
+    size_and_scale: str = Field(
+        description="Numbers, never just 'giant' or 'huge': estimated real size in m or cm, its size compared "
+                    "with the people or hands in the shot (e.g. 'the woman is about 1/12 of its width'), and "
+                    "the share of the frame it fills (e.g. 'fills the lower 65% of the frame')."
+    )
+    shape_and_parts: str = Field(
+        description="Its exact shape and the parts it actually has, as seen: e.g. 'rounded rectangle with low "
+                    "padded walls on all four sides; two-tier steps at the front-left corner'."
+    )
+    not_present: str = Field(
+        description="Parts a viewer would expect on such an object but that are NOT there, e.g. 'no headboard, "
+                    "no visible legs or frame'. 'none' if nothing expected is missing."
+    )
+
+
 class SourceScene(BaseModel):
     start_seconds: float
     end_seconds: float
@@ -1475,6 +1514,11 @@ class SourceScene(BaseModel):
     transition_out: str = Field(description="How this scene ends/cuts to the next: hard cut, jump cut, match cut, fade, whip, none.")
     on_screen_text: str = Field(description="Any captions/titles/text overlays and their placement, or empty.")
     audio: str = Field(description="What is heard in this scene: who speaks (the words are in audio.transcript), music, sound effects.")
+    # Defaults keep older cached analyses loading; Gemini must fill them
+    # (_StrictSourceScene below).
+    camera_position: str = Field("", description=CAMERA_POSITION_HELP)
+    composition: str = Field("", description=COMPOSITION_HELP)
+    end_state: str = Field("", description=END_STATE_HELP)
 
 
 class Utterance(BaseModel):
@@ -1508,6 +1552,7 @@ class VideoAnalysis(BaseModel):
     visual_medium: str = Field(description="One of: live_action, 2d_animation, 3d_animation, stop_motion, motion_graphics, screen_recording, mixed.")
     summary: str = Field(description="2-3 sentence summary of the whole video.")
     hook: str = Field(description="What grabs attention in the first 1-3 seconds.")
+    hero_subjects: list[HeroSubject] = Field(default_factory=list, description=HERO_HELP)
     story_arc: str = Field(description="Beginning -> middle -> payoff/ending.")
     art_style: str = Field(description="Concrete visual style: rendering/look, texture, realism level, references to a style (not to a copyrighted title).")
     color_palette: str
@@ -1520,6 +1565,20 @@ class VideoAnalysis(BaseModel):
     scenes: list[SourceScene] = Field(description="Chronological scenes/shots covering the full timeline.")
     audio: AudioProfile
     why_it_works: str = Field(description="What makes this video engaging/viral/effective -- the elements a recreation must keep.")
+
+
+class _StrictSourceScene(SourceScene):
+    camera_position: str = Field(description=CAMERA_POSITION_HELP)
+    composition: str = Field(description=COMPOSITION_HELP)
+    end_state: str = Field(description=END_STATE_HELP)
+
+
+class _StrictVideoAnalysis(VideoAnalysis):
+    """The schema Gemini answers to: the new fields are required there, so
+    no model leaves them out (VideoAnalysis keeps defaults for old caches)."""
+
+    hero_subjects: list[HeroSubject] = Field(description=HERO_HELP)
+    scenes: list[_StrictSourceScene] = Field(description="Chronological scenes/shots covering the full timeline.")
 
 
 def _cut_rule(media: MediaInfo) -> str:
@@ -1553,6 +1612,13 @@ def _analysis_prompt(media: MediaInfo) -> str:
         + "- Watch every second: record every action, object, gesture and on-screen change, in order. "
         "Nothing that happens may be left out.\n"
         "- Describe only what is actually seen and heard. Do not invent dialogue or sounds.\n"
+        "- KEY SUBJECT: decide what the video is really about (hero_subjects) and MEASURE it: real size, size "
+        "compared with the people in the shot, share of the frame. 'Giant', 'huge' or 'massive' alone is not "
+        "enough -- give numbers.\n"
+        "- Shapes exactly as seen: never add a part that such an object usually has but this one does not "
+        "(e.g. a headboard on a bed that has none); name those parts in not_present.\n"
+        "- For every scene give camera_position (height and look-down angle), composition (what fills which "
+        "share of the frame) and end_state (where everyone is in its last frame).\n"
         "- Never identify real people by name; describe them by appearance only.\n"
         "- SPEECH: transcribe every spoken line into audio.transcript word for word, with start/end "
         "times. Write it in the language actually spoken and in that language's own script -- "
@@ -1602,10 +1668,10 @@ def _upload_and_wait(path: Path, notify: Notify):
         )
 
 
-def analyze_video(path: Path, media: MediaInfo, notify: Notify = _noop_notify) -> VideoAnalysis:
+def analyze_video(path: Path, media: MediaInfo, notify: Notify = _noop_notify) -> tuple[VideoAnalysis, str]:
     """One Gemini call over the original video file (no re-encode, which only
     lost detail), sampled at analysis_fps() instead of Gemini's default 1 fps,
-    with the measured cuts in the prompt."""
+    with the measured cuts in the prompt. Returns (analysis, model used)."""
     from google.genai import types as genai_types
 
     client = get_client()
@@ -1619,26 +1685,27 @@ def analyze_video(path: Path, media: MediaInfo, notify: Notify = _noop_notify) -
             video_metadata=genai_types.VideoMetadata(fps=analysis_fps(media.duration_seconds)),
         )
 
-        def run(model: str) -> VideoAnalysis:
+        def run(model: str) -> tuple[VideoAnalysis, str]:
             response = client.models.generate_content(
                 model=model,
                 contents=[video_part, prompt],
                 config=genai_types.GenerateContentConfig(
                     http_options=gemini_http_options(TIMEOUT_VIDEO_SECONDS),
                     response_mime_type="application/json",
-                    response_schema=VideoAnalysis,
+                    response_schema=_StrictVideoAnalysis,
                     temperature=0.3,
                     automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
                 ),
             )
-            return _parse_structured(response, VideoAnalysis)
+            strict = _parse_structured(response, _StrictVideoAnalysis)
+            return VideoAnalysis.model_validate(strict.model_dump()), model
 
-        analysis = call_gemini(run, notify, task="analysis", label="analyze")
+        analysis, model = call_gemini(run, notify, task="analysis", label="analyze")
         logger.info(
-            f"[ANALYZE] ok content_type={analysis.content_type} medium={analysis.visual_medium} "
-            f"scenes={len(analysis.scenes)}"
+            f"[ANALYZE] ok model={model} content_type={analysis.content_type} medium={analysis.visual_medium} "
+            f"scenes={len(analysis.scenes)} key_subjects={[h.name for h in analysis.hero_subjects]}"
         )
-        return analysis
+        return analysis, model
     finally:
         try:
             client.files.delete(name=uploaded.name)
@@ -1905,22 +1972,31 @@ def _shared_rules(media: MediaInfo, dialogue: str) -> str:
         "- reference_images: 0-3 images. 'character' for recurring characters (max 2), "
         "'first_frame' when opening composition matters, 'object' for a key prop. "
         "Number REF_1, REF_2... and cite as [REF_n] inside beat text.\n"
-        "- Each image_prompt is a complete standalone text-to-image prompt: subject alone, "
-        f"neutral pose, plain background, same visual medium, {media.aspect_ratio} for first_frame.\n"
+        "- Each image_prompt is a complete standalone text-to-image prompt in the same visual medium. "
+        "character / object: the subject alone, neutral pose, plain background. first_frame: the source's "
+        f"opening frame itself, {media.aspect_ratio}: its camera_position, its composition and the key "
+        "subject's measured size and shape.\n"
         "- IMPORTANT: When you generate the reference image prompts, describe the object with full "
         "physical precision: exact orientation (face-up/face-down/vertical/horizontal), "
         "exact colour, material, and any attached parts (handles, straps, buttons).\n\n"
 
-        "=== AVOID (global + video-specific) ===\n"
-        "- `avoid` MUST include these global items:\n"
-        "  * 'On-screen text, captions, subtitles, or title cards of any kind -- video must be completely text-free'\n"
-        "  * 'Changing a scene's setting where the source does not -- each scene keeps the source's own setting'\n"
-        "  * 'Unprompted camera zoom or pan -- camera is fixed unless the Camera line explicitly says so'\n"
-        "  * 'Slow-motion unless the scene label explicitly says slow motion'\n"
-        "  * 'Fade-in or fade-out at start; begin on the first frame at full energy'\n"
-        "  * 'Background music unless the AUDIO section specifies it'\n"
-        "  * 'Letterboxing or pillarboxing; fill the full frame edge-to-edge'\n"
-        "- Also add video-specific failure modes (style drift, wrong character count, wrong object orientation).\n"
+        "=== KEY SUBJECT, SCALE AND FRAMING (mandatory) ===\n"
+        "- The analysis's hero_subjects are the point of the video. In every beat that shows one, the visual "
+        "gives its size with the analysis's numbers (compared with the people, share of the frame) -- never "
+        "only 'giant', 'huge', 'massive', 'enormous' or 'vast'.\n"
+        "- Describe shapes exactly as the analysis does. Never add a part the analysis does not mention (a "
+        "headboard, legs, a frame, handles...), and never anything in not_present.\n"
+        "- Each beat's camera line includes its scenes' camera_position (height and look-down angle); its "
+        "visual includes their composition (what fills which share of the frame).\n"
+        "- Each beat's action ends where its scenes' end_state says; the last beat ends exactly in the "
+        "source's final end_state (same place, same pose).\n\n"
+
+        "=== AVOID (video-specific only) ===\n"
+        "- The app adds the standard items itself (on-screen text, setting changes, unprompted zoom or pan, "
+        "slow motion, fades, background music, letterboxing, watermarks). Do not repeat them.\n"
+        "- List 3-6 failure modes specific to THIS video, each naming the exact object and the exact wrong "
+        "result, e.g. 'a bed with a headboard', 'the woman looking bigger than 1/10 of the bed width', 'the "
+        "dog jumping off the bed'. Never vague items such as 'style drift' or 'misrepresenting the scale'.\n"
         "- No real person names, no brand logos, no platform UI or watermarks.\n\n"
     )
 
@@ -1995,6 +2071,62 @@ _GLOBAL_AVOID = [
 ]
 
 
+# What each _GLOBAL_AVOID item is about: a video-specific item matching one
+# of these only repeats it (Gemini rewords them: "Letterboxing or
+# pillarboxing" next to "Letterboxing, pillarboxing, or black bars").
+_GLOBAL_AVOID_TOPICS = [
+    r"on-screen text|\bcaptions?\b|subtitles?|title cards?|text overlay",
+    r"\bzoom|camera (pan|movement)|\bpan(ning)? (left|right|across)",
+    r"slow[- ]?motion",
+    r"\bfade",
+    r"letterbox|pillarbox|black bars",
+    r"chang\w* (a |the )?(scene'?s? )?(setting|room|background|floor)",
+    r"background music",
+    r"watermark|platform ui",
+]
+
+
+def _repeats_global_avoid(item: str) -> bool:
+    return any(re.search(topic, item, flags=re.IGNORECASE) for topic in _GLOBAL_AVOID_TOPICS)
+
+
+def _unique_avoid(items: list[str]) -> list[str]:
+    """Drops repeats that differ only in case or punctuation."""
+    seen: set[str] = set()
+    kept = []
+    for item in items:
+        key = re.sub(r"[^a-z0-9]+", " ", item.lower()).strip()
+        if key and key not in seen:
+            seen.add(key)
+            kept.append(item)
+    return kept
+
+
+def hero_line(hero: HeroSubject) -> str:
+    """'Giant pink sofa-bed: size ... Shape: ... Not present (do not add): ...'"""
+    parts = [f"{hero.name.strip()}: {hero.size_and_scale.strip().rstrip('.')}."]
+    if hero.shape_and_parts.strip():
+        parts.append(f"Shape: {hero.shape_and_parts.strip().rstrip('.')}.")
+    missing = hero.not_present.strip().rstrip(".")
+    if missing and missing.lower() not in {"none", "n/a", "nothing"}:
+        parts.append(f"Not present (do not add): {missing}.")
+    return " ".join(parts)
+
+
+def _with_hero_details(refs: list[ReferenceImage], heroes: list[HeroSubject]) -> list[ReferenceImage]:
+    """The first-frame and object image prompts carry the key subject's
+    measured size and shape too: a generated start frame with an ordinary
+    version of it would undo the video prompt."""
+    details = " ".join(hero_line(hero) for hero in heroes if hero.name.strip())
+    if not details:
+        return refs
+    return [
+        ref.model_copy(update={"image_prompt": f"{ref.image_prompt.strip()} Exact size and shape -- {details}"})
+        if ref.purpose in {"first_frame", "object"} else ref
+        for ref in refs
+    ]
+
+
 def _is_english(language: str) -> bool:
     return language.strip().lower() in {"", "english", "en", "none"}
 
@@ -2011,6 +2143,7 @@ def render_prompt(
     duration: int,
     audio: AudioProfile | None = None,
     mode: str = VIRAL,
+    heroes: list[HeroSubject] | None = None,
 ) -> str:
     """Render the final text prompt that gets pasted into a video generator.
 
@@ -2020,6 +2153,9 @@ def render_prompt(
     - _GLOBAL_AVOID prepended before video-specific avoids to kill zoom bias.
     - With the source `audio`, each beat's transcript lines are written out
       word for word in the spoken language, plus a language + voice header.
+    - `heroes` (the analysis's key subjects) are written out with their
+      measured size and shape, so the generator cannot fall back on an
+      ordinary version of them.
     """
     orientation = {"9:16": "vertical", "3:4": "vertical", "4:5": "vertical", "1:1": "square"}.get(
         media.aspect_ratio, "horizontal"
@@ -2066,6 +2202,10 @@ def render_prompt(
         f"- Color and lighting: {plan.color_and_lighting.strip()}",
         f"- Mood: {plan.mood.strip()}",
     ]
+    key_subjects = [hero for hero in heroes or [] if hero.name.strip()]
+    if key_subjects:
+        lines += ["", "KEY SUBJECT (keep its exact size and shape -- it is the point of the video)",
+                  *[f"- {hero_line(hero)}" for hero in key_subjects]]
     characters = [item.strip() for item in plan.characters if item.strip()]
     if characters:
         lines += ["", "CHARACTERS (keep identical in every shot)", *[f"- {item}" for item in characters]]
@@ -2101,14 +2241,17 @@ def render_prompt(
     if plan.overall_audio.strip():
         lines += ["AUDIO", plan.overall_audio.strip(), ""]
 
-    # Global avoids first (suppress model defaults), then video-specific.
-    avoid = list(_GLOBAL_AVOID) + [item.strip() for item in plan.avoid if item.strip()]
+    # Global avoids first (suppress model defaults), then video-specific
+    # ones that do not just repeat them.
+    avoid = list(_GLOBAL_AVOID) + [f"Changing the {hero.name.strip()}'s size, proportions or shape from the KEY "
+                                   "SUBJECT description" for hero in key_subjects]
+    avoid += [item.strip() for item in plan.avoid if item.strip() and not _repeats_global_avoid(item)]
     if transcript:
         avoid.append("Translating, rewording, shortening or skipping any dialogue line")
         if not _is_english(language):
             avoid.append(f"Any spoken language other than {language}; no English voice-over")
     avoid.append("watermarks, platform UI, or logos")
-    lines += ["AVOID", *[f"- {item}" for item in dict.fromkeys(avoid)], ""]
+    lines += ["AVOID", *[f"- {item}" for item in _unique_avoid(avoid)], ""]
     lines.append(
         f"Timing is mandatory: the video must be exactly {duration} seconds. Play the scenes in "
         "this order within their time ranges. Do not add an intro or outro outside the timeline."
@@ -2266,6 +2409,7 @@ class GeneratedPrompt:
     mode: str = ""
     accuracy: dict = field(default_factory=dict)  # see accuracy_report
     parts: list[str] = field(default_factory=list)  # full length: one prompt per consecutive part
+    model: str = ""  # the Gemini model that wrote it
 
     def full_text(self) -> str:
         parts = [
@@ -2725,6 +2869,8 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
     request = _plan_prompt(analysis, media, duration, beat_count, mode=mode)
     contents = [request]
 
+    used: dict[str, str] = {}
+
     def run(model: str) -> RecreationPlan:
         response = client.models.generate_content(
             model=model,
@@ -2740,6 +2886,7 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
         plan = _parse_structured(response, RecreationPlan)
         if not plan.beats:
             raise _RetryableResponse("Gemini returned a plan with no beats.")
+        used["model"] = model
         return plan
 
     notify(f"Writing the {duration}-second prompt...")
@@ -2752,6 +2899,7 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
         scenes = accuracy_report([candidate.beats], analysis)["missing_scenes"] if mode == FAITHFUL else []
         return lines, scenes
 
+    first_model = used["model"]
     missing_lines, missing_scenes = gaps(plan)
     if missing_lines or missing_scenes:
         # Content that should be there is Gemini's mistake: one retry.
@@ -2775,14 +2923,17 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
         retry_lines, retry_scenes = gaps(retry)
         if len(retry_lines) + len(retry_scenes) < len(missing_lines) + len(missing_scenes):
             plan = retry
+        else:
+            used["model"] = first_model
     if len(plan.beats) != beat_count:
         logger.info(f"[PROMPT] asked for {beat_count} beats, got {len(plan.beats)} -- keeping Gemini's split")
     plan = plan.model_copy(update={
         "beats": _normalize_durations(plan.beats, duration),
-        "reference_images": _normalize_references(plan.reference_images, len(plan.beats)),
+        "reference_images": _with_hero_details(
+            _normalize_references(plan.reference_images, len(plan.beats)), analysis.hero_subjects),
     })
     warnings = _dialogue_warnings(plan.beats, transcript, duration) if transcript else []
-    prompt = render_prompt(plan, media, duration, analysis.audio, mode=mode)
+    prompt = render_prompt(plan, media, duration, analysis.audio, mode=mode, heroes=analysis.hero_subjects)
     report = accuracy_report([plan.beats], analysis)
     if mode == FAITHFUL and report["missing_scenes"]:
         warnings.append(
@@ -2799,6 +2950,7 @@ def generate_prompt(result: "AnalysisResult", duration: int, notify: Notify = _n
         warnings=warnings,
         mode=mode,
         accuracy=report,
+        model=used.get("model", ""),
     )
     return _save_generated(generated, plan, result, notify, include_social, f"{duration}s_{mode}")
 
@@ -2931,6 +3083,8 @@ def generate_full_length(result: "AnalysisResult", part_seconds: int, notify: No
     windows = part_windows(media.duration_seconds, media.cuts, part_seconds)
     request = _full_length_prompt(analysis, media, part_seconds, windows)
 
+    used: dict[str, str] = {}
+
     def run(model: str) -> FullLengthPlan:
         response = client.models.generate_content(
             model=model,
@@ -2946,13 +3100,15 @@ def generate_full_length(result: "AnalysisResult", part_seconds: int, notify: No
         plan = _parse_structured(response, FullLengthPlan)
         if len(plan.parts) != len(windows) or any(not part.beats for part in plan.parts):
             raise _RetryableResponse(f"Gemini returned {len(plan.parts)} parts instead of {len(windows)}.")
+        used["model"] = model
         return plan
 
     notify(f"Writing {len(windows)} consecutive {part_seconds}-second prompts...")
     full = call_gemini(run, notify, task="text", label="full-length")
     transcript = analysis.audio.transcript
     shared = full.model_dump(exclude={"parts"})
-    shared["reference_images"] = _normalize_references(full.reference_images, 1 << 10)
+    shared["reference_images"] = _with_hero_details(_normalize_references(full.reference_images, 1 << 10),
+                                                    analysis.hero_subjects)
     prompts: list[str] = []
     beat_groups: list[list[PromptBeat]] = []
     warnings: list[str] = []
@@ -2972,7 +3128,7 @@ def generate_full_length(result: "AnalysisResult", part_seconds: int, notify: No
             header.append(f"CONTINUITY: this clip continues directly from part {number - 1}; its first frame "
                           f"matches that part's last frame exactly: {previous_end}")
         prompts.append("\n".join(header) + "\n\n" + render_prompt(part_plan, media, part_seconds, analysis.audio,
-                                                                  mode=FAITHFUL))
+                                                                  mode=FAITHFUL, heroes=analysis.hero_subjects))
         previous_end = beats[-1].visual.strip()
 
     first_plan = RecreationPlan(**shared, beats=beat_groups[0])
@@ -2990,6 +3146,7 @@ def generate_full_length(result: "AnalysisResult", part_seconds: int, notify: No
         mode=FULL_LENGTH,
         accuracy=report,
         parts=prompts,
+        model=used.get("model", ""),
     )
     return _save_generated(generated, first_plan, result, notify, include_social, f"{part_seconds}s_full")
 
@@ -3009,12 +3166,44 @@ class AnalysisResult:
     analysis: dict
     from_cache: bool = field(default=False)
     analysis_version: int = 0
+    first_frame: str = ""  # the source's own opening frame (JPEG), "" if none
+    analysis_model: str = ""  # the Gemini model that analysed it
 
 
 # Bumped when the analysis itself gets better, so older cached analyses are
 # redone once instead of being reused. 2: original file at 2-4 fps with
-# measured cuts (1 was a 2 fps CRF 28 re-encode with guessed cuts).
-ANALYSIS_VERSION = 2
+# measured cuts (1 was a 2 fps CRF 28 re-encode with guessed cuts). 3: key
+# subjects measured, camera position, composition and end state per scene.
+ANALYSIS_VERSION = 3
+
+# The weakest free models: an analysis or prompt they wrote is flagged in the
+# UI, and an analysis is not cached so the next try can use a stronger one.
+LITE_MODELS = frozenset({"gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-3.1-flash-lite"})
+
+
+def save_first_frame(video: Path, video_sha: str) -> str:
+    """The source's own opening frame, to attach as an image-to-video start
+    frame: the most exact way to get the opening's size, shape and framing."""
+    out = CONFIG.work_dir / "frames" / f"{video_sha[:16]}_first.jpg"
+    if out.is_file():
+        return str(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run([ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(video), "-frames:v", "1",
+                        "-q:v", "2", str(out)], capture_output=True, check=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(f"[FRAME] could not save the first frame of {video.name}: {exc}")
+        return ""
+    return str(out) if out.is_file() else ""
+
+
+def _write_cache(result: "AnalysisResult") -> None:
+    if result.analysis_model in LITE_MODELS:
+        logger.info(f"[CACHE] not caching {result.video_sha[:12]}: analysed by {result.analysis_model}")
+        return
+    _cache_path(result.video_sha).parent.mkdir(parents=True, exist_ok=True)
+    _cache_path(result.video_sha).write_text(json.dumps(asdict(result), indent=2, ensure_ascii=False),
+                                             encoding="utf-8")
 
 
 def _sha256(path: Path) -> str:
@@ -3101,15 +3290,21 @@ def analyze_url(url: str, notify: Notify = _noop_notify) -> AnalysisResult:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     _write_url_index(safe_url, video_sha)
+    first_frame = save_first_frame(final_path, video_sha)
     if cached := _load_cached(video_sha):
         notify("Using saved analysis for this video")
         logger.info(f"[CACHE] hit by content sha={video_sha[:12]}")
         final_path.unlink(missing_ok=True)
+        cached.first_frame = first_frame or cached.first_frame
         return cached
 
     notify("Measuring the cuts...")
     media.cuts = detect_scene_cuts(final_path)
-    analysis = analyze_video(final_path, media, notify)
+    try:
+        analysis, model = analyze_video(final_path, media, notify)
+    except Exception:
+        final_path.unlink(missing_ok=True)
+        raise
 
     # Immediately delete the downloaded video — only the prompt text is kept.
     # The analysis JSON is written to cache (small); the video is no longer needed.
@@ -3128,9 +3323,10 @@ def analyze_url(url: str, notify: Notify = _noop_notify) -> AnalysisResult:
         media=asdict(media),
         analysis=analysis.model_dump(),
         analysis_version=ANALYSIS_VERSION,
+        first_frame=first_frame,
+        analysis_model=model,
     )
-    _cache_path(video_sha).parent.mkdir(parents=True, exist_ok=True)
-    _cache_path(video_sha).write_text(json.dumps(asdict(result), indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_cache(result)
     return result
 
 
@@ -3143,14 +3339,16 @@ def analyze_local_video(path: Path, title: str = "Uploaded video", notify: Notif
         validate_media(media)
 
         video_sha = _sha256(path)
+        first_frame = save_first_frame(path, video_sha)
         if cached := _load_cached(video_sha):
             notify("Using saved analysis for this video")
             logger.info(f"[CACHE] hit by content sha={video_sha[:12]}")
+            cached.first_frame = first_frame or cached.first_frame
             return cached
 
         notify("Measuring the cuts...")
         media.cuts = detect_scene_cuts(path)
-        analysis = analyze_video(path, media, notify)
+        analysis, model = analyze_video(path, media, notify)
     finally:
         try:
             path.unlink(missing_ok=True)
@@ -3167,9 +3365,10 @@ def analyze_local_video(path: Path, title: str = "Uploaded video", notify: Notif
         media=asdict(media),
         analysis=analysis.model_dump(),
         analysis_version=ANALYSIS_VERSION,
+        first_frame=first_frame,
+        analysis_model=model,
     )
-    _cache_path(video_sha).parent.mkdir(parents=True, exist_ok=True)
-    _cache_path(video_sha).write_text(json.dumps(asdict(result), indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_cache(result)
     return result
 
 
@@ -3259,6 +3458,39 @@ def render_social_or_generate(st, social: "SocialMetadata | None", key: str,
     render_social(st, social)
 
 
+def weak_model_note(analysis_model: str, prompt_model: str) -> str:
+    """A warning when the analysis or the prompt came from one of the weakest
+    free models (the stronger ones were busy or out of today's quota)."""
+    weak = list(dict.fromkeys(m for m in (analysis_model, prompt_model) if m in LITE_MODELS))
+    if not weak:
+        return ""
+    return (
+        f"Made with {' and '.join(weak)} -- the stronger free models were busy or out of today's quota, so "
+        "sizes, shapes and framing may be less exact. For a better prompt, paste the link again in a few "
+        f"minutes, or after the quota resets (in {_format_reset_wait()})."
+    )
+
+
+def _show_first_frame(st, result: "AnalysisResult | None", generated: "GeneratedPrompt", key: str) -> None:
+    """The source's real opening frame as a start-frame option (faithful and
+    full length, which open on the source's own first frame)."""
+    path = Path(getattr(result, "first_frame", "") or "")
+    if result is None or generated.mode == VIRAL or not path.name or not path.is_file():
+        return
+    with st.container(border=True):
+        st.markdown("**🖼️ Most exact start frame: the original's first frame**")
+        columns = st.columns([1, 2])
+        columns[0].image(str(path), width=200)
+        columns[1].caption(
+            "Attach this as the START / FIRST FRAME in Veo / Flow (image-to-video) instead of generating "
+            "the first-frame image: the size, shape and framing of everything then match the original "
+            "exactly. It is the creator's own image -- use it only where you have the right to."
+        )
+        columns[1].download_button("Download first frame", path.read_bytes(),
+                                   file_name=f"first_frame_{result.video_sha[:8]}.jpg", mime="image/jpeg",
+                                   key=f"first_frame_{key}")
+
+
 def _render_generated(st, generated: "GeneratedPrompt", result: "AnalysisResult | None" = None,
                       prompt_key: str | None = None) -> None:
     references = getattr(generated, "references", []) or []
@@ -3284,6 +3516,8 @@ def _render_generated(st, generated: "GeneratedPrompt", result: "AnalysisResult 
             st.info(f"**Accuracy:** {score}")
         for warning in getattr(generated, "warnings", []) or []:
             st.warning(warning)
+        if weak := weak_model_note(getattr(result, "analysis_model", ""), getattr(generated, "model", "")):
+            st.warning(weak)
         if parts:
             st.caption("Generate the parts in order; each one continues from the last frame of the previous one.")
             for number, part in enumerate(parts, start=1):
@@ -3293,6 +3527,7 @@ def _render_generated(st, generated: "GeneratedPrompt", result: "AnalysisResult 
             _show_copyable(st, generated.prompt)
 
         st.subheader("Reference images to attach")
+        _show_first_frame(st, result, generated, prompt_key)
         if not references:
             st.info("No reference images needed -- the video prompt is text-only. Paste it as-is.")
         else:
@@ -3397,7 +3632,8 @@ def _render_quota_sidebar(st) -> None:
     )
 
 
-APP_MODULES = ("recreate_video", "recreate_image", "image_to_video", "summary_short", "voiceover", "slideshow")
+APP_MODULES = ("recreate_video", "recreate_image", "image_to_video", "summary_short", "clips", "voiceover",
+               "slideshow")
 
 
 def drop_stale_app_modules() -> list[str]:
@@ -3450,7 +3686,7 @@ def run_app() -> None:
         st.markdown("## 🎬 Recreate")
         mode = st.radio(
             "What are you recreating?",
-            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE],
+            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE, CLIPS_MODE],
             key="app_mode",
         )
         st.divider()
@@ -3471,6 +3707,11 @@ def run_app() -> None:
         from summary_short import render_page as render_summary_page
 
         render_summary_page(st)
+        return
+    if mode == CLIPS_MODE:
+        from clips import render_page as render_clips_page
+
+        render_clips_page(st)
         return
 
     is_image_mode = mode == IMAGE_MODE
@@ -3634,6 +3875,7 @@ IMAGE_MODE = "🖼️ Image Post"
 VIDEO_MODE = "🎬 Video / Reel"
 IMAGE_TO_VIDEO_MODE = "🎞️ Image to Video"
 SUMMARY_MODE = "📝 Summarise to Short"
+CLIPS_MODE = "✂️ Clips from long video"
 
 
 def _analyze_image_link(st, url: str) -> None:

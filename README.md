@@ -98,6 +98,9 @@ Open `.env` and add your Google Gemini API key:
 GEMINI_API_KEY=your_actual_gemini_api_key_here
 ```
 
+#### Clips from a long video
+Paste a YouTube / Instagram link or upload a video of up to 30 minutes (`CLIPS_MAX_VIDEO_SECONDS`; longer videos are rejected). Gemini watches it once (YouTube links directly, no upload) and recommends how many clips are worth posting and where they are; start and end snap to speech pauses or shot changes. ffmpeg cuts the real footage to 1080x1920 (landscape on a blurred background), −14 LUFS, with an optional Edge TTS spoken hook. Every clip gets its own YouTube and Instagram metadata. No video generation model is used. Post clips only of videos you own or have rights to.
+
 #### Free tier only
 The app is built for a **free** Gemini key and accepts only free-tier models
 (`gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`,

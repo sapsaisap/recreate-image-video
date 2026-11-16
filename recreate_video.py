@@ -1233,15 +1233,20 @@ def download_video(
     *,
     max_seconds: int | None = None,
     max_height: int = 720,
+    max_mb: int | None = None,
+    too_long_message: str | None = None,
 ) -> DownloadedVideo:
-    """max_seconds defaults to MAX_VIDEO_SECONDS. max_height caps the picture:
-    720p is plenty for Gemini; modes that reuse real frames ask for more."""
+    """max_seconds defaults to MAX_VIDEO_SECONDS, max_mb to MAX_DOWNLOAD_MB.
+    max_height caps the picture: 720p is plenty for Gemini; modes that reuse
+    real frames ask for more. too_long_message replaces the default "too
+    long" text ({seconds} and {limit} are filled in)."""
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError
 
     safe_url = validate_public_video_url(url)
     destination.mkdir(parents=True, exist_ok=True)
-    max_bytes = CONFIG.max_download_mb * 1024 * 1024
+    size_limit_mb = max_mb or CONFIG.max_download_mb
+    max_bytes = size_limit_mb * 1024 * 1024
     limit = max_seconds or CONFIG.max_video_seconds
     rejection: dict[str, str] = {}
 
@@ -1251,10 +1256,11 @@ def download_video(
             reason = "Live streams are not supported."
         duration = info.get("duration")
         if not reason and duration and duration > limit:
-            reason = f"This video is {duration:.0f} seconds long. The maximum is {limit} seconds."
+            reason = (too_long_message.format(seconds=duration, limit=limit) if too_long_message
+                      else f"This video is {duration:.0f} seconds long. The maximum is {limit} seconds.")
         size = info.get("filesize") or info.get("filesize_approx")
         if not reason and size and size > max_bytes:
-            reason = f"This video is larger than the {CONFIG.max_download_mb} MB limit."
+            reason = f"This video is larger than the {size_limit_mb} MB limit."
         if reason:
             rejection["reason"] = reason
         return reason
@@ -1335,7 +1341,7 @@ def download_video(
     if size == 0:
         raise URLVideoError("The download produced an empty file -- the source may need sign-in or be unavailable.")
     if size > max_bytes:
-        raise URLVideoError(f"The downloaded video is larger than the {CONFIG.max_download_mb} MB limit.")
+        raise URLVideoError(f"The downloaded video is larger than the {size_limit_mb} MB limit.")
     logger.info(
         f"[DOWNLOAD] ok {size / 1048576:.1f}MB extractor={info.get('extractor_key') or 'generic'} "
         f"title={str(info.get('title') or '')[:60]}"
@@ -3626,7 +3632,8 @@ def _render_quota_sidebar(st) -> None:
     )
 
 
-APP_MODULES = ("recreate_video", "recreate_image", "image_to_video", "summary_short", "voiceover", "slideshow")
+APP_MODULES = ("recreate_video", "recreate_image", "image_to_video", "summary_short", "clips", "voiceover",
+               "slideshow")
 
 
 def drop_stale_app_modules() -> list[str]:
@@ -3679,7 +3686,7 @@ def run_app() -> None:
         st.markdown("## 🎬 Recreate")
         mode = st.radio(
             "What are you recreating?",
-            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE],
+            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE, CLIPS_MODE],
             key="app_mode",
         )
         st.divider()
@@ -3700,6 +3707,11 @@ def run_app() -> None:
         from summary_short import render_page as render_summary_page
 
         render_summary_page(st)
+        return
+    if mode == CLIPS_MODE:
+        from clips import render_page as render_clips_page
+
+        render_clips_page(st)
         return
 
     is_image_mode = mode == IMAGE_MODE
@@ -3863,6 +3875,7 @@ IMAGE_MODE = "🖼️ Image Post"
 VIDEO_MODE = "🎬 Video / Reel"
 IMAGE_TO_VIDEO_MODE = "🎞️ Image to Video"
 SUMMARY_MODE = "📝 Summarise to Short"
+CLIPS_MODE = "✂️ Clips from long video"
 
 
 def _analyze_image_link(st, url: str) -> None:

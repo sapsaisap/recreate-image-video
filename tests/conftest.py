@@ -18,7 +18,18 @@ SHA_YT      = "c523678b1cb3b5302b74c16c7aface30d147901478454d3f6e0153837d2215e6"
 
 
 def _load(sha):
-    return json.loads((CACHE_DIR / (sha + ".json")).read_text(encoding="utf-8"))
+    path = CACHE_DIR / (sha + ".json")
+    if not path.is_file():
+        pytest.skip(f"needs a cached analysis ({path.name}) that only exists on the machine that made it")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _media(sha, seconds):
+    """The cached video's media, or a plain vertical clip of the same kind:
+    render_prompt only uses the length and shape."""
+    if (CACHE_DIR / (sha + ".json")).is_file():
+        return MediaInfo(**_load(sha)["media"])
+    return MediaInfo(duration_seconds=seconds, width=1080, height=1920, has_audio=True, aspect_ratio="9:16")
 
 
 @pytest.fixture(scope="session")
@@ -43,10 +54,10 @@ def yt_analysis(yt_cache):
     return VideoAnalysis.model_validate(yt_cache["analysis"])
 
 @pytest.fixture(scope="session")
-def chicken_media(chicken_cache):  return MediaInfo(**chicken_cache["media"])
+def chicken_media():  return _media(SHA_CHICKEN, 8.0)
 
 @pytest.fixture(scope="session")
-def cats_media(cats_cache):  return MediaInfo(**cats_cache["media"])
+def cats_media():  return _media(SHA_CATS, 8.0)
 
 @pytest.fixture(scope="session")
 def yt_media(yt_cache):  return MediaInfo(**yt_cache["media"])

@@ -99,7 +99,11 @@ GEMINI_API_KEY=your_actual_gemini_api_key_here
 ```
 
 #### Clips from a long video
-Paste a YouTube / Instagram link or upload a video of up to 30 minutes (`CLIPS_MAX_VIDEO_SECONDS`; longer videos are rejected). Gemini watches it once (YouTube links directly, no upload) and recommends how many clips are worth posting and where they are; start and end snap to speech pauses or shot changes. ffmpeg cuts the real footage to 1080x1920 (landscape on a blurred background), −14 LUFS, with an optional Edge TTS spoken hook. Every clip gets its own YouTube and Instagram metadata. No video generation model is used. Post clips only of videos you own or have rights to.
+Paste a YouTube / Instagram link or upload a video of up to 30 minutes (`CLIPS_MAX_VIDEO_SECONDS`; longer videos are rejected). Gemini watches it once (YouTube links directly, no upload) and recommends how many clips are worth posting and where they are: separate moments, each with its own hook and payoff. An answer that just chops the video into back-to-back pieces is sent back once; if it comes back chopped again, only the best clips that aren't next to each other are kept. Start and end snap to speech pauses or shot changes, and a timeline shows where each clip sits.
+
+**The original sound is never used.** Gemini writes a new voice-over for every clip in its own words (not a translation or transcript of what is said), in the video's spoken language. Edge TTS reads it, fitted to the clip's length, with optional background music you upload (only music you have rights to, e.g. the YouTube Audio Library). ffmpeg cuts the picture to 1080x1920 (landscape on a blurred background), −14 LUFS. Every clip gets its own YouTube and Instagram metadata. No video generation model is used.
+
+A new voice-over removes the original voice and music, but the picture is still the creator's footage, and YouTube / Instagram match video too. Post clips only of videos you own or have rights to; for someone else's video, Summarise to Short (AI images) is the safer choice.
 
 #### Free tier only
 The app is built for a **free** Gemini key and accepts only free-tier models

@@ -1,6 +1,7 @@
-"""Clips from a long video: snapping and choosing clips, the Gemini call
-(faked), rendering with real ffmpeg, and the whole page from link to clips
-with their own metadata."""
+"""Clips from a long video: snapping and choosing clips, no back-to-back
+chopping, the Gemini call (faked), rendering with real ffmpeg (new voice-over
+only, never the original sound), and the whole page from link to clips with
+their own metadata."""
 import subprocess
 import textwrap
 from pathlib import Path
@@ -20,7 +21,7 @@ REPO = Path(__file__).resolve().parent.parent
 def idea(start, end, score=80, stands_alone=True, title=None):
     return ClipIdea(start_seconds=start, end_seconds=end, title=title or f"clip {start:g}", hook="h", payoff="p",
                     why_it_works="w", what_is_said="said", score=score, stands_alone=stands_alone,
-                    hook_voiceover="చూడండి")
+                    narration="ఈ రహస్య మసాలా రుచిని మార్చేస్తుంది")
 
 
 def plan(*ideas, count=None):
@@ -31,6 +32,19 @@ def plan(*ideas, count=None):
 
 def ffmpeg(*args):
     subprocess.run([rv.ffmpeg_exe(), "-y", "-loglevel", "error", *args], capture_output=True, check=True)
+
+
+def make_tone(path, seconds, frequency=900):
+    ffmpeg("-f", "lavfi", "-i", f"sine=frequency={frequency}:duration={seconds}", str(path))
+    return path
+
+
+def max_volume(path):
+    """Loudest sample in dB (-91 = digital silence)."""
+    output = subprocess.run([rv.ffmpeg_exe(), "-hide_banner", "-i", str(path), "-af", "volumedetect", "-f", "null",
+                             "-"], capture_output=True, text=True, encoding="utf-8", errors="replace").stderr
+    import re
+    return float(re.search(r"max_volume:\s*(-?[\d.]+) dB", output).group(1))
 
 
 def make_video(path, seconds, size="1280x720", audio=True):
@@ -95,6 +109,24 @@ class TestFinaliseClips:
         assert len(kept) == 12 and sum(c["recommended"] for c in kept) == clips.MAX_CLIPS
 
 
+class TestChopping:
+    def test_back_to_back_pieces_are_chopping(self):
+        assert clips.looks_chopped([(0, 30), (30, 60), (60, 90), (90, 120)], 120)
+
+    def test_two_halves_of_a_short_video_are_chopping(self):
+        assert clips.looks_chopped([(2, 60), (62, 118)], 120)
+
+    def test_separate_moments_are_not(self):
+        assert not clips.looks_chopped([(20, 50), (300, 340), (600, 640)], 900)
+        assert not clips.looks_chopped([(10, 40)], 120)
+
+    def test_chopped_answer_keeps_only_separate_best_moments(self):
+        pieces = plan(idea(0, 30, 70), idea(30, 60, 92), idea(60, 90, 75), idea(90, 120, 80))
+        kept = finalise_clips(pieces, 120, [], [])
+        assert [(c["start"], c["score"]) for c in kept] == [(30, 92), (90, 80)]
+        assert not clips.looks_chopped([(c["start"], c["end"]) for c in kept], 120)
+
+
 class TestGeminiRequest:
     @pytest.mark.parametrize("seconds, fps", [(300, 1.0), (600, 1.0), (900, 0.5), (1800, 0.25)])
     def test_fewer_frames_for_longer_videos(self, seconds, fps):
@@ -120,11 +152,20 @@ class TestGeminiRequest:
         assert "600-second" in prompt and "15-60 seconds" in prompt
         assert "Speech pauses (seconds): 10.5" in prompt and "Shot changes: 42.0" in prompt
         assert "recommended_count" in prompt and "Never name real people" in prompt
+        assert "NEVER split the video into consecutive pieces" in prompt and "0 or 1 clip" not in prompt
+        assert "NEW voice-over" in prompt and "Never repeat, translate or closely paraphrase" in prompt
+        assert "te 1.4" in prompt and "IMPORTANT" not in prompt
+
+    def test_short_video_and_correction(self):
+        media = MediaInfo(duration_seconds=120, width=1280, height=720, has_audio=True, aspect_ratio="16:9")
+        prompt = clips._clip_prompt(media, [], [], clips.CHOPPED_FIX)
+        assert "0 or 1 clip is normal" in prompt and "IMPORTANT: Your previous answer split the video" in prompt
 
     def test_metadata_context_is_about_one_clip(self):
         clip = {**idea(10, 40).model_dump(), "start": 10.0, "end": 40.0, "title": "Secret spice"}
         context = clips.metadata_context(clip, plan())
         assert "30-second Short" in context and "Secret spice" in context and "Spoken language: Telugu" in context
+        assert "New voice-over of the clip: ఈ రహస్య" in context
         silent = plan().model_copy(update={"spoken_language": "none"})
         assert "Spoken language" not in clips.metadata_context({**clip, "what_is_said": ""}, silent)
 
@@ -172,6 +213,17 @@ class TestFindClips:
         clips.find_clips(Path("x.mp4"), "https://youtu.be/EmcJiDu9mJI", MEDIA, [], [])
         assert client.requests[1].file_data.file_uri == "https://files/abc" and client.deleted == ["files/abc"]
 
+    def test_chopped_answer_is_sent_back_once(self, gemini):
+        chopped = plan(idea(0, 150), idea(150, 300), idea(300, 450), idea(450, 600))
+        client = gemini([chopped, plan(idea(100, 140))])
+        result, _ = clips.find_clips(Path("x.mp4"), "https://youtu.be/EmcJiDu9mJI", MEDIA, [], [])
+        assert len(client.requests) == 2 and [c.start_seconds for c in result.clips] == [100]
+
+    def test_good_answer_is_not_asked_again(self, gemini):
+        client = gemini([plan(idea(100, 140), idea(400, 430))])
+        clips.find_clips(Path("x.mp4"), "https://youtu.be/EmcJiDu9mJI", MEDIA, [], [])
+        assert len(client.requests) == 1
+
     def test_upload_is_deleted_even_when_gemini_fails(self, gemini):
         client = gemini([rv.GeminiCallError("busy")])
         with pytest.raises(rv.GeminiCallError):
@@ -192,26 +244,69 @@ def test_speech_pauses_finds_the_silence(tmp_path):
 
 class TestRenderClip:
     @pytest.mark.parametrize("size, audio", [("1280x720", True), ("720x1280", False)])
-    def test_vertical_1080x1920_at_the_right_length(self, tmp_path, size, audio):
+    def test_vertical_1080x1920_at_the_clip_length(self, tmp_path, size, audio):
         source = make_video(tmp_path / "src.mp4", 8, size, audio)
-        media = rv.probe_video(source)
-        out = clips.render_clip(source, media, 2.0, 6.0, tmp_path / "clip.mp4")
+        voice = make_tone(tmp_path / "voice.mp3", 2.5)  # shorter than the clip: padded with silence
+        out = clips.render_clip(source, rv.probe_video(source), 2.0, 6.0, tmp_path / "clip.mp4", voice)
         result = rv.probe_video(out)
         assert (result.width, result.height) == (1080, 1920) and result.has_audio
         assert result.duration_seconds == pytest.approx(4.0, abs=0.15)
 
-    def test_spoken_hook_is_mixed_in(self, tmp_path):
-        source = make_video(tmp_path / "src.mp4", 8)
-        hook = tmp_path / "hook.mp3"
-        ffmpeg("-f", "lavfi", "-i", "sine=frequency=900:duration=1.5", str(hook))
-        out = clips.render_clip(source, rv.probe_video(source), 1.0, 6.0, tmp_path / "clip.mp4", hook, 1.5)
-        assert rv.probe_video(out).duration_seconds == pytest.approx(5.0, abs=0.15)
+    def test_original_sound_is_never_used(self, tmp_path):
+        source = make_video(tmp_path / "src.mp4", 8)  # loud 300 Hz tone in the source
+        assert max_volume(source) > -20
+        silent_voice = tmp_path / "silence.wav"
+        ffmpeg("-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "3", str(silent_voice))
+        out = clips.render_clip(source, rv.probe_video(source), 1.0, 5.0, tmp_path / "clip.mp4", silent_voice)
+        assert max_volume(out) < -60
+
+    def test_music_plays_under_the_voice_and_loops(self, tmp_path):
+        source = make_video(tmp_path / "src.mp4", 10, audio=False)
+        silent_voice = tmp_path / "silence.wav"
+        ffmpeg("-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "1", str(silent_voice))
+        music = make_tone(tmp_path / "music.mp3", 2, frequency=440)  # shorter than the clip: loops
+        out = clips.render_clip(source, rv.probe_video(source), 0.0, 8.0, tmp_path / "clip.mp4", silent_voice,
+                                music)
+        assert rv.probe_video(out).duration_seconds == pytest.approx(8.0, abs=0.15)
+        tail = tmp_path / "tail.wav"
+        ffmpeg("-ss", "6", "-i", str(out), "-vn", str(tail))
+        assert max_volume(tail) > -40  # music still playing after its own 2 s
 
     def test_broken_source_raises_a_clear_error(self, tmp_path):
         broken = tmp_path / "broken.mp4"
         broken.write_bytes(b"not a video")
         with pytest.raises(clips.ClipRenderError, match="could not render"):
-            clips.render_clip(broken, MEDIA, 0, 5, tmp_path / "clip.mp4")
+            clips.render_clip(broken, MEDIA, 0, 5, tmp_path / "clip.mp4", make_tone(tmp_path / "v.mp3", 1))
+
+
+class TestVoice:
+    def fitted(self, monkeypatch, seconds):
+        import voiceover as vo
+
+        take = vo.Take(audio=b"mp3", duration=seconds, words=[])
+        monkeypatch.setattr(vo, "fit_to_duration", lambda scenes, voice, target, notify=None: vo.FittedVoiceover(
+            take=take, scenes=scenes, scene_starts=[0.0], video_duration=max(target, seconds)))
+
+    def test_voice_that_fits_keeps_the_clip(self, monkeypatch):
+        self.fitted(monkeypatch, 18.0)
+        audio, clip = clips.fit_clip_voice({"start": 10.0, "end": 30.0, "narration": "x"}, "v", 600)
+        assert audio == b"mp3" and clip["end"] == 30.0 and clip["notes"] == []
+
+    def test_voice_that_runs_over_lengthens_the_clip_not_past_the_end(self, monkeypatch):
+        self.fitted(monkeypatch, 24.0)
+        _, clip = clips.fit_clip_voice({"start": 10.0, "end": 30.0, "narration": "x"}, "v", 600)
+        assert clip["end"] == 34.3 and "lengthened" in clip["notes"][0]
+        _, clip = clips.fit_clip_voice({"start": 580.0, "end": 598.0, "narration": "x"}, "v", 600)
+        assert clip["end"] == 600
+
+    def test_narration_language(self):
+        assert clips.narration_language(plan()) == "te"
+        assert clips.narration_language(plan().model_copy(update={"spoken_language": "none"})) == "en"
+
+    def test_timeline_marks_each_clip(self):
+        html = clips.timeline_html([{"start": 30.0, "end": 60.0, "recommended": True},
+                                    {"start": 90.0, "end": 105.0, "recommended": False}], 120)
+        assert "left:25.00%;width:25.00%" in html and "left:75.00%;width:12.50%" in html
 
 
 # ── Whole page, end to end ──────────────────────────────────────────────────
@@ -241,8 +336,8 @@ WRAPPER = textwrap.dedent('''
 
     def fake_find(video, source_url, media, pauses, cuts, notify):
         calls.append(("find", source_url))
-        return plan(idea(2, 20, score=90, title="Secret spice"), idea(22, 40, score=75, title="Taste test"),
-                    idea(41, 58, score=55, title="Washing up")), "gemini-3.6-flash"
+        return plan(idea(2, 20, score=90, title="Secret spice"), idea(35, 53, score=75, title="Taste test"),
+                    idea(70, 88, score=55, title="Washing up")), "gemini-3.6-flash"
 
     def fake_metadata(context, kind, language, notify):
         calls.append(("metadata", context.splitlines()[1], language))
@@ -251,19 +346,20 @@ WRAPPER = textwrap.dedent('''
                                  instagram_caption=f"{{title}} caption", instagram_hashtags="#a #b #c #d #e",
                                  model="gemini-2.5-flash", search_queries=[f"{{title}} recipe"])
 
-    def fake_synthesize(text, voice):
-        audio = work / "hook.mp3"
-        subprocess.run([rv.ffmpeg_exe(), "-y", "-f", "lavfi", "-i", "sine=frequency=900:duration=1.2", str(audio)],
+    def fake_fit(scenes, voice, target, notify=None):
+        audio = work / "voice.mp3"
+        subprocess.run([rv.ffmpeg_exe(), "-y", "-f", "lavfi", "-i", "sine=frequency=900:duration=3", str(audio)],
                        capture_output=True, check=True)
-        calls.append(("voice", text, voice))
-        return vo.Take(audio=audio.read_bytes(), duration=1.2, words=[])
+        calls.append(("voice", scenes[0], voice, round(target, 2)))
+        take = vo.Take(audio=audio.read_bytes(), duration=3.0, words=[])
+        return vo.FittedVoiceover(take=take, scenes=scenes, scene_starts=[0.0], video_duration=target)
 
     clips.download_video = fake_download
     clips.find_clips = fake_find
     clips.generate_metadata = fake_metadata
     vo.languages = lambda: [("en", "English"), ("te", "Telugu")]
     vo.voices_for = lambda code, gender=None: [vo.Voice("te-IN-MohanNeural", "Male", "te-IN", "Telugu", "India")]
-    vo.synthesize = fake_synthesize
+    vo.fit_to_duration = fake_fit
     clips.render_page(st)
 ''')
 
@@ -273,11 +369,11 @@ def page(tmp_path, monkeypatch):
     import voiceover as vo
 
     for module, names in [(clips, ["download_video", "find_clips", "generate_metadata", "CONFIG"]),
-                          (vo, ["languages", "voices_for", "synthesize"]), (rv, ["CONFIG"])]:
+                          (vo, ["languages", "voices_for", "fit_to_duration"]), (rv, ["CONFIG"])]:
         for name in names:
             monkeypatch.setattr(module, name, getattr(module, name))
 
-    def build(seconds=60):
+    def build(seconds=100):
         wrapper = tmp_path / "app.py"
         wrapper.write_text(WRAPPER.format(repo=str(REPO), tests=str(REPO / "tests"), work=str(tmp_path / "work"),
                                           seconds=seconds), encoding="utf-8")
@@ -318,21 +414,29 @@ def test_whole_flow_from_link_to_clips_with_their_own_metadata(page):
     takes = [c for c in app.checkbox if "score" in c.label]
     assert [c.value for c in takes] == [True, True, False]  # recommended ones are ticked
 
-    # 2. spoken hook on the first clip, render the two recommended
-    hooks = [c for c in app.checkbox if c.label == "Add a spoken hook at the start"]
-    hooks[0].check()
+    assert any("orange = recommended" in m.value for m in app.markdown)  # the timeline
+    assert any("Language: Telugu" in c.value for c in app.caption)
+
+    # 2. edit the first clip's voice-over, render the two recommended
+    narrations = [t for t in app.text_area if t.label == "Voice-over"]
+    assert narrations[0].value == "ఈ రహస్య మసాలా రుచిని మార్చేస్తుంది"
+    narrations[0].input("కొత్త వాయిస్ ఓవర్")
     app = app.run()
     app = advance(app, "Render 2 clip(s)", wrapper)
     state = app.session_state.clips
     assert state["stage"] == "done" and not app.exception
     rendered = list(state["rendered"].values())
     assert [c["title"] for c in rendered] == ["Secret spice", "Taste test"]
-    assert rendered[0]["hook_line"] == "చూడండి" and rendered[1]["hook_line"] == ""
-    assert sum(1 for call in app.session_state.calls if call[0] == "voice") == 1
+    voices = [call for call in app.session_state.calls if call[0] == "voice"]
+    assert [v[1] for v in voices] == ["కొత్త వాయిస్ ఓవర్", "ఈ రహస్య మసాలా రుచిని మార్చేస్తుంది"]
+    assert all(v[2] == "te-IN-MohanNeural" for v in voices)
     for clip in rendered:
         media = rv.probe_video(Path(clip["path"]))
         assert (media.width, media.height) == (1080, 1920)
         assert media.duration_seconds == pytest.approx(clip["end"] - clip["start"], abs=0.2)
+        tail = Path(clip["path"]).with_suffix(".tail.wav")
+        ffmpeg("-ss", "5", "-i", clip["path"], "-vn", str(tail))
+        assert max_volume(tail) < -60  # after the 3 s voice: silence, not the source's 300 Hz tone
     import zipfile
     with zipfile.ZipFile(state["zip"]) as archive:
         assert sorted(archive.namelist()) == sorted(Path(c["path"]).name for c in rendered)

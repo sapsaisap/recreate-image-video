@@ -1,16 +1,21 @@
 """Clips from a long video: Gemini watches the whole video once and
 recommends the moments worth posting on their own as YouTube Shorts /
-Instagram Reels; ffmpeg cuts them from the real footage -- no video
-generation model is involved.
+Instagram Reels; ffmpeg cuts the picture from the real footage. The
+original sound (voice and music) is never used: every clip gets a new
+narration written by Gemini in its own words, read by Edge TTS, with
+optional background music the user uploads.
 
 Flow (one Streamlit page, three stages):
   1. input   link or upload (max CLIPS_MAX_VIDEO_SECONDS, 30 min) -> speech
              pauses and shot cuts measured by ffmpeg -> one Gemini call
-             returns the recommended clips (count, times, hook, score)
-  2. pick    the clips, start/end snapped to pauses or cuts so no word is
-             cut in half; tick, nudge, optional Edge TTS spoken hook
+             returns the recommended clips (count, times, hook, score,
+             narration); clips that just chop the video into back-to-back
+             pieces are sent back once
+  2. pick    the clips on a timeline, start/end snapped to pauses or cuts;
+             tick, nudge, edit the narration, pick the voice and music
   3. done    each clip rendered 1080x1920 (blurred fill for landscape
-             footage), -14 LUFS, with its own YouTube + Instagram metadata
+             footage), new voice-over at -14 LUFS, with its own YouTube +
+             Instagram metadata
 """
 from __future__ import annotations
 
@@ -48,6 +53,7 @@ from recreate_video import (
     probe_video,
     render_social_or_generate,
 )
+from summary_short import WORDS_PER_SECOND, words_per_second
 
 logger = logging.getLogger(__name__)
 _LOADED_MTIME = Path(__file__).stat().st_mtime  # see recreate_video.drop_stale_app_modules
@@ -62,6 +68,16 @@ MAX_CLIPS = 8
 SNAP_SECONDS = 2.0  # how far a start / end may move to reach a pause or cut
 CLIPS_TIMEOUT_SECONDS = 600  # one call over up to 30 minutes of video
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be")
+CHOP_GAP_SECONDS = 5.0  # clips closer than this count as "next to each other"
+CHOP_COVERAGE = 0.6  # back-to-back clips covering more than this share = chopped
+SHORT_SOURCE_SECONDS = 180  # below this, 0-1 clip is normal
+MUSIC_VOLUME = 0.12  # background music under the voice
+NARRATION_SHARE = 0.85  # narration fills ~85% of the clip, leaving breathing room
+CHOPPED_FIX = (
+    "Your previous answer split the video into consecutive back-to-back pieces. That is wrong: do not cover "
+    "the video piece by piece. Return only the separate moments that each have a real hook and payoff of "
+    "their own, with gaps between them; fewer clips (even 0 or 1) is fine."
+)
 
 
 # ============================================================================
@@ -72,15 +88,18 @@ class ClipIdea(BaseModel):
     start_seconds: float
     end_seconds: float
     title: str = Field(description="Short working title of the clip, in English.")
-    hook: str = Field(description="What grabs attention in the clip's first 2 seconds (line said or thing seen).")
-    payoff: str = Field(description="How the clip ends: the answer, punchline, result or conclusion.")
+    hook: str = Field(description="The exact moment that grabs attention in the clip's first 2 seconds: quote "
+                                  "the words said there (in English meaning) or describe exactly what is seen.")
+    payoff: str = Field(description="The exact moment the clip ends on: the answer, punchline, result or "
+                                    "conclusion, quoted or described.")
     why_it_works: str = Field(description="Why it works as a standalone Short, in one sentence.")
     what_is_said: str = Field(description="English meaning of what is said in the clip, 1-3 sentences; '' if nothing.")
     score: int = Field(description="0-100: how likely it is to hold viewers as a standalone Short. Strict.")
     stands_alone: bool = Field(description="True if it makes sense without the rest of the video.")
-    hook_voiceover: str = Field(
-        description="One spoken line of at most 10 words, in the video's spoken language and script, that could "
-                    "be read over the first 2 seconds to tease the clip. Honest, no clickbait lies.")
+    narration: str = Field(
+        description="A NEW voice-over for the clip in your own words, in the video's spoken language and its own "
+                    "script (English if nobody speaks), sized to the clip's length. It replaces the original "
+                    "sound completely.")
 
 
 class ClipPlan(BaseModel):
@@ -118,10 +137,38 @@ def snap(value: float, points: list[float], window: float = SNAP_SECONDS) -> flo
     return min(near, key=lambda p: abs(p - value)) if near else value
 
 
+def looks_chopped(spans: list[tuple[float, float]], duration: float) -> bool:
+    """True when the clips just cover the video piece by piece: they cover
+    most of it and most neighbours touch -- not separate moments."""
+    spans = sorted(spans)
+    if len(spans) < 2 or duration <= 0:
+        return False
+    covered = sum(max(0.0, end - start) for start, end in spans)
+    touching = sum(1 for (_, end), (start, _) in zip(spans, spans[1:]) if start - end < CHOP_GAP_SECONDS)
+    return covered > CHOP_COVERAGE * duration and touching * 2 >= len(spans) - 1
+
+
 def finalise_clips(plan: ClipPlan, duration: float, pauses: list[tuple[float, float]],
                    cuts: list[float]) -> list[dict]:
     """Gemini's clips with start / end moved onto a pause or cut, 15-60 s,
-    no overlaps, best first for overlap decisions, then in video order."""
+    no overlaps, best first for overlap decisions, then in video order. If
+    they still chop the video into back-to-back pieces, only the best ones
+    with a gap between them are kept."""
+    kept = _pick_clips(plan, duration, pauses, cuts, gap=-2.0)
+    if looks_chopped([(c["start"], c["end"]) for c in kept], duration):
+        logger.info("[CLIPS] clips are back-to-back -- keeping only separate moments")
+        kept = _pick_clips(plan, duration, pauses, cuts, gap=CHOP_GAP_SECONDS)
+    kept = kept[:12]  # already best first
+    good = [c for c in kept if c["score"] >= RECOMMEND_SCORE and c["stands_alone"]][:MAX_CLIPS]
+    for clip in kept:
+        clip["recommended"] = any(clip is g for g in good)
+    return sorted(kept, key=lambda c: c["start"])
+
+
+def _pick_clips(plan: ClipPlan, duration: float, pauses: list[tuple[float, float]], cuts: list[float],
+                gap: float) -> list[dict]:
+    """Best first; a clip is skipped when it comes closer than `gap` seconds
+    to one already kept (a negative gap allows that much overlap)."""
     start_points = sorted({round(max(0.0, end - 0.1), 2) for _, end in pauses} | set(cuts) | {0.0})
     end_points = sorted({round(start + 0.15, 2) for start, _ in pauses} | set(cuts) | {round(duration, 2)})
     kept: list[dict] = []
@@ -135,14 +182,10 @@ def finalise_clips(plan: ClipPlan, duration: float, pauses: list[tuple[float, fl
         if end - start < CLIP_MIN_SECONDS - 1:
             logger.info(f"[CLIPS] dropped '{idea.title}': {end - start:.1f}s after snapping")
             continue
-        if any(start < k["end"] - 2 and end > k["start"] + 2 for k in kept):
+        if any(start < k["end"] + gap and end > k["start"] - gap for k in kept):
             continue
         kept.append({**idea.model_dump(), "start": round(start, 2), "end": round(end, 2)})
-    kept = kept[:12]  # already best first
-    good = [c for c in kept if c["score"] >= RECOMMEND_SCORE and c["stands_alone"]][:MAX_CLIPS]
-    for clip in kept:
-        clip["recommended"] = any(clip is g for g in good)
-    return sorted(kept, key=lambda c: c["start"])
+    return kept
 
 
 # ============================================================================
@@ -159,9 +202,13 @@ def frames_per_second(duration: float) -> float:
     return 0.25
 
 
-def _clip_prompt(media: MediaInfo, pauses: list[tuple[float, float]], cuts: list[float]) -> str:
+def _clip_prompt(media: MediaInfo, pauses: list[tuple[float, float]], cuts: list[float],
+                 correction: str = "") -> str:
     pause_times = ", ".join(f"{(a + b) / 2:.1f}" for a, b in pauses[:400]) or "none measured"
     cut_times = ", ".join(f"{c:.1f}" for c in cuts[:200]) or "none measured"
+    rates = ", ".join(f"{code} {rate:g}" for code, rate in WORDS_PER_SECOND.items())
+    short = (f"- This video is short ({media.duration_seconds:.0f} s): 0 or 1 clip is normal.\n"
+             if media.duration_seconds < SHORT_SOURCE_SECONDS else "")
     return (
         f"You are a short-form video editor. Watch and listen to this whole {media.duration_seconds:.0f}-second "
         "video. Find the moments worth posting on their own as YouTube Shorts / Instagram Reels, each cut "
@@ -173,14 +220,24 @@ def _clip_prompt(media: MediaInfo, pauses: list[tuple[float, float]], cuts: list
         "unexplained references.\n"
         "- Score each clip 0-100 for how well it would hold viewers as a standalone Short. Be strict: 70+ only "
         "for clips you would really post.\n"
+        "- NEVER split the video into consecutive pieces (0-30 s, 30-60 s, ...). Most of a video is not worth "
+        "clipping; gaps between clips are normal. Each clip is a separate moment with its OWN hook and payoff.\n"
+        "- The length follows the moment: as short as the moment allows, not as long as the limit.\n"
         "- recommended_count = the number of clips scoring 70+. It follows the content, not the length: roughly "
         "one per 2-4 minutes of strong content, and 0 if nothing stands on its own. Return up to 12 "
         "candidates, best first, including a few 50-69 alternatives. Clips must not overlap.\n"
+        + short +
         f"- Times are seconds from the start, between 0 and {media.duration_seconds:.0f}. Start and end at "
         f"speech pauses or shot changes. Speech pauses (seconds): {pause_times}. Shot changes: {cut_times}.\n"
-        "- hook_voiceover: in the spoken language and its own script.\n"
+        "- narration: the original sound (voice and music) is removed from the clip, so write a NEW voice-over "
+        "in your own words that tells what happens in the clip: open on the hook, end on the payoff. Never "
+        "repeat, translate or closely paraphrase what is said in the video, and quote no song lyrics. Write it "
+        "in the spoken language and its own script (English if nobody speaks). Size it to the clip: about "
+        f"{NARRATION_SHARE:.0%} of (clip seconds x words per second); words per second by language: {rates}, "
+        "others 2.0. Plain spoken sentences, no hashtags or emojis, no 'like and subscribe'.\n"
         "- Never name real people; describe them by appearance or role. Ignore platform UI and watermarks.\n"
-        "Return JSON matching the schema."
+        + (f"\nIMPORTANT: {correction}\n" if correction else "")
+        + "Return JSON matching the schema."
     )
 
 
@@ -201,11 +258,18 @@ def find_clips(video: Path, source_url: str, media: MediaInfo, pauses: list[tupl
     from google.genai import types as genai_types
 
     client = get_client()
-    prompt = _clip_prompt(media, pauses, cuts)
     metadata = genai_types.VideoMetadata(fps=frames_per_second(media.duration_seconds))
     used: dict[str, str] = {}
 
     def ask(part):
+        plan = ask_once(part, _clip_prompt(media, pauses, cuts))
+        if looks_chopped([(c.start_seconds, c.end_seconds) for c in plan.clips], media.duration_seconds):
+            logger.info("[CLIPS] Gemini chopped the video into back-to-back pieces -- asking once more")
+            notify("Gemini split the video into back-to-back pieces -- asking again for real moments...")
+            plan = ask_once(part, _clip_prompt(media, pauses, cuts, CHOPPED_FIX))
+        return plan
+
+    def ask_once(part, prompt: str) -> ClipPlan:
         def run(model: str) -> ClipPlan:
             response = client.models.generate_content(
                 model=model,
@@ -254,16 +318,15 @@ class ClipRenderError(RuntimeError):
 
 
 def render_clip(source: Path, media: MediaInfo, start: float, end: float, output: Path,
-                hook_audio: Path | None = None, hook_seconds: float = 0.0) -> Path:
+                voice: Path, music: Path | None = None) -> Path:
     """One 1080x1920 clip: vertical footage is filled, landscape footage sits
-    on a blurred copy of itself; original sound (ducked under the spoken
-    hook, if any), normalised to -14 LUFS."""
+    on a blurred copy of itself. The source's own sound is never used: the
+    audio is the new voice-over, with the music (looped, quiet) under it if
+    given, normalised to -14 LUFS."""
     length = max(1.0, end - start)
-    inputs = ["-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(source)]
-    audio_index = 0
-    if not media.has_audio:
-        inputs += ["-f", "lavfi", "-t", f"{length:.3f}", "-i", "anullsrc=r=48000:cl=stereo"]
-        audio_index = 1
+    inputs = ["-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(source), "-i", str(voice)]
+    if music is not None:
+        inputs += ["-stream_loop", "-1", "-i", str(music)]
     if media.width / max(1, media.height) <= 0.6:
         video = "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30[v]"
     else:
@@ -271,14 +334,12 @@ def render_clip(source: Path, media: MediaInfo, start: float, end: float, output
                  "[bg0]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:2[bg];"
                  "[fg0]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30[v]")
     loudness = "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000"
-    if hook_audio is not None:
-        inputs += ["-i", str(hook_audio)]
-        hook_index = audio_index + 1
-        audio = (f"[{audio_index}:a]volume='if(lt(t,{hook_seconds + 0.3:.2f}),0.2,1)':eval=frame[orig];"
-                 f"[{hook_index}:a]aresample=48000[hook];"
-                 f"[orig][hook]amix=inputs=2:duration=first:normalize=0,{loudness}[a]")
+    voice_chain = "[1:a]aresample=48000,aformat=channel_layouts=stereo,apad"
+    if music is not None:
+        audio = (f"{voice_chain}[vo];[2:a]aresample=48000,aformat=channel_layouts=stereo,"
+                 f"volume={MUSIC_VOLUME}[bg];[vo][bg]amix=inputs=2:duration=first:normalize=0,{loudness}[a]")
     else:
-        audio = f"[{audio_index}:a]{loudness}[a]"
+        audio = f"{voice_chain},{loudness}[a]"
     command = [ffmpeg_exe(), "-y", "-hide_banner", "-loglevel", "error", *inputs,
                "-filter_complex", f"{video};{audio}", "-map", "[v]", "-map", "[a]",
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
@@ -301,6 +362,7 @@ def metadata_context(clip: dict, plan: ClipPlan) -> str:
         f"Payoff: {clip['payoff']}",
         f"Why it works: {clip['why_it_works']}",
         f"What is said (English meaning): {clip['what_is_said']}" if clip.get("what_is_said") else "",
+        f"New voice-over of the clip: {clip['narration']}" if clip.get("narration") else "",
         f"The full video: {plan.video_summary.strip()[:400]}",
         f"Spoken language: {plan.spoken_language}" if plan.spoken_language.lower() != "none" else "",
     ] if part)
@@ -343,11 +405,13 @@ def _page_input(st) -> None:
     limit_min = CLIPS_MAX_VIDEO_SECONDS / 60
     st.caption(
         f"Paste a YouTube / Instagram link or upload a video (up to {limit_min:.0f} minutes). Gemini watches it "
-        "once and recommends the moments worth posting as Shorts / Reels; they are cut from the real footage "
-        "with ffmpeg -- no video is generated."
+        "once and recommends the moments worth posting as Shorts / Reels; the picture is cut from the real "
+        "footage with ffmpeg. The original sound is never used: each clip gets a new voice-over written by "
+        "Gemini, with optional music you upload."
     )
-    st.info("The clips are the original creator's footage. Post them only for videos you own or have the "
-            "rights to, or you risk a copyright strike.")
+    st.info("A new voice-over removes the original voice and music, but the picture is still the creator's "
+            "footage, and YouTube / Instagram also match video. Post clips only of videos you own or have the "
+            "rights to. For someone else's video, Summarise to Short (AI images) is the safer choice.")
     for problem in (problems := CONFIG.problems()):
         st.error(problem)
     url = st.text_input("Video link", placeholder="https://www.youtube.com/watch?v=...", key="clips_url")
@@ -412,8 +476,16 @@ def _page_pick(st) -> None:
                 + f" — {plan.count_reason}")
     if not clips:
         st.warning("Gemini found no moment that works on its own as a Short. Try another video.")
-    with st.expander("Spoken hook voice (optional)"):
-        voice = _voice_picker(st, plan.language_code)
+    elif media.duration_seconds < SHORT_SOURCE_SECONDS:
+        st.caption("Short video: 0-1 clip is normal. To retell the whole video as a Short, use Summarise to Short.")
+    if clips:
+        st.markdown(timeline_html(clips, media.duration_seconds), unsafe_allow_html=True)
+    language = narration_language(plan)
+    st.markdown("**New voice-over** (the original sound is not used)")
+    voice = _voice_picker(st, language)
+    music = st.file_uploader("Background music (optional, quiet under the voice) -- only music you have rights "
+                             "to, e.g. from the YouTube Audio Library", type=["mp3", "wav", "m4a", "aac", "ogg"],
+                             key=_key(st, "music"))
 
     chosen = []
     for index, clip in enumerate(clips):
@@ -429,64 +501,103 @@ def _page_pick(st) -> None:
                                           key=_key(st, f"start_{index}"))
             end = times[1].number_input("End (s)", 0.0, media.duration_seconds, float(clip["end"]), 0.5,
                                         key=_key(st, f"end_{index}"))
-            hook_on = st.checkbox("Add a spoken hook at the start", value=False, key=_key(st, f"hook_on_{index}"),
-                                  disabled=voice is None)
-            hook_text = st.text_input("Hook line", clip["hook_voiceover"], key=_key(st, f"hook_{index}"),
-                                      disabled=not hook_on)
+            narration = st.text_area("Voice-over", clip["narration"], key=_key(st, f"narration_{index}"), height=90)
+            budget = round(max(0.0, end - start) * words_per_second(language) * NARRATION_SHARE)
+            st.caption(f"{len(narration.split())} words · about {budget} fit in {max(0.0, end - start):.0f} s "
+                       "(the voice is sped up or slowed down a little to fit)")
             if take:
-                chosen.append({**clip, "index": index, "start": start, "end": end,
-                               "hook_line": hook_text.strip() if hook_on else ""})
+                chosen.append({**clip, "index": index, "start": start, "end": end, "narration": narration.strip()})
 
     bad = [c for c in chosen if not 3 <= c["end"] - c["start"] <= 180]
     for clip in bad:
         st.warning(f"'{clip['title']}': end must be 3-180 s after start.")
+    silent = [c for c in chosen if not c["narration"]]
+    for clip in silent:
+        st.warning(f"'{clip['title']}': write a voice-over -- the original sound is not used.")
     left, right = st.columns(2)
     if right.button("Start over", key=_key(st, "restart")):
         _start_over(st)
         st.rerun()
-    if not left.button(f"Render {len(chosen)} clip(s)", type="primary", disabled=not chosen or bool(bad),
-                       key=_key(st, "render")):
+    if not left.button(f"Render {len(chosen)} clip(s)", type="primary",
+                       disabled=not chosen or bool(bad) or bool(silent) or voice is None, key=_key(st, "render")):
         return
-    _render_chosen(st, chosen, media, voice)
+    _render_chosen(st, chosen, media, voice, music)
+
+
+def narration_language(plan: ClipPlan) -> str:
+    """The language the narration is written in: the spoken one, English
+    when nobody speaks."""
+    if plan.spoken_language.strip().lower() in ("", "none"):
+        return "en"
+    return (plan.language_code or "en").lower().split("-")[0]
+
+
+def timeline_html(clips: list[dict], duration: float) -> str:
+    """A bar for the whole video with each clip marked where it sits, so
+    back-to-back chopping is easy to spot."""
+    marks = "".join(
+        f'<div title="{_clock(c["start"])}-{_clock(c["end"])}" style="position:absolute;top:0;bottom:0;'
+        f'left:{100 * c["start"] / duration:.2f}%;width:{max(0.4, 100 * (c["end"] - c["start"]) / duration):.2f}%;'
+        f'background:{"#e8590c" if c["recommended"] else "#adb5bd"};border-radius:3px"></div>'
+        for c in clips if duration > 0)
+    return (f'<div style="position:relative;height:14px;background:rgba(128,128,128,.18);border-radius:3px;'
+            f'margin:4px 0 2px">{marks}</div><div style="display:flex;justify-content:space-between;'
+            f'font-size:12px;opacity:.7"><span>0:00</span><span>clips on the video (orange = recommended)</span>'
+            f'<span>{_clock(duration)}</span></div>')
 
 
 def _voice_picker(st, language_code: str):
+    """The voice for the narration's language (male / female, speaker)."""
     try:
-        options = voiceover.languages()
+        names = dict(voiceover.languages())
     except voiceover.VoiceoverError as exc:
         st.error(str(exc))
         return None
-    codes = [code for code, _ in options]
-    names = dict(options)
-    source = (language_code or "en").lower().split("-")[0]
     left, right = st.columns(2)
-    code = left.selectbox("Language", codes, index=codes.index(source) if source in codes else 0,
-                          format_func=lambda c: names.get(c, c), key="clips_lang")
+    left.caption(f"Language: {names.get(language_code, language_code)} (the video's spoken language)")
     gender = right.radio("Voice", ["Female", "Male"], horizontal=True, key="clips_gender")
-    voices = voiceover.voices_for(code, gender)
+    voices = voiceover.voices_for(language_code, gender)
     if not voices:
-        st.warning(f"No {gender.lower()} voice for {names.get(code, code)} -- pick the other voice.")
+        st.warning(f"No {gender.lower()} voice for {names.get(language_code, language_code)} -- pick the other "
+                   "voice.")
         return None
     return st.selectbox("Speaker", voices, format_func=lambda v: v.label, key="clips_voice")
 
 
-def _render_chosen(st, chosen: list[dict], media: MediaInfo, voice) -> None:
+def fit_clip_voice(clip: dict, voice: str, duration: float, notify: Notify = _noop_notify) -> tuple[bytes, dict]:
+    """The narration read by Edge TTS and fitted to the clip. If it still
+    runs over at the fastest natural speed, the clip ends a little later
+    (never past the video's end). Returns (MP3, the clip with notes)."""
+    length = clip["end"] - clip["start"]
+    fitted = voiceover.fit_to_duration([clip["narration"]], voice, length, notify=notify)
+    clip = {**clip, "notes": list(fitted.notes)}
+    if fitted.take.duration > length + voiceover.OVERRUN_TOLERANCE_SECONDS:
+        clip["end"] = round(min(duration, clip["start"] + fitted.take.duration + 0.3), 2)
+        clip["notes"].append(f"The clip was lengthened to {clip['end'] - clip['start']:.0f} s to fit the voice-over.")
+    return fitted.take.audio, clip
+
+
+def _render_chosen(st, chosen: list[dict], media: MediaInfo, voice, music_upload=None) -> None:
     state = _state(st)
     job = Path(state["job"])
+    music = None
+    if music_upload is not None:
+        music = job / f"music{Path(music_upload.name).suffix.lower() or '.mp3'}"
+        music.write_bytes(music_upload.getvalue())
     rendered: dict[str, dict] = {}
     with st.status("Rendering the clips...", expanded=True) as status:
         for number, clip in enumerate(chosen, start=1):
-            status.update(label=f"Rendering clip {number} of {len(chosen)}: {clip['title']}")
+            label = f"Clip {number} of {len(chosen)}: {clip['title']}"
+            status.update(label=label)
             try:
-                hook_audio, hook_seconds = None, 0.0
-                if clip["hook_line"] and voice is not None:
-                    take = voiceover.synthesize(clip["hook_line"], voice.short_name)
-                    hook_audio = job / f"hook_{clip['index']}.mp3"
-                    hook_audio.write_bytes(take.audio)
-                    hook_seconds = take.duration
+                audio, clip = fit_clip_voice(clip, voice.short_name, media.duration_seconds,
+                                             lambda message: status.update(label=f"{label} -- {message}"))
+                voice_path = job / f"voice_{clip['index']}.mp3"
+                voice_path.write_bytes(audio)
                 output = job / f"clip_{number:02d}_{int(clip['start'])}s.mp4"
-                render_clip(Path(state["video"]), media, clip["start"], clip["end"], output, hook_audio, hook_seconds)
-                rendered[str(clip["index"])] = {**clip, "path": str(output)}
+                status.update(label=f"{label} -- rendering")
+                render_clip(Path(state["video"]), media, clip["start"], clip["end"], output, voice_path, music)
+                rendered[str(clip["index"])] = {**clip, "path": str(output), "music": music is not None}
             except (ClipRenderError, voiceover.VoiceoverError) as exc:
                 st.error(f"Clip {number} ({clip['title']}): {exc}")
         status.update(label=f"{len(rendered)} clip(s) ready", state="complete" if rendered else "error",
@@ -522,7 +633,10 @@ def _page_done(st) -> None:
         st.divider()
         st.subheader(f"Clip {number}: {clip['title']}")
         st.caption(f"{_clock(clip['start'])} → {_clock(clip['end'])} · {clip['end'] - clip['start']:.0f} s"
-                   + (f" · spoken hook: “{clip['hook_line']}”" if clip.get("hook_line") else ""))
+                   + (" · with music" if clip.get("music") else ""))
+        st.caption(f"**Voice-over:** {clip['narration']}")
+        for note in clip.get("notes", []):
+            st.caption(note)
         path = Path(clip["path"])
         columns = st.columns([1, 2])
         if path.is_file():

@@ -44,6 +44,7 @@ from recreate_video import (
     _parse_structured,
     _upload_and_wait,
     call_gemini,
+    content_texts,
     detect_scene_cuts,
     download_video,
     ffmpeg_exe,
@@ -62,21 +63,23 @@ CLIPS_MAX_VIDEO_SECONDS = int(os.getenv("CLIPS_MAX_VIDEO_SECONDS", "1800") or 18
 CLIPS_MAX_DOWNLOAD_MB = int(os.getenv("CLIPS_MAX_DOWNLOAD_MB", "1500") or 1500)
 TOO_LONG = (f"This video cannot be analysed or made into clips due to its duration. The maximum is "
             f"{CLIPS_MAX_VIDEO_SECONDS / 60:.0f} minutes.")
-CLIP_MIN_SECONDS, CLIP_MAX_SECONDS = 15, 60
+CLIP_MIN_SECONDS, CLIP_MAX_SECONDS = 8, 45
 RECOMMEND_SCORE = 70
 MAX_CLIPS = 8
+MAX_COVERAGE = 0.5  # recommended clips together never cover more than half the video
+MAX_ALTERNATIVES = 3  # extra possible clips, shown folded away
 SNAP_SECONDS = 2.0  # how far a start / end may move to reach a pause or cut
 CLIPS_TIMEOUT_SECONDS = 600  # one call over up to 30 minutes of video
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be")
 CHOP_GAP_SECONDS = 5.0  # clips closer than this count as "next to each other"
-CHOP_COVERAGE = 0.6  # back-to-back clips covering more than this share = chopped
-SHORT_SOURCE_SECONDS = 180  # below this, 0-1 clip is normal
+SHORT_SOURCE_SECONDS = 180  # below this: at most 2 clips
 MUSIC_VOLUME = 0.12  # background music under the voice
 NARRATION_SHARE = 0.85  # narration fills ~85% of the clip, leaving breathing room
 CHOPPED_FIX = (
     "Your previous answer split the video into consecutive back-to-back pieces. That is wrong: do not cover "
     "the video piece by piece. Return only the separate moments that each have a real hook and payoff of "
-    "their own, with gaps between them; fewer clips (even 0 or 1) is fine."
+    "their own, with gaps between them, together under half the video's length; fewer clips (even 0 or 1) "
+    "is fine."
 )
 
 
@@ -96,6 +99,10 @@ class ClipIdea(BaseModel):
     what_is_said: str = Field(description="English meaning of what is said in the clip, 1-3 sentences; '' if nothing.")
     score: int = Field(description="0-100: how likely it is to hold viewers as a standalone Short. Strict.")
     stands_alone: bool = Field(description="True if it makes sense without the rest of the video.")
+    on_screen_text: str = Field(
+        description="Text shown on screen during the clip (captions, meme lines, titles), word for word, with "
+                    "the English meaning in brackets if it is another language; no watermarks or @handles. "
+                    "'' if none.")
     narration: str = Field(
         description="A NEW voice-over for the clip in your own words, in the video's spoken language and its own "
                     "script (English if nobody speaks), sized to the clip's length. It replaces the original "
@@ -137,32 +144,56 @@ def snap(value: float, points: list[float], window: float = SNAP_SECONDS) -> flo
     return min(near, key=lambda p: abs(p - value)) if near else value
 
 
+def max_clips_for(duration: float) -> int:
+    """How many clips a video can give: 2 under 3 minutes, then about one
+    per 1.5-2 minutes, at most MAX_CLIPS."""
+    if duration < SHORT_SOURCE_SECONDS:
+        return 2
+    return max(2, min(MAX_CLIPS, round(duration / 105)))
+
+
 def looks_chopped(spans: list[tuple[float, float]], duration: float) -> bool:
-    """True when the clips just cover the video piece by piece: they cover
-    most of it and most neighbours touch -- not separate moments."""
+    """True when the clips just cover the video piece by piece: together
+    more than half of it, or three or more that mostly touch."""
     spans = sorted(spans)
     if len(spans) < 2 or duration <= 0:
         return False
     covered = sum(max(0.0, end - start) for start, end in spans)
     touching = sum(1 for (_, end), (start, _) in zip(spans, spans[1:]) if start - end < CHOP_GAP_SECONDS)
-    return covered > CHOP_COVERAGE * duration and touching * 2 >= len(spans) - 1
+    return covered > MAX_COVERAGE * duration or (len(spans) >= 3 and touching * 2 >= len(spans) - 1)
+
+
+def _best_spans(clips: list, duration: float) -> list[tuple[float, float]]:
+    """The clips that would be recommended (best `max_clips_for` by score)."""
+    def field(clip, name, key):
+        return clip[key] if isinstance(clip, dict) else getattr(clip, name)
+    best = sorted(clips, key=lambda c: field(c, "score", "score"), reverse=True)[:max_clips_for(duration)]
+    return [(field(c, "start_seconds", "start"), field(c, "end_seconds", "end")) for c in best]
 
 
 def finalise_clips(plan: ClipPlan, duration: float, pauses: list[tuple[float, float]],
                    cuts: list[float]) -> list[dict]:
-    """Gemini's clips with start / end moved onto a pause or cut, 15-60 s,
+    """Gemini's clips with start / end moved onto a pause or cut, 8-45 s,
     no overlaps, best first for overlap decisions, then in video order. If
-    they still chop the video into back-to-back pieces, only the best ones
-    with a gap between them are kept."""
+    they chop the video into back-to-back pieces, only the best ones with a
+    gap between them are kept. Recommended: score 70+, makes sense alone, at
+    most `max_clips_for(duration)`, together at most half the video. Up to
+    MAX_ALTERNATIVES others are kept as possible extras."""
     kept = _pick_clips(plan, duration, pauses, cuts, gap=-2.0)
-    if looks_chopped([(c["start"], c["end"]) for c in kept], duration):
+    if looks_chopped(_best_spans(kept, duration), duration):
         logger.info("[CLIPS] clips are back-to-back -- keeping only separate moments")
         kept = _pick_clips(plan, duration, pauses, cuts, gap=CHOP_GAP_SECONDS)
-    kept = kept[:12]  # already best first
-    good = [c for c in kept if c["score"] >= RECOMMEND_SCORE and c["stands_alone"]][:MAX_CLIPS]
-    for clip in kept:
+    cap, budget = max_clips_for(duration), MAX_COVERAGE * duration
+    good: list[dict] = []
+    for clip in kept:  # best first
+        length = clip["end"] - clip["start"]
+        if (clip["score"] >= RECOMMEND_SCORE and clip["stands_alone"] and len(good) < cap
+                and sum(g["end"] - g["start"] for g in good) + length <= budget):
+            good.append(clip)
+    others = [c for c in kept if not any(c is g for g in good)][:MAX_ALTERNATIVES]
+    for clip in good + others:
         clip["recommended"] = any(clip is g for g in good)
-    return sorted(kept, key=lambda c: c["start"])
+    return sorted(good + others, key=lambda c: c["start"])
 
 
 def _pick_clips(plan: ClipPlan, duration: float, pauses: list[tuple[float, float]], cuts: list[float],
@@ -207,8 +238,9 @@ def _clip_prompt(media: MediaInfo, pauses: list[tuple[float, float]], cuts: list
     pause_times = ", ".join(f"{(a + b) / 2:.1f}" for a, b in pauses[:400]) or "none measured"
     cut_times = ", ".join(f"{c:.1f}" for c in cuts[:200]) or "none measured"
     rates = ", ".join(f"{code} {rate:g}" for code, rate in WORDS_PER_SECOND.items())
-    short = (f"- This video is short ({media.duration_seconds:.0f} s): 0 or 1 clip is normal.\n"
-             if media.duration_seconds < SHORT_SOURCE_SECONDS else "")
+    cap = max_clips_for(media.duration_seconds)
+    short = (f"- This video is short ({media.duration_seconds:.0f} s): 1 or 2 short clips at most, 0 if nothing "
+             "stands alone. Never use most of the video.\n" if media.duration_seconds < SHORT_SOURCE_SECONDS else "")
     return (
         f"You are a short-form video editor. Watch and listen to this whole {media.duration_seconds:.0f}-second "
         "video. Find the moments worth posting on their own as YouTube Shorts / Instagram Reels, each cut "
@@ -222,13 +254,15 @@ def _clip_prompt(media: MediaInfo, pauses: list[tuple[float, float]], cuts: list
         "for clips you would really post.\n"
         "- NEVER split the video into consecutive pieces (0-30 s, 30-60 s, ...). Most of a video is not worth "
         "clipping; gaps between clips are normal. Each clip is a separate moment with its OWN hook and payoff.\n"
-        "- The length follows the moment: as short as the moment allows, not as long as the limit.\n"
-        "- recommended_count = the number of clips scoring 70+. It follows the content, not the length: roughly "
-        "one per 2-4 minutes of strong content, and 0 if nothing stands on its own. Return up to 12 "
-        "candidates, best first, including a few 50-69 alternatives. Clips must not overlap.\n"
+        "- The length follows the moment: as short as the moment allows (a few seconds is fine), not as long as "
+        "the limit.\n"
+        f"- recommended_count = the number of clips scoring 70+, at most {cap} for this video, and together "
+        "under half of its length. It follows the content: 0 if nothing stands on its own. Return those plus "
+        "up to 3 alternatives scoring 50-69, best first. Clips must not overlap.\n"
         + short +
         f"- Times are seconds from the start, between 0 and {media.duration_seconds:.0f}. Start and end at "
         f"speech pauses or shot changes. Speech pauses (seconds): {pause_times}. Shot changes: {cut_times}.\n"
+        "- on_screen_text: the text shown during the clip, word for word (it matters for memes and captions).\n"
         "- narration: the original sound (voice and music) is removed from the clip, so write a NEW voice-over "
         "in your own words that tells what happens in the clip: open on the hook, end on the payoff. Never "
         "repeat, translate or closely paraphrase what is said in the video, and quote no song lyrics. Write it "
@@ -263,7 +297,7 @@ def find_clips(video: Path, source_url: str, media: MediaInfo, pauses: list[tupl
 
     def ask(part):
         plan = ask_once(part, _clip_prompt(media, pauses, cuts))
-        if looks_chopped([(c.start_seconds, c.end_seconds) for c in plan.clips], media.duration_seconds):
+        if looks_chopped(_best_spans(plan.clips, media.duration_seconds), media.duration_seconds):
             logger.info("[CLIPS] Gemini chopped the video into back-to-back pieces -- asking once more")
             notify("Gemini split the video into back-to-back pieces -- asking again for real moments...")
             plan = ask_once(part, _clip_prompt(media, pauses, cuts, CHOPPED_FIX))
@@ -355,8 +389,11 @@ def render_clip(source: Path, media: MediaInfo, start: float, end: float, output
 
 
 def metadata_context(clip: dict, plan: ClipPlan) -> str:
+    on_screen = content_texts([clip.get("on_screen_text", "")])
     return "\n".join(part for part in [
         f"Content: a {clip['end'] - clip['start']:.0f}-second Short cut from a longer video.",
+        "Text on screen (often the main message -- build the metadata around it): " + " | ".join(on_screen)
+        if on_screen else "",
         f"Clip title idea: {clip['title']}",
         f"Hook: {clip['hook']}",
         f"Payoff: {clip['payoff']}",
@@ -439,7 +476,7 @@ def _page_input(st) -> None:
             media = probe_video(video)
             if media.duration_seconds > CLIPS_MAX_VIDEO_SECONDS + 0.5:
                 raise URLVideoError(TOO_LONG)
-            if media.duration_seconds < CLIP_MIN_SECONDS * 2:
+            if media.duration_seconds < 30:
                 raise URLVideoError(f"This video is only {media.duration_seconds:.0f} seconds long -- too short to "
                                     "cut into clips. Use Video recreate instead.")
             notify("Finding the speech pauses...")
@@ -477,9 +514,11 @@ def _page_pick(st) -> None:
     if not clips:
         st.warning("Gemini found no moment that works on its own as a Short. Try another video.")
     elif media.duration_seconds < SHORT_SOURCE_SECONDS:
-        st.caption("Short video: 0-1 clip is normal. To retell the whole video as a Short, use Summarise to Short.")
+        st.caption("Short video: at most 2 clips. To retell the whole video as a Short, use Summarise to Short.")
     if clips:
         st.markdown(timeline_html(clips, media.duration_seconds), unsafe_allow_html=True)
+    if clips and not recommended:
+        st.warning("No clip is strong enough to recommend. The possible ones are below if you want to try them.")
     language = narration_language(plan)
     st.markdown("**New voice-over** (the original sound is not used)")
     voice = _voice_picker(st, language)
@@ -488,26 +527,17 @@ def _page_pick(st) -> None:
                              key=_key(st, "music"))
 
     chosen = []
+    extras = [(i, c) for i, c in enumerate(clips) if not c["recommended"]]
     for index, clip in enumerate(clips):
-        with st.container(border=True):
-            top = st.columns([3, 1])
-            take = top[0].checkbox(f"**{clip['title']}** · score {clip['score']}" + (" · ⭐ recommended"
-                                   if clip["recommended"] else ""), value=clip["recommended"],
-                                   key=_key(st, f"take_{index}"))
-            top[1].caption(f"{_clock(clip['start'])} → {_clock(clip['end'])} ({clip['end'] - clip['start']:.0f} s)")
-            st.caption(f"**Hook:** {clip['hook']}  \n**Payoff:** {clip['payoff']}  \n**Why:** {clip['why_it_works']}")
-            times = st.columns(2)
-            start = times[0].number_input("Start (s)", 0.0, media.duration_seconds, float(clip["start"]), 0.5,
-                                          key=_key(st, f"start_{index}"))
-            end = times[1].number_input("End (s)", 0.0, media.duration_seconds, float(clip["end"]), 0.5,
-                                        key=_key(st, f"end_{index}"))
-            narration = st.text_area("Voice-over", clip["narration"], key=_key(st, f"narration_{index}"), height=90)
-            budget = round(max(0.0, end - start) * words_per_second(language) * NARRATION_SHARE)
-            st.caption(f"{len(narration.split())} words · about {budget} fit in {max(0.0, end - start):.0f} s "
-                       "(the voice is sped up or slowed down a little to fit)")
-            if take:
-                chosen.append({**clip, "index": index, "start": start, "end": end, "narration": narration.strip()})
+        if clip["recommended"]:
+            _clip_card(st, index, clip, media, language, chosen)
+    if extras:
+        with st.expander(f"Show {len(extras)} more possible clip(s) (not recommended)"):
+            for index, clip in extras:
+                _clip_card(st, index, clip, media, language, chosen)
+    chosen.sort(key=lambda c: c["start"])
 
+    bad = [c for c in chosen if not 3 <= c["end"] - c["start"] <= 180]
     bad = [c for c in chosen if not 3 <= c["end"] - c["start"] <= 180]
     for clip in bad:
         st.warning(f"'{clip['title']}': end must be 3-180 s after start.")
@@ -522,6 +552,29 @@ def _page_pick(st) -> None:
                        disabled=not chosen or bool(bad) or bool(silent) or voice is None, key=_key(st, "render")):
         return
     _render_chosen(st, chosen, media, voice, music)
+
+
+def _clip_card(st, index: int, clip: dict, media: MediaInfo, language: str, chosen: list[dict]) -> None:
+    """One clip: tick, times, hook / payoff / text, editable voice-over."""
+    with st.container(border=True):
+        top = st.columns([3, 1])
+        take = top[0].checkbox(f"**{clip['title']}** · score {clip['score']}" + (" · ⭐ recommended"
+                               if clip["recommended"] else ""), value=clip["recommended"],
+                               key=_key(st, f"take_{index}"))
+        top[1].caption(f"{_clock(clip['start'])} → {_clock(clip['end'])} ({clip['end'] - clip['start']:.0f} s)")
+        st.caption(f"**Hook:** {clip['hook']}  \n**Payoff:** {clip['payoff']}  \n**Why:** {clip['why_it_works']}"
+                   + (f"  \n**Text on screen:** {clip['on_screen_text']}" if clip.get("on_screen_text") else ""))
+        times = st.columns(2)
+        start = times[0].number_input("Start (s)", 0.0, media.duration_seconds, float(clip["start"]), 0.5,
+                                      key=_key(st, f"start_{index}"))
+        end = times[1].number_input("End (s)", 0.0, media.duration_seconds, float(clip["end"]), 0.5,
+                                    key=_key(st, f"end_{index}"))
+        narration = st.text_area("Voice-over", clip["narration"], key=_key(st, f"narration_{index}"), height=90)
+        budget = round(max(0.0, end - start) * words_per_second(language) * NARRATION_SHARE)
+        st.caption(f"{len(narration.split())} words · about {budget} fit in {max(0.0, end - start):.0f} s "
+                   "(the voice is sped up or slowed down a little to fit)")
+        if take:
+            chosen.append({**clip, "index": index, "start": start, "end": end, "narration": narration.strip()})
 
 
 def narration_language(plan: ClipPlan) -> str:

@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 # ── Shared utilities from recreate_video ────────────────────────────────────
 from recreate_video import (
     CONFIG,
+    content_texts,
     TIMEOUT_IMAGE_SECONDS,
     TIMEOUT_TEXT_SECONDS,
     gemini_http_options,
@@ -141,6 +142,27 @@ class ImageAnalysis(BaseModel):
     suggested_audio: SuggestedAudio = Field(
         description="Best audio recommendation for posting this as an Instagram Reel."
     )
+    # Defaults keep analyses cached before these fields existed loadable;
+    # _StrictImageAnalysis makes Gemini fill them.
+    text_meaning: str = Field(
+        default="",
+        description="In English: what the text in the image says and what its joke, point or message is, "
+                    "together with the picture. '' if there is no text.")
+    text_language: str = Field(
+        default="",
+        description="Language of the main text as an English name, e.g. 'Telugu', 'English'; '' if no text.")
+    meme_format: str = Field(
+        default="",
+        description="The meme template, format or trend this follows, if any (e.g. 'Drake hotline bling', "
+                    "'expectation vs reality', 'POV'); '' if none.")
+
+
+class _StrictImageAnalysis(ImageAnalysis):
+    """The schema Gemini must fill: the text fields are required for it."""
+
+    text_meaning: str = Field(description=ImageAnalysis.model_fields["text_meaning"].description)
+    text_language: str = Field(description=ImageAnalysis.model_fields["text_language"].description)
+    meme_format: str = Field(description=ImageAnalysis.model_fields["meme_format"].description)
 
 
 class ImageRecreationPlan(BaseModel):
@@ -329,7 +351,11 @@ def _analysis_prompt_image() -> str:
         "=== TEXT EXTRACTION (critical) ===\n"
         "- Read EVERY piece of text visible in the image, verbatim.\n"
         "- For each text: record exact wording, position, font style/colour.\n"
-        "- Set has_text=true if ANY text is visible, even small.\n\n"
+        "- Set has_text=true if ANY text is visible, even small.\n"
+        "- On memes, quotes and captioned posts the text IS the content: in text_meaning, explain in English "
+        "what it says and what the joke or point is together with the picture. Give text_language, and "
+        "meme_format if it follows a known template or trend.\n"
+        "- Mark watermarks, @handles and platform buttons with purpose 'watermark'.\n\n"
 
         "=== VISUAL ANALYSIS ===\n"
         "- Describe subject, composition, colour palette, lighting, background precisely.\n"
@@ -468,12 +494,13 @@ def analyze_image(path: Path, notify: Notify = _noop_notify) -> ImageAnalysis:
             config=genai_types.GenerateContentConfig(
                 http_options=gemini_http_options(TIMEOUT_IMAGE_SECONDS),
                 response_mime_type="application/json",
-                response_schema=ImageAnalysis,
+                response_schema=_StrictImageAnalysis,
                 temperature=0.4,
                 automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
             ),
         )
-        return _parse_structured(response, ImageAnalysis)
+        strict = _parse_structured(response, _StrictImageAnalysis)
+        return ImageAnalysis.model_validate(strict.model_dump())
 
     return call_gemini(run, notify, task="analysis", label="image-analysis")
 
@@ -528,19 +555,34 @@ def generate_social_metadata_for_image(
     notify: Notify = _noop_notify,
 ) -> SocialMetadata:
     """YouTube + Instagram metadata for the image post (one Gemini call,
-    grounded in Google Search when today's free search quota allows)."""
-    overlay_text = " | ".join(overlay.text for overlay in analysis.text_overlays if overlay.text.strip())
-    context = "\n".join(part for part in [
+    written from Google Search results). The text on the image comes first:
+    on memes and quotes it is the content."""
+    context = image_metadata_context(analysis, plan)
+    return generate_metadata(context, "image", image_metadata_language(analysis), notify)
+
+
+def image_metadata_context(analysis: ImageAnalysis, plan: ImageRecreationPlan) -> str:
+    texts = content_texts([o.text for o in analysis.text_overlays
+                           if "watermark" not in o.purpose.lower() and "hashtag" not in o.purpose.lower()])
+    return "\n".join(part for part in [
         f"Content type: {analysis.content_type} ({analysis.visual_medium})",
+        "Text on the image (the main message -- build the metadata around it): " + " | ".join(texts)
+        if texts else "",
+        f"What the text means / the joke: {analysis.text_meaning.strip()}" if texts and analysis.text_meaning else "",
+        f"Meme format / trend: {analysis.meme_format.strip()}" if analysis.meme_format.strip() else "",
         f"Summary: {analysis.summary.strip()}",
         f"Subject: {analysis.subject.strip()}",
         f"Hook: {analysis.hook.strip()}",
         f"Mood: {analysis.mood.strip()}",
         f"Recreated post title: {plan.title}",
         f"Logline: {plan.logline}",
-        f"Text in the image: {overlay_text}" if overlay_text else "",
     ] if part)
-    return generate_metadata(context, "image", "English", notify)
+
+
+def image_metadata_language(analysis: ImageAnalysis) -> str:
+    """The text's language when the post has text, else English."""
+    language = analysis.text_language.strip()
+    return language if analysis.has_text and language and language.lower() != "none" else "English"
 
 
 # ============================================================================
@@ -648,6 +690,8 @@ def _load_image_cached(sha: str) -> ImageAnalysisResult | None:
         data["from_cache"] = True
         result = ImageAnalysisResult(**data)
         ImageAnalysis.model_validate(result.analysis)
+        if "text_meaning" not in result.analysis:  # cached before text meaning was read: analyse again
+            return None
         return result
     except (OSError, ValueError, TypeError) as exc:
         logger.warning(f"[CACHE] ignoring unreadable image cache {p.name}: {exc}")

@@ -1770,9 +1770,13 @@ class SocialMetadataDraft(BaseModel):
     youtube_description: str = Field(description="YouTube description, 1000-2000 characters.")
     youtube_tags: list[str] = Field(description="30-40 YouTube tags, best first, no '#'.")
     instagram_caption: str = Field(description="Instagram caption without hashtags.")
-    instagram_hashtags: list[str] = Field(description="Exactly 5 niche Instagram hashtags, best first.")
+    instagram_hashtags: list[str] = Field(description="Exactly 5 Instagram hashtags, best first.")
+    trending_now: str = Field(
+        default="",
+        description="1-2 sentences: what is trending right now for this topic (found in search) and which tags "
+                    "came from it.")
 
-    @field_validator("search_insights", mode="before")
+    @field_validator("search_insights", "trending_now", mode="before")
     @classmethod
     def _insights_as_text(cls, value: Any) -> Any:
         # gemini-2.5-flash-lite sometimes sends this as {"youtube_searches": [...], ...}.
@@ -1794,6 +1798,7 @@ class SocialMetadata(BaseModel):
     instagram_caption: str
     instagram_hashtags: str  # space-separated
     primary_keyword: str = ""
+    trending_now: str = ""  # what search found trending for the topic
     grounded: bool = False  # True when Gemini actually ran Google searches for it
     search_queries: list[str] = Field(default_factory=list)
     sources: list[dict[str, str]] = Field(default_factory=list)  # {"title", "uri"}
@@ -2469,11 +2474,15 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> st
             f"2. Look at the titles, descriptions and tags of top-performing recent "
             f"{'Shorts and Reels' if is_video else 'posts'} about it.\n"
             "3. Note the exact search phrases, long-tail variants and currently trending terms.\n"
+            "4. Search what is trending RIGHT NOW around this topic: the meme format or template, a trend, "
+            "challenge, festival, event or news it belongs to, and the hashtags those posts use.\n"
+            "5. If there is text on screen, search its key phrase too: people search memes and quotes by "
+            "their words.\n"
             "Base every keyword on what you found; do not invent trends.\n\n"
         )
         reply = (
             "\nReply with ONLY one JSON object and no other text, with these keys: primary_keyword, "
-            "search_insights, youtube_title, youtube_description, youtube_tags (array of strings), "
+            "search_insights, trending_now, youtube_title, youtube_description, youtube_tags (array of strings), "
             "instagram_caption, instagram_hashtags (array of strings)."
         )
     else:
@@ -2487,6 +2496,12 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> st
         f"{research}"
         "=== LANGUAGE ===\n"
         f"{_metadata_language_rule(language)}\n\n"
+        "=== TEXT ON SCREEN ===\n"
+        "- If the CONTENT below lists text on the image or on screen, that text is usually the main message "
+        "(memes, quotes, captions, jokes). Build the primary keyword, title, caption, tags and hashtags around "
+        "what the text says and its joke or point -- not only around what is seen. Never ignore it.\n"
+        "- Use the text's own key words in the tags (and their English meaning if it is in another language). "
+        "Ignore watermarks, @handles and platform buttons.\n\n"
         "=== YOUTUBE ===\n"
         "- primary_keyword: the single phrase most viewers type to find this.\n"
         f"- youtube_title: max {YOUTUBE_TITLE_MAX} characters, best 50-70. Primary keyword within the "
@@ -2498,16 +2513,19 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> st
         "  3. A call to action (subscribe, or answer a question in the comments).\n"
         f"  4. Last line: {hashtag_line}.\n"
         "- youtube_tags: 30-40 tags, best first: the primary keyword, its close variants, long-tail "
-        "phrases people really search, language variants, and 2-3 broad category tags. 1-5 words "
-        "each, no '#'. The app keeps as many as fit in YouTube's 500-character limit.\n\n"
+        "phrases people really search, the trend / meme format it belongs to, the on-screen text's key "
+        "phrase, language variants, and 2-3 broad category tags. 1-5 words each, no '#'. The app keeps as "
+        "many as fit in YouTube's 500-character limit.\n\n"
         "=== INSTAGRAM ===\n"
         f"- instagram_caption: max {INSTAGRAM_CAPTION_MAX} characters, best 300-800. The first line "
         "(under 125 characters, shown before '...more') holds the hook and the primary keyword, "
         "because Instagram search reads captions. Then 2-4 short lines with natural keywords. End "
         "with a save or share call to action. No hashtags in the caption.\n"
-        f"- instagram_hashtags: exactly {INSTAGRAM_HASHTAGS_MAX}, best first, specific to this "
-        "content's topic, niche and community. Never generic tags such as #viral #reels "
-        "#explorepage #fyp #trending.\n\n"
+        f"- instagram_hashtags: exactly {INSTAGRAM_HASHTAGS_MAX}, best first: 1-2 that are trending right "
+        "now for this topic (the trend, meme format or event your research found), the rest specific to "
+        "the content's topic, niche and community. Never generic tags such as #viral #reels #explorepage "
+        "#fyp #trending -- they bring no reach.\n"
+        "- trending_now: 1-2 sentences on what is trending for this topic and which tags came from it.\n\n"
         "=== CONTENT ===\n"
         f"{context}\n"
         f"{reply}"
@@ -2611,6 +2629,7 @@ def _finish_metadata(
             draft.instagram_hashtags, fill_from=[draft.primary_keyword, *draft.youtube_tags]
         ),
         primary_keyword=draft.primary_keyword.strip(),
+        trending_now=(draft.trending_now or "").strip(),
         grounded=bool(queries or sources),
         search_queries=queries,
         sources=sources,
@@ -2778,6 +2797,31 @@ def generate_metadata(context: str, kind: str, language: str, notify: Notify = _
     return _finish_metadata(draft, kind, queries, sources, model)
 
 
+_NOT_CONTENT_TEXT = re.compile(
+    r"^\s*@|watermark|tiktok|instagram|youtube|subscribe|follow (?:me|us)|username|\bhandle\b|"
+    r"\blike\b.*\bshare\b|^\s*(?:none|n/?a|no text|empty)\.?\s*$", re.IGNORECASE)
+
+
+def content_texts(texts: list[str], limit: int = 900) -> list[str]:
+    """The text on screen that carries the content (meme lines, quotes,
+    captions): watermarks, @handles, platform buttons and blanks dropped,
+    duplicates removed, at most `limit` characters in all."""
+    kept: list[str] = []
+    seen: set[str] = set()
+    used = 0
+    for raw in texts:
+        text = " ".join((raw or "").split())
+        key = text.casefold()
+        if not text or key in seen or _NOT_CONTENT_TEXT.search(text):
+            continue
+        if used + len(text) > limit:
+            break
+        kept.append(text)
+        seen.add(key)
+        used += len(text)
+    return kept
+
+
 def generate_social_metadata(
     result: "AnalysisResult",
     plan: "RecreationPlan",
@@ -2787,14 +2831,19 @@ def generate_social_metadata(
     analysis = VideoAnalysis.model_validate(result.analysis)
     audio = analysis.audio
     speech = " ".join(line.english.strip() for line in audio.transcript)[:600]
+    on_screen = content_texts([scene.on_screen_text for scene in analysis.scenes])
     context = "\n".join(part for part in [
         f"Content type: {analysis.content_type} ({analysis.visual_medium})",
+        "Text on screen (often the main message -- build the metadata around it): " + " | ".join(on_screen)
+        if on_screen else "",
         f"Summary: {analysis.summary.strip()[:400]}",
         f"Hook: {analysis.hook.strip()}",
         f"Why it works: {analysis.why_it_works.strip()[:300]}",
         f"Recreated video title: {plan.title}",
         f"Logline: {plan.logline}",
         f"Mood: {plan.mood}",
+        "Key subjects: " + "; ".join(h.name for h in analysis.hero_subjects) if analysis.hero_subjects else "",
+        f"Settings: {', '.join(analysis.settings)}" if analysis.settings else "",
         f"Spoken language: {audio.spoken_language}" if audio.has_speech else "",
         f"What is said (English meaning): {speech}" if speech else "",
     ] if part)
@@ -2829,6 +2878,8 @@ def render_social_metadata(meta: "SocialMetadata") -> str:
         "#️⃣ HASHTAGS",
         meta.instagram_hashtags,
     ]
+    if meta.trending_now:
+        lines += ["", "📈 TRENDING NOW", meta.trending_now]
     if meta.search_queries:
         lines += ["", "🔎 SEARCHES USED", "; ".join(meta.search_queries)]
     if meta.sources:
@@ -3402,6 +3453,8 @@ def render_social(st, social: "SocialMetadata | None") -> None:
         st.warning("Social metadata generation failed — try regenerating.")
         return
     st.caption(grounding_label(social.search_queries, social.sources, social.model) + ". Edit before posting.")
+    if social.trending_now:
+        st.caption(f"📈 **Trending now:** {social.trending_now}")
     tab_yt, tab_ig = st.tabs(["▶️ YouTube", "📸 Instagram"])
     with tab_yt:
         st.markdown("**📌 Title** — paste into the YouTube title field")

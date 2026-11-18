@@ -18,10 +18,10 @@ from recreate_video import MediaInfo
 REPO = Path(__file__).resolve().parent.parent
 
 
-def idea(start, end, score=80, stands_alone=True, title=None):
+def idea(start, end, score=80, stands_alone=True, title=None, on_screen_text=""):
     return ClipIdea(start_seconds=start, end_seconds=end, title=title or f"clip {start:g}", hook="h", payoff="p",
                     why_it_works="w", what_is_said="said", score=score, stands_alone=stands_alone,
-                    narration="ఈ రహస్య మసాలా రుచిని మార్చేస్తుంది")
+                    on_screen_text=on_screen_text, narration="ఈ రహస్య మసాలా రుచిని మార్చేస్తుంది")
 
 
 def plan(*ideas, count=None):
@@ -74,16 +74,17 @@ class TestFinaliseClips:
         clip, = finalise_clips(plan(idea(20.0, 49.0)), 300, pauses=[(48.0, 49.5)], cuts=[])
         assert clip["end"] == 48.15
 
-    def test_too_long_clip_ends_on_the_last_pause_before_60_s(self):
-        clip, = finalise_clips(plan(idea(10.0, 100.0)), 300, pauses=[(40.0, 40.5), (65.0, 65.5)], cuts=[])
-        assert clip["start"] == 10.0 and clip["end"] == 65.15
+    def test_too_long_clip_ends_on_the_last_pause_before_45_s(self):
+        clip, = finalise_clips(plan(idea(10.0, 100.0)), 300, pauses=[(40.0, 40.5), (52.0, 52.5)], cuts=[])
+        assert clip["start"] == 10.0 and clip["end"] == 52.15
 
-    def test_too_long_without_pauses_is_cut_at_60_s(self):
+    def test_too_long_without_pauses_is_cut_at_45_s(self):
         clip, = finalise_clips(plan(idea(10.0, 100.0)), 300, pauses=[], cuts=[])
-        assert clip["end"] - clip["start"] == 60
+        assert clip["end"] - clip["start"] == 45
 
-    def test_too_short_clip_is_dropped(self):
-        assert finalise_clips(plan(idea(10.0, 18.0)), 300, [], []) == []
+    def test_a_few_seconds_is_a_clip_but_less_is_not(self):
+        assert len(finalise_clips(plan(idea(10.0, 18.0)), 300, [], [])) == 1
+        assert finalise_clips(plan(idea(10.0, 16.0)), 300, [], []) == []
 
     def test_times_past_the_end_are_clamped(self):
         clip, = finalise_clips(plan(idea(270.0, 400.0)), 300, [], [])
@@ -103,10 +104,29 @@ class TestFinaliseClips:
         assert [c["start"] for c in kept] == [10, 100, 200]  # video order
         assert [c["recommended"] for c in kept] == [False, True, False]
 
-    def test_at_most_eight_recommended_and_twelve_kept(self):
-        many = [idea(i * 40.0, i * 40.0 + 30, score=95 - i) for i in range(14)]
-        kept = finalise_clips(plan(*many), 14 * 40, [], [])
-        assert len(kept) == 12 and sum(c["recommended"] for c in kept) == clips.MAX_CLIPS
+    def test_at_most_eight_recommended_plus_three_more(self):
+        many = [idea(i * 100.0, i * 100.0 + 30, score=95 - i) for i in range(14)]
+        kept = finalise_clips(plan(*many), 1800, [], [])
+        assert sum(c["recommended"] for c in kept) == clips.MAX_CLIPS and len(kept) == clips.MAX_CLIPS + 3
+
+
+class TestHowMany:
+    @pytest.mark.parametrize("seconds, count", [(60, 2), (120, 2), (179, 2), (300, 3), (600, 6), (1800, 8)])
+    def test_clip_count_follows_the_length(self, seconds, count):
+        assert clips.max_clips_for(seconds) == count
+
+    def test_two_minute_video_gives_one_or_two_clips_not_the_whole_video(self):
+        # the reported case: four pieces with small gaps covering almost all of a 2-minute video
+        pieces = plan(idea(0, 25, 90), idea(32, 58, 85), idea(65, 90, 80), idea(97, 120, 75))
+        kept = finalise_clips(pieces, 120, [], [])
+        best = [c for c in kept if c["recommended"]]
+        assert 1 <= len(best) <= 2 and sum(c["end"] - c["start"] for c in best) <= 60
+        assert [c["score"] for c in best] == [90, 85]
+
+    def test_recommended_clips_never_cover_more_than_half(self):
+        long_ones = plan(idea(0, 40, 95), idea(50, 90, 90), idea(100, 140, 85))
+        best = [c for c in finalise_clips(long_ones, 150, [], []) if c["recommended"]]
+        assert [c["score"] for c in best] == [95] and sum(c["end"] - c["start"] for c in best) <= 75
 
 
 class TestChopping:
@@ -116,15 +136,18 @@ class TestChopping:
     def test_two_halves_of_a_short_video_are_chopping(self):
         assert clips.looks_chopped([(2, 60), (62, 118)], 120)
 
+    def test_small_gaps_still_count_when_most_of_the_video_is_used(self):
+        assert clips.looks_chopped([(0, 25), (32, 58), (65, 90), (97, 120)], 120)
+
     def test_separate_moments_are_not(self):
         assert not clips.looks_chopped([(20, 50), (300, 340), (600, 640)], 900)
         assert not clips.looks_chopped([(10, 40)], 120)
 
     def test_chopped_answer_keeps_only_separate_best_moments(self):
         pieces = plan(idea(0, 30, 70), idea(30, 60, 92), idea(60, 90, 75), idea(90, 120, 80))
-        kept = finalise_clips(pieces, 120, [], [])
-        assert [(c["start"], c["score"]) for c in kept] == [(30, 92), (90, 80)]
-        assert not clips.looks_chopped([(c["start"], c["end"]) for c in kept], 120)
+        best = [c for c in finalise_clips(pieces, 120, [], []) if c["recommended"]]
+        assert [(c["start"], c["score"]) for c in best] == [(30, 92), (90, 80)]
+        assert not clips.looks_chopped([(c["start"], c["end"]) for c in best], 120)
 
 
 class TestGeminiRequest:
@@ -149,17 +172,18 @@ class TestGeminiRequest:
     def test_prompt_gives_pauses_cuts_and_length(self):
         media = MediaInfo(duration_seconds=600, width=1280, height=720, has_audio=True, aspect_ratio="16:9")
         prompt = clips._clip_prompt(media, [(10.0, 11.0)], [42.04])
-        assert "600-second" in prompt and "15-60 seconds" in prompt
+        assert "600-second" in prompt and "8-45 seconds" in prompt and "at most 6 for this video" in prompt
+        assert "under half of its length" in prompt and "on_screen_text" in prompt
         assert "Speech pauses (seconds): 10.5" in prompt and "Shot changes: 42.0" in prompt
         assert "recommended_count" in prompt and "Never name real people" in prompt
-        assert "NEVER split the video into consecutive pieces" in prompt and "0 or 1 clip" not in prompt
+        assert "NEVER split the video into consecutive pieces" in prompt and "1 or 2 short clips" not in prompt
         assert "NEW voice-over" in prompt and "Never repeat, translate or closely paraphrase" in prompt
         assert "te 1.4" in prompt and "IMPORTANT" not in prompt
 
     def test_short_video_and_correction(self):
         media = MediaInfo(duration_seconds=120, width=1280, height=720, has_audio=True, aspect_ratio="16:9")
         prompt = clips._clip_prompt(media, [], [], clips.CHOPPED_FIX)
-        assert "0 or 1 clip is normal" in prompt and "IMPORTANT: Your previous answer split the video" in prompt
+        assert "1 or 2 short clips at most" in prompt and "IMPORTANT: Your previous answer split the video" in prompt
 
     def test_metadata_context_is_about_one_clip(self):
         clip = {**idea(10, 40).model_dump(), "start": 10.0, "end": 40.0, "title": "Secret spice"}
@@ -168,6 +192,15 @@ class TestGeminiRequest:
         assert "New voice-over of the clip: ఈ రహస్య" in context
         silent = plan().model_copy(update={"spoken_language": "none"})
         assert "Spoken language" not in clips.metadata_context({**clip, "what_is_said": ""}, silent)
+        assert "Text on screen" not in context
+
+    def test_metadata_context_leads_with_the_text_on_screen(self):
+        clip = {**idea(10, 40, on_screen_text="When mom says 5 minutes").model_dump(), "start": 10.0, "end": 40.0}
+        context = clips.metadata_context(clip, plan())
+        assert context.splitlines()[1].startswith("Text on screen (often the main message")
+        assert "When mom says 5 minutes" in context
+        watermark = {**clip, "on_screen_text": "@foodie_channel"}
+        assert "Text on screen" not in clips.metadata_context(watermark, plan())
 
 
 class FakeClient:
@@ -413,6 +446,7 @@ def test_whole_flow_from_link_to_clips_with_their_own_metadata(page):
     assert any("Gemini recommends 2 clip(s)" in m.value for m in app.markdown)
     takes = [c for c in app.checkbox if "score" in c.label]
     assert [c.value for c in takes] == [True, True, False]  # recommended ones are ticked
+    assert any(e.label == "Show 1 more possible clip(s) (not recommended)" for e in app.expander)
 
     assert any("orange = recommended" in m.value for m in app.markdown)  # the timeline
     assert any("Language: Telugu" in c.value for c in app.caption)

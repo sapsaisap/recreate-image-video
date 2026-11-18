@@ -1759,6 +1759,44 @@ class RecreationPlan(BaseModel):
 
 
 
+class TrendingAudio(BaseModel):
+    """A sound to post with: found trending / widely used with Google Search."""
+
+    track: str = ""
+    artist: str = ""
+    language: str = ""
+    search_query: str = ""  # what to type into Instagram / YouTube audio search
+    why: str = ""  # how it fits this meme / video, and where it is trending
+
+    @property
+    def label(self) -> str:
+        return " — ".join(part for part in (self.track, self.artist) if part)
+
+
+def _audio_list(value: Any) -> list[dict]:
+    """Gemini's trending_audio, tolerant of the shapes 2.5-flash-lite sends:
+    one object, plain strings, or other key names."""
+    if isinstance(value, (dict, str)):
+        value = [value]
+    items = []
+    for item in value if isinstance(value, list) else []:
+        if isinstance(item, str):
+            item = {"track": item}
+        if not isinstance(item, dict):
+            continue
+        get = lambda *keys: next((str(item[k]).strip() for k in keys if item.get(k)), "")  # noqa: E731
+        audio = {"track": get("track", "track_name", "title", "song", "name", "sound"),
+                 "artist": get("artist", "artist_name", "singer", "by"),
+                 "language": get("language"),
+                 "search_query": get("search_query", "instagram_search_query", "search", "query"),
+                 "why": get("why", "reason", "why_it_fits", "mood_match")}
+        if audio["track"] and not re.fullmatch(r"(?i)\s*original (?:sound|audio)\b.*", audio["track"]):
+            audio["search_query"] = audio["search_query"] or " ".join(
+                part for part in (audio["track"], audio["artist"]) if part)
+            items.append(audio)
+    return items[:3]
+
+
 class SocialMetadataDraft(BaseModel):
     """What Gemini writes; _finish_metadata turns it into SocialMetadata."""
 
@@ -1775,6 +1813,14 @@ class SocialMetadataDraft(BaseModel):
         default="",
         description="1-2 sentences: what is trending right now for this topic (found in search) and which tags "
                     "came from it.")
+    trending_audio: list[TrendingAudio] = Field(
+        default_factory=list,
+        description="2-3 sounds trending or widely used right now on Reels / Shorts for this content, best first.")
+
+    @field_validator("trending_audio", mode="before")
+    @classmethod
+    def _audio_shapes(cls, value: Any) -> Any:
+        return _audio_list(value)
 
     @field_validator("search_insights", "trending_now", mode="before")
     @classmethod
@@ -1799,6 +1845,7 @@ class SocialMetadata(BaseModel):
     instagram_hashtags: str  # space-separated
     primary_keyword: str = ""
     trending_now: str = ""  # what search found trending for the topic
+    trending_audio: list[TrendingAudio] = Field(default_factory=list)  # sounds found with Google Search
     grounded: bool = False  # True when Gemini actually ran Google searches for it
     search_queries: list[str] = Field(default_factory=list)
     sources: list[dict[str, str]] = Field(default_factory=list)  # {"title", "uri"}
@@ -2446,6 +2493,16 @@ GENERIC_HASHTAGS = frozenset({
     "#trending", "#instagood", "#reelsinstagram", "#viralreels", "#viralvideo", "#reelitfeelit",
 })
 
+def _audio_rule(language: str) -> str:
+    """Which language the recommended sounds should be in."""
+    if _is_english(language):
+        return ("- The content is in English or has no language: pick the sounds trending worldwide for it, "
+                "which are usually English.")
+    return (f"- The content is in {language}: most viewers are {language} speakers, so pick trending "
+            f"{language} songs and sounds first (at least 2 of the 3). Add an English or global sound only "
+            "if it is a well-known trending sound for this meme format.")
+
+
 def _metadata_language_rule(language: str) -> str:
     if _is_english(language) or CONFIG.metadata_language == "english":
         return "- Write everything in English."
@@ -2478,12 +2535,16 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> st
             "challenge, festival, event or news it belongs to, and the hashtags those posts use.\n"
             "5. If there is text on screen, search its key phrase too: people search memes and quotes by "
             "their words.\n"
+            "6. Search which sounds / songs are trending or widely used RIGHT NOW on Instagram Reels and "
+            "YouTube Shorts for this kind of content: the sound that goes with this meme format, or the songs "
+            "creators use for this topic.\n"
             "Base every keyword on what you found; do not invent trends.\n\n"
         )
         reply = (
             "\nReply with ONLY one JSON object and no other text, with these keys: primary_keyword, "
             "search_insights, trending_now, youtube_title, youtube_description, youtube_tags (array of strings), "
-            "instagram_caption, instagram_hashtags (array of strings)."
+            "instagram_caption, instagram_hashtags (array of strings), trending_audio (array of objects with "
+            "track, artist, language, search_query, why)."
         )
     else:
         research = "=== KEYWORDS ===\nUse what you know people search on YouTube and Instagram for this topic.\n\n"
@@ -2526,6 +2587,13 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> st
         "the content's topic, niche and community. Never generic tags such as #viral #reels #explorepage "
         "#fyp #trending -- they bring no reach.\n"
         "- trending_now: 1-2 sentences on what is trending for this topic and which tags came from it.\n\n"
+        "=== AUDIO ===\n"
+        f"{_audio_rule(language)}\n"
+        "- trending_audio: 2-3 real sounds your search found trending or widely used right now, best first. "
+        "Each must fit THIS meme or video -- its joke, mood, topic and energy -- not just be popular. For a "
+        "meme, the sound that goes with its format comes first. track and artist exactly as on Instagram; "
+        "search_query is what to type into Instagram audio search; why says how it fits and where it is "
+        "trending. Name real tracks or named viral sounds -- never 'Original Sound' -- and never invent one.\n\n"
         "=== CONTENT ===\n"
         f"{context}\n"
         f"{reply}"
@@ -2630,6 +2698,7 @@ def _finish_metadata(
         ),
         primary_keyword=draft.primary_keyword.strip(),
         trending_now=(draft.trending_now or "").strip(),
+        trending_audio=draft.trending_audio,
         grounded=bool(queries or sources),
         search_queries=queries,
         sources=sources,
@@ -2880,6 +2949,11 @@ def render_social_metadata(meta: "SocialMetadata") -> str:
     ]
     if meta.trending_now:
         lines += ["", "📈 TRENDING NOW", meta.trending_now]
+    if meta.trending_audio:
+        lines += ["", "🎵 TRENDING AUDIO (found with Google Search)"]
+        for audio in meta.trending_audio:
+            lines.append(f"- {audio.label}" + (f" [{audio.language}]" if audio.language else "")
+                         + f" — search: {audio.search_query}" + (f" — {audio.why}" if audio.why else ""))
     if meta.search_queries:
         lines += ["", "🔎 SEARCHES USED", "; ".join(meta.search_queries)]
     if meta.sources:
@@ -3478,12 +3552,24 @@ def render_social(st, social: "SocialMetadata | None") -> None:
         )
         with st.expander("Hashtags only (e.g. for the first comment)"):
             _show_copyable(st, social.instagram_hashtags)
+    render_trending_audio(st, social)
     if social.search_queries or social.sources:
         with st.expander("Searches and sources used"):
             if social.search_queries:
                 st.markdown("**Searches:** " + "; ".join(social.search_queries))
             for source in social.sources:
                 st.markdown(f"- [{source['title']}]({source['uri']})")
+
+
+def render_trending_audio(st, social: "SocialMetadata | None") -> None:
+    """The sounds Google Search found trending for this content."""
+    if not social or not social.trending_audio:
+        return
+    st.markdown("**🎵 Trending audio** — found with Google Search; pick one in the Instagram / YouTube app")
+    for audio in social.trending_audio:
+        st.markdown(f"- **{audio.label}**" + (f" · {audio.language}" if audio.language else "")
+                    + (f"  \n  {audio.why}" if audio.why else ""))
+        _show_copyable(st, audio.search_query)
 
 
 def render_social_or_generate(st, social: "SocialMetadata | None", key: str,
@@ -4129,6 +4215,8 @@ def _render_image_results(st, is_image_mode: bool) -> None:
             _show_copyable(st, plan.negative_prompt)
         with tab_audio:
             st.subheader("Recommended Audio")
+            render_trending_audio(st, gen.social_metadata)
+            st.caption("Trending sounds for this post, found with Google Search, are in the Social Media tab. The ones below are Gemini's own pick, not checked with search.")
             audio = plan.suggested_audio
             with st.container(border=True):
                 st.markdown(f"**{audio.track_name}** by {audio.artist_name}")

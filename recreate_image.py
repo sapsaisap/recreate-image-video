@@ -53,6 +53,7 @@ from recreate_video import (
     js_runtimes,
     safe_get,
     render_social,
+    render_trending_audio,
     render_social_metadata,
     validate_public_video_url,
     URLVideoError,
@@ -362,8 +363,11 @@ def _analysis_prompt_image() -> str:
         "- Identify the content_type (quote_card, meme, aesthetic, etc.).\n\n"
 
         "=== AUDIO RECOMMENDATION ===\n"
-        "- Suggest the BEST real, known song to use as audio when posting as an Instagram Reel.\n"
-        "- The track must match the mood, energy, and content type exactly.\n"
+        "- Suggest the BEST real, widely used song or sound to use as audio when posting as an Instagram Reel.\n"
+        "- It must fit what the image and its text are about (the joke, topic, mood and energy), not just be "
+        "popular. For a meme, use the sound that goes with its format if there is one.\n"
+        "- If the text is in another language, pick a popular song in that language; English only for English "
+        "or text-free images.\n"
         "- Provide an alternative in case the primary is unavailable.\n"
         "- Give the exact Instagram audio search query for each.\n\n"
 
@@ -1004,6 +1008,8 @@ def run_app() -> None:
 
         with tab_audio:
             st.subheader("Recommended Audio for Instagram Reel")
+            render_trending_audio(st, generated.social_metadata)
+            st.caption("Trending sounds for this post, found with Google Search, are in the Social Media tab. The ones below are Gemini's own pick, not checked with search.")
             audio = plan.suggested_audio
             with st.container(border=True):
                 st.markdown(f"**Primary: {audio.track_name}** by {audio.artist_name}")

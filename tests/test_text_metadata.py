@@ -120,3 +120,51 @@ class TestPromptAndTrending:
         assert rv.SocialMetadata.model_validate({"youtube_title": "t", "youtube_description": "d",
                                                  "youtube_tags": "", "instagram_caption": "c",
                                                  "instagram_hashtags": ""}).trending_now == ""
+
+
+class TestTrendingAudio:
+    def test_sounds_follow_the_contents_language(self):
+        telugu = rv._metadata_prompt("Content: recipe", "video", "Telugu", search=True)
+        assert "pick trending Telugu songs and sounds first (at least 2 of the 3)" in telugu
+        english = rv._metadata_prompt("Content: meme", "image", "English", search=True)
+        assert "trending worldwide" in english and "trending Telugu" not in english
+
+    def test_prompt_asks_for_sounds_that_fit_and_are_searched(self):
+        prompt = rv._metadata_prompt("Content: meme", "image", "English", search=True)
+        assert "sounds / songs are trending or widely used RIGHT NOW" in prompt
+        assert "fit THIS meme or video" in prompt and "the sound that goes with its format comes first" in prompt
+        assert "trending_audio (array of objects" in prompt and "never 'Original Sound'" in prompt
+
+    def test_gemini_shapes_are_accepted(self):
+        def draft(audio):
+            return rv.SocialMetadataDraft(primary_keyword="k", search_insights="x", youtube_title="t",
+                                          youtube_description="d", youtube_tags=[], instagram_caption="c",
+                                          instagram_hashtags=[], trending_audio=audio)
+        full = draft([{"track_name": "Kurchi Madathapetti", "artist_name": "Thaman S", "language": "Telugu",
+                       "reason": "used on most Telugu food reels"}, "Monkey Spinning Monkeys", {"artist": "x"},
+                      {"track": "a"}, {"track": "b"}])
+        assert [a.track for a in full.trending_audio] == ["Kurchi Madathapetti", "Monkey Spinning Monkeys", "a"]
+        first = full.trending_audio[0]
+        assert first.search_query == "Kurchi Madathapetti Thaman S" and first.why.startswith("used on")
+        assert draft({"song": "Oh No", "by": "Capone"}).trending_audio[0].label == "Oh No — Capone"
+        assert draft(None).trending_audio == [] and draft("").trending_audio == []
+        assert draft([{"track": "Original Sound - me at 3am"}, "original audio"]).trending_audio == []
+
+    def test_kept_shown_and_old_metadata_still_loads(self):
+        draft = rv.SocialMetadataDraft(primary_keyword="k", search_insights="x", youtube_title="t",
+                                       youtube_description="d", youtube_tags=[], instagram_caption="c",
+                                       instagram_hashtags=[], trending_audio=[
+                                           {"track": "Oh No", "artist": "Capone", "language": "English",
+                                            "search_query": "oh no oh no", "why": "the classic fail meme sound"}])
+        meta = rv._finish_metadata(draft, "image", ["q"], [])
+        text = rv.render_social_metadata(meta)
+        assert "🎵 TRENDING AUDIO" in text and "- Oh No — Capone [English] — search: oh no oh no" in text
+        assert rv.SocialMetadata.model_validate_json(meta.model_dump_json()).trending_audio[0].track == "Oh No"
+        old = rv.SocialMetadata.model_validate({"youtube_title": "t", "youtube_description": "d",
+                                                "youtube_tags": "", "instagram_caption": "c",
+                                                "instagram_hashtags": ""})
+        assert old.trending_audio == [] and "TRENDING AUDIO" not in rv.render_social_metadata(old)
+
+    def test_image_pick_follows_the_text_and_its_language(self):
+        prompt = ri._analysis_prompt_image()
+        assert "fit what the image and its text are about" in prompt and "popular song in that language" in prompt

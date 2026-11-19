@@ -3803,7 +3803,7 @@ def _render_quota_sidebar(st) -> None:
 
 
 APP_MODULES = ("recreate_video", "recreate_image", "image_to_video", "summary_short", "clips", "voiceover",
-               "slideshow")
+               "slideshow", "upscale")
 
 
 def drop_stale_app_modules() -> list[str]:
@@ -3856,7 +3856,7 @@ def run_app() -> None:
         st.markdown("## 🎬 Recreate")
         mode = st.radio(
             "What are you recreating?",
-            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE, CLIPS_MODE],
+            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE, CLIPS_MODE, UPSCALE_MODE],
             key="app_mode",
         )
         st.selectbox("Trending audio language", AUDIO_LANGUAGES, key=AUDIO_LANGUAGE_KEY,
@@ -3885,6 +3885,11 @@ def run_app() -> None:
         from clips import render_page as render_clips_page
 
         render_clips_page(st)
+        return
+    if mode == UPSCALE_MODE:  # Real-ESRGAN / ffmpeg only, no Gemini key needed
+        from upscale import render_page as render_upscale_page
+
+        render_upscale_page(st)
         return
 
     is_image_mode = mode == IMAGE_MODE
@@ -4049,6 +4054,7 @@ VIDEO_MODE = "🎬 Video / Reel"
 IMAGE_TO_VIDEO_MODE = "🎞️ Image to Video"
 SUMMARY_MODE = "📝 Summarise to Short"
 CLIPS_MODE = "✂️ Clips from long video"
+UPSCALE_MODE = "🔍 Upscale to 1080"
 
 
 def _analyze_image_link(st, url: str) -> None:

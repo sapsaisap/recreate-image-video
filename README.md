@@ -105,6 +105,11 @@ Paste a YouTube / Instagram link or upload a video of 8 seconds to 30 minutes (`
 
 A new voice-over removes the original voice and music, but the picture is still the creator's footage, and YouTube / Instagram match video too. Post clips only of videos you own or have rights to; for someone else's video, Summarise to Short (AI images) is the safer choice.
 
+#### Upscale to 1080
+Upload a low-quality image or video and get it back with its short side at 1080 pixels (1080x1920 for 9:16, 1080x1350 for 4:5, 1080x1080 square, 1920x1080 landscape), the same shape, nothing cropped. No Gemini call.
+- **Image**: Real-ESRGAN (`realesr-general-x4v3`, BSD-3-Clause, converted from the official weights to `models/realesr-general-x4v3.onnx`, 4.9 MB) runs on the CPU with `onnxruntime`, in overlapping tiles so memory stays small. It removes blur and JPEG blocks and sharpens edges; a 270x480 image takes about a second. Images already bigger than 1080 are resized down; transparency is kept (PNG). If the model cannot load, a lanczos resize with light sharpening is used.
+- **Video** (up to 3 minutes): ffmpeg lanczos resize, light noise removal and light sharpening, sound kept. Running the AI on every frame would take far too long on a CPU, so this makes a video clean at 1080 but cannot add detail that is not there.
+
 #### Free tier only
 The app is built for a **free** Gemini key and accepts only free-tier models
 (`gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`,
@@ -140,6 +145,9 @@ python recreate_video.py --url "https://www.youtube.com/shorts/YOUR_VIDEO_ID" --
 ├── recreate_video.py              # Main unified Streamlit app & video recreation pipeline
 ├── recreate_image.py              # Image analysis, multi-model prompt generation & Canva workflows
 ├── image_to_video.py              # Still image -> 9:16 MP4 with ffmpeg (no Gemini)
+├── clips.py                       # Clips from a long video: Gemini picks, ffmpeg cuts, new voice-over
+├── upscale.py                     # Upscale to 1080: Real-ESRGAN (onnxruntime) for images, ffmpeg for video
+├── models/                        # realesr-general-x4v3.onnx (Real-ESRGAN, BSD-3-Clause)
 ├── summary_short.py               # Summarise to Short: analysis, script, 5-step page
 ├── voiceover.py                   # Edge TTS voice-over fitted to a target length
 ├── slideshow.py                   # Images + voice -> 9:16 MP4 with motion and crossfades

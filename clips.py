@@ -1,9 +1,10 @@
 """Clips from a long video: Gemini watches the whole video once and
 recommends the moments worth posting on their own as YouTube Shorts /
 Instagram Reels; ffmpeg cuts the picture from the real footage. The
-original sound (voice and music) is never used: every clip gets a new
+original voice and music are never used: every clip gets a new
 narration written by Gemini in its own words, read by Edge TTS, with
-optional background music the user uploads.
+optional background music the user uploads; only sound effects heard with
+no music or speech (water, engines...) are kept from the source.
 
 Flow (one Streamlit page, three stages):
   1. input   link or upload (max CLIPS_MAX_VIDEO_SECONDS, 30 min) -> speech
@@ -76,6 +77,8 @@ CHOP_GAP_SECONDS = 5.0  # clips closer than this count as "next to each other"
 SHORT_SOURCE_SECONDS = 180  # below this: at most 2 clips
 TINY_SOURCE_SECONDS = 30  # below this: 1 clip, which may be the whole video
 MUSIC_VOLUME = 0.12  # background music under the voice
+SFX_VOLUME = 0.6  # the source's own sound effects, under the voice
+SFX_FADE_SECONDS = 0.15  # fade in / out at the edges of each kept moment
 NARRATION_SHARE = 0.85  # narration fills ~85% of the clip, leaving breathing room
 CHOPPED_FIX = (
     "Your previous answer split the video into consecutive back-to-back pieces. That is wrong: do not cover "
@@ -88,6 +91,12 @@ CHOPPED_FIX = (
 # ============================================================================
 # What Gemini returns
 # ============================================================================
+
+class SoundMoment(BaseModel):
+    start_seconds: float
+    end_seconds: float
+    sound: str = Field(description="What is heard, e.g. 'water splashing', 'bike engine revving'.")
+
 
 class ClipIdea(BaseModel):
     start_seconds: float
@@ -109,6 +118,10 @@ class ClipIdea(BaseModel):
         description="A NEW voice-over for the clip in your own words, in the video's spoken language and its own "
                     "script (English if nobody speaks), sized to the clip's length. It replaces the original "
                     "sound completely.")
+    sound_effects: list[SoundMoment] = Field(
+        description="Moments inside the clip with a real sound effect (water, engine, sizzle, door, footsteps, "
+                    "crowd...) and NO music and NO speech at all, in seconds from the video's start. [] if none, "
+                    "or if music or speech is under them. Only these are kept from the original sound.")
 
 
 class ClipPlan(BaseModel):
@@ -293,12 +306,16 @@ def _clip_prompt(media: MediaInfo, pauses: list[tuple[float, float]], cuts: list
         f"- Times are seconds from the start, between 0 and {media.duration_seconds:.0f}. Start and end at "
         f"speech pauses or shot changes. Speech pauses (seconds): {pause_times}. Shot changes: {cut_times}.\n"
         "- on_screen_text: the text shown during the clip, word for word (it matters for memes and captions).\n"
-        "- narration: the original sound (voice and music) is removed from the clip, so write a NEW voice-over "
+        "- narration: the original voice and music are removed from the clip, so write a NEW voice-over "
         "in your own words that tells what happens in the clip: open on the hook, end on the payoff. Never "
         "repeat, translate or closely paraphrase what is said in the video, and quote no song lyrics. Write it "
         "in the spoken language and its own script (English if nobody speaks). Size it to the clip: about "
         f"{NARRATION_SHARE:.0%} of (clip seconds x words per second); words per second by language: {rates}, "
         "others 2.0. Plain spoken sentences, no hashtags or emojis, no 'like and subscribe'.\n"
+        "- sound_effects: inside each clip, the moments with a real sound effect (water, bike or car engine, "
+        "sizzle, door, footsteps, crowd...) and NO music and NO speech at all -- only those are kept from the "
+        "original sound, quietly under the voice-over. Leave out any moment with even quiet music or speech "
+        "under it (copyright); [] if none.\n"
         "- source_music: if the video's music is a recognisable song, its title, artist and film (used only "
         "to recommend trending audio; it is never put in the clip).\n"
         "- Never name real people; describe them by appearance or role. Ignore platform UI and watermarks.\n"
@@ -401,24 +418,49 @@ def video_filter(media: MediaInfo) -> str:
             f"[fg0]scale=1080:-2:{SHARP_SCALE}{sharpen}[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30[v]")
 
 
+def sfx_windows(clip: dict, start: float, end: float) -> list[tuple[float, float]]:
+    """The clip's sound-effect moments that fall inside [start, end], as
+    (from, to) seconds from the clip's start; moments under 0.3 s are dropped."""
+    windows = []
+    for moment in clip.get("sound_effects") or []:
+        a = max(start, float(moment["start_seconds"])) - start
+        b = min(end, float(moment["end_seconds"])) - start
+        if b - a >= 0.3:
+            windows.append((round(a, 2), round(b, 2)))
+    return sorted(windows)
+
+
+def sfx_gain(windows: list[tuple[float, float]]) -> str:
+    """ffmpeg volume expression: 1 inside the windows (with short fades), 0
+    everywhere else."""
+    f = SFX_FADE_SECONDS
+    parts = [f"max(0,min(1,(t-{a:g})/{f:g}))*max(0,min(1,({b:g}-t)/{f:g}))" for a, b in windows]
+    return f"min(1,{'+'.join(parts)})" if parts else "0"
+
+
 def render_clip(source: Path, media: MediaInfo, start: float, end: float, output: Path,
-                voice: Path, music: Path | None = None) -> Path:
+                voice: Path, music: Path | None = None, sfx: list[tuple[float, float]] | None = None) -> Path:
     """One 1080x1920 clip: vertical footage is filled, landscape footage sits
-    on a blurred copy of itself. The source's own sound is never used: the
-    audio is the new voice-over, with the music (looped, quiet) under it if
-    given, normalised to -14 LUFS."""
+    on a blurred copy of itself. The audio is the new voice-over, with the
+    music (looped, quiet) under it if given, normalised to -14 LUFS. The
+    source's own sound is used only inside the `sfx` windows (seconds from
+    the clip's start: sound effects with no music or speech), faded at the
+    edges and silent everywhere else."""
     length = max(1.0, end - start)
     inputs = ["-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(source), "-i", str(voice)]
     if music is not None:
         inputs += ["-stream_loop", "-1", "-i", str(music)]
     video = video_filter(media)
     loudness = "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000"
-    voice_chain = "[1:a]aresample=48000,aformat=channel_layouts=stereo,apad"
+    stereo = "aresample=48000,aformat=channel_layouts=stereo"
+    beds = [f"[1:a]{stereo},apad[vo]"]
     if music is not None:
-        audio = (f"{voice_chain}[vo];[2:a]aresample=48000,aformat=channel_layouts=stereo,"
-                 f"volume={MUSIC_VOLUME}[bg];[vo][bg]amix=inputs=2:duration=first:normalize=0,{loudness}[a]")
-    else:
-        audio = f"{voice_chain},{loudness}[a]"
+        beds.append(f"[2:a]{stereo},volume={MUSIC_VOLUME}[bg]")
+    if sfx and media.has_audio:
+        beds.append(f"[0:a]{stereo},volume='{SFX_VOLUME}*{sfx_gain(sfx)}':eval=frame,apad[fx]")
+    labels = "".join(bed[bed.rindex("["):] for bed in beds)
+    mix = (f"{labels}amix=inputs={len(beds)}:duration=first:normalize=0," if len(beds) > 1 else "[vo]")
+    audio = ";".join(beds) + f";{mix}{loudness}[a]"
     command = [ffmpeg_exe(), "-y", "-hide_banner", "-loglevel", "error", *inputs,
                "-filter_complex", f"{video};{audio}", "-map", "[v]", "-map", "[a]",
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
@@ -489,8 +531,9 @@ def _page_input(st) -> None:
     st.caption(
         f"Paste a YouTube / Instagram link or upload a video (up to {limit_min:.0f} minutes). Gemini watches it "
         "once and recommends the moments worth posting as Shorts / Reels; the picture is cut from the real "
-        "footage with ffmpeg. The original sound is never used: each clip gets a new voice-over written by "
-        "Gemini, with optional music you upload."
+        "footage with ffmpeg. The original voice and music are never used: each clip gets a new voice-over "
+        "written by Gemini, with optional music you upload, and only sound effects (water, engines...) where "
+        "no music or speech plays are kept from the video."
     )
     st.info("A new voice-over removes the original voice and music, but the picture is still the creator's "
             "footage, and YouTube / Instagram also match video. Post clips only of videos you own or have the "
@@ -572,7 +615,7 @@ def _page_pick(st) -> None:
     if clips and not recommended:
         st.warning("No clip is strong enough to recommend. The possible ones are below if you want to try them.")
     language = narration_language(plan)
-    st.markdown("**New voice-over** (the original sound is not used)")
+    st.markdown("**New voice-over** (the original voice and music are not used)")
     voice = _voice_picker(st, language)
     music = st.file_uploader("Background music (optional, quiet under the voice) -- only music you have rights "
                              "to, e.g. from the YouTube Audio Library", type=["mp3", "wav", "m4a", "aac", "ogg"],
@@ -595,7 +638,7 @@ def _page_pick(st) -> None:
         st.warning(f"'{clip['title']}': end must be 3-180 s after start.")
     silent = [c for c in chosen if not c["narration"]]
     for clip in silent:
-        st.warning(f"'{clip['title']}': write a voice-over -- the original sound is not used.")
+        st.warning(f"'{clip['title']}': write a voice-over -- the original voice and music are not used.")
     left, right = st.columns(2)
     if right.button("Start over", key=_key(st, "restart")):
         _start_over(st)
@@ -625,8 +668,18 @@ def _clip_card(st, index: int, clip: dict, media: MediaInfo, language: str, chos
         budget = round(max(0.0, end - start) * words_per_second(language) * NARRATION_SHARE)
         st.caption(f"{len(narration.split())} words · about {budget} fit in {max(0.0, end - start):.0f} s "
                    "(the voice is sped up or slowed down a little to fit)")
+        moments = sfx_windows(clip, start, end)
+        keep_sfx = False
+        if moments and media.has_audio:
+            sounds = ", ".join(f"{m['sound']} ({_clock(m['start_seconds'])})" for m in clip["sound_effects"]
+                               if sfx_windows({"sound_effects": [m]}, start, end))
+            keep_sfx = st.checkbox(f"Keep sound effects from the video: {sounds}", value=True,
+                                   key=_key(st, f"sfx_{index}"),
+                                   help="Only these moments of the original sound, where Gemini heard no music "
+                                        "or speech, quietly under the voice-over. Untick if you hear music.")
         if take:
-            chosen.append({**clip, "index": index, "start": start, "end": end, "narration": narration.strip()})
+            chosen.append({**clip, "index": index, "start": start, "end": end, "narration": narration.strip(),
+                           "keep_sfx": keep_sfx})
 
 
 def narration_language(plan: ClipPlan) -> str:
@@ -701,8 +754,10 @@ def _render_chosen(st, chosen: list[dict], media: MediaInfo, voice, music_upload
                 voice_path.write_bytes(audio)
                 output = job / f"clip_{number:02d}_{int(clip['start'])}s.mp4"
                 status.update(label=f"{label} -- rendering")
-                render_clip(Path(state["video"]), media, clip["start"], clip["end"], output, voice_path, music)
-                rendered[str(clip["index"])] = {**clip, "path": str(output), "music": music is not None}
+                sfx = sfx_windows(clip, clip["start"], clip["end"]) if clip.get("keep_sfx") else []
+                render_clip(Path(state["video"]), media, clip["start"], clip["end"], output, voice_path, music, sfx)
+                rendered[str(clip["index"])] = {**clip, "path": str(output), "music": music is not None,
+                                                "sfx": len(sfx)}
             except (ClipRenderError, voiceover.VoiceoverError) as exc:
                 st.error(f"Clip {number} ({clip['title']}): {exc}")
         status.update(label=f"{len(rendered)} clip(s) ready", state="complete" if rendered else "error",

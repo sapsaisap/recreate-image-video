@@ -12,3 +12,5 @@ imageio-ffmpeg>=0.5
 # Free Microsoft Edge text-to-speech for Summarise to Short. 7.3.1+ is required:
 # older releases send an outdated Edge version and get HTTP 403 (checked Nov 2026).
 edge-tts>=7.3.1
+# Upscale to 1080: runs the Real-ESRGAN model in models/ on the CPU (free, ~15 MB, no PyTorch).
+onnxruntime>=1.20

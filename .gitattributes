@@ -1,0 +1,2 @@
+# Model files are binary: never convert line endings
+*.onnx binary

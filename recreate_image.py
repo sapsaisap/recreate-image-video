@@ -156,6 +156,11 @@ class ImageAnalysis(BaseModel):
         default="",
         description="The meme template, format or trend this follows, if any (e.g. 'Drake hotline bling', "
                     "'expectation vs reality', 'POV'); '' if none.")
+    audience_language: str = Field(
+        default="",
+        description="Language of the people this post is for, as an English name, from its text, script, "
+                    "people, place, food or culture (e.g. a Telugu movie meme or Hyderabadi biryani -> "
+                    "'Telugu'); 'English' if it is global.")
 
 
 class _StrictImageAnalysis(ImageAnalysis):
@@ -164,6 +169,7 @@ class _StrictImageAnalysis(ImageAnalysis):
     text_meaning: str = Field(description=ImageAnalysis.model_fields["text_meaning"].description)
     text_language: str = Field(description=ImageAnalysis.model_fields["text_language"].description)
     meme_format: str = Field(description=ImageAnalysis.model_fields["meme_format"].description)
+    audience_language: str = Field(description=ImageAnalysis.model_fields["audience_language"].description)
 
 
 class ImageRecreationPlan(BaseModel):
@@ -366,8 +372,8 @@ def _analysis_prompt_image() -> str:
         "- Suggest the BEST real, widely used song or sound to use as audio when posting as an Instagram Reel.\n"
         "- It must fit what the image and its text are about (the joke, topic, mood and energy), not just be "
         "popular. For a meme, use the sound that goes with its format if there is one.\n"
-        "- If the text is in another language, pick a popular song in that language; English only for English "
-        "or text-free images.\n"
+        "- Pick a popular song in the audience's language (audience_language); English only when the post is "
+        "global.\n"
         "- Provide an alternative in case the primary is unavailable.\n"
         "- Give the exact Instagram audio search query for each.\n\n"
 
@@ -562,7 +568,8 @@ def generate_social_metadata_for_image(
     written from Google Search results). The text on the image comes first:
     on memes and quotes it is the content."""
     context = image_metadata_context(analysis, plan)
-    return generate_metadata(context, "image", image_metadata_language(analysis), notify)
+    return generate_metadata(context, "image", image_metadata_language(analysis), notify,
+                             audio_language=analysis.audience_language)
 
 
 def image_metadata_context(analysis: ImageAnalysis, plan: ImageRecreationPlan) -> str:
@@ -1009,15 +1016,13 @@ def run_app() -> None:
         with tab_audio:
             st.subheader("Recommended Audio for Instagram Reel")
             render_trending_audio(st, generated.social_metadata)
-            st.caption("Trending sounds for this post, found with Google Search, are in the Social Media tab. The ones below are Gemini's own pick, not checked with search.")
-            audio = plan.suggested_audio
-            with st.container(border=True):
+            with st.expander("Gemini's own pick (from memory, not checked with search)"):
+                audio = plan.suggested_audio
                 st.markdown(f"**Primary: {audio.track_name}** by {audio.artist_name}")
                 st.markdown(f"Genre: {audio.genre} | Feel: {audio.bpm_feel}")
                 st.caption(audio.mood_match)
                 st.markdown("**Search on Instagram audio:**")
                 _show_copyable(st, audio.instagram_search_query)
-            with st.container(border=True):
                 st.markdown(
                     f"**Alternative: {audio.alternative_track_name}** "
                     f"by {audio.alternative_artist_name}"

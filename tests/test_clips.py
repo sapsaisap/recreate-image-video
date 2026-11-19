@@ -18,10 +18,10 @@ from recreate_video import MediaInfo
 REPO = Path(__file__).resolve().parent.parent
 
 
-def idea(start, end, score=80, stands_alone=True, title=None, on_screen_text=""):
+def idea(start, end, score=80, stands_alone=True, title=None, on_screen_text="", sound_effects=()):
     return ClipIdea(start_seconds=start, end_seconds=end, title=title or f"clip {start:g}", hook="h", payoff="p",
                     why_it_works="w", what_is_said="said", score=score, stands_alone=stands_alone,
-                    on_screen_text=on_screen_text, narration="ఈ రహస్య మసాలా రుచిని మార్చేస్తుంది")
+                    on_screen_text=on_screen_text, sound_effects=list(sound_effects), narration="ఈ రహస్య మసాలా రుచిని మార్చేస్తుంది")
 
 
 def plan(*ideas, count=None):
@@ -82,9 +82,21 @@ class TestFinaliseClips:
         clip, = finalise_clips(plan(idea(10.0, 100.0)), 300, pauses=[], cuts=[])
         assert clip["end"] - clip["start"] == 45
 
-    def test_a_few_seconds_is_a_clip_but_less_is_not(self):
-        assert len(finalise_clips(plan(idea(10.0, 18.0)), 300, [], [])) == 1
-        assert finalise_clips(plan(idea(10.0, 16.0)), 300, [], []) == []
+    def test_a_short_moment_is_widened_to_8_s_not_dropped(self):
+        clip, = finalise_clips(plan(idea(10.0, 14.0)), 300, [], [])
+        assert (clip["start"], clip["end"]) == (8.0, 16.0)
+        clip, = finalise_clips(plan(idea(0.0, 3.0)), 300, [], [])  # kept inside the video
+        assert (clip["start"], clip["end"]) == (0.0, 8.0)
+        assert clips.stretch_to_minimum(295.0, 299.5, 300) == (292.0, 300.0)
+
+    def test_a_very_short_video_gives_one_clip_that_may_be_all_of_it(self):
+        clip, = [c for c in finalise_clips(plan(idea(0.0, 20.0, 90)), 20, [], []) if c["recommended"]]
+        assert (clip["start"], clip["end"]) == (0.0, 20.0)
+        nine, = finalise_clips(plan(idea(1.0, 5.0, 90)), 9, [], [])
+        assert (nine["start"], nine["end"], nine["recommended"]) == (0.0, 8.0, True)
+        prompt = clips._clip_prompt(MediaInfo(duration_seconds=20, width=1080, height=1920, has_audio=True,
+                                              aspect_ratio="9:16"), [], [])
+        assert "very short (20 s): return 1 clip" in prompt
 
     def test_times_past_the_end_are_clamped(self):
         clip, = finalise_clips(plan(idea(270.0, 400.0)), 300, [], [])
@@ -111,7 +123,7 @@ class TestFinaliseClips:
 
 
 class TestHowMany:
-    @pytest.mark.parametrize("seconds, count", [(60, 2), (120, 2), (179, 2), (300, 3), (600, 6), (1800, 8)])
+    @pytest.mark.parametrize("seconds, count", [(8, 1), (29, 1), (30, 2), (60, 2), (120, 2), (179, 2), (300, 3), (600, 6), (1800, 8)])
     def test_clip_count_follows_the_length(self, seconds, count):
         assert clips.max_clips_for(seconds) == count
 
@@ -193,6 +205,13 @@ class TestGeminiRequest:
         silent = plan().model_copy(update={"spoken_language": "none"})
         assert "Spoken language" not in clips.metadata_context({**clip, "what_is_said": ""}, silent)
         assert "Text on screen" not in context
+
+    def test_the_source_song_is_used_for_the_audio_only(self):
+        clip = {**idea(10, 40).model_dump(), "start": 10.0, "end": 40.0}
+        song = plan().model_copy(update={"source_music": "Kurchi Madathapetti, Thaman S"})
+        assert "Source music: Kurchi Madathapetti, Thaman S" in clips.metadata_context(clip, song)
+        assert "Source music" not in clips.metadata_context(clip, plan().model_copy(update={"source_music": "none"}))
+        assert "it is never put in the clip" in clips._clip_prompt(MEDIA, [], [])
 
     def test_metadata_context_leads_with_the_text_on_screen(self):
         clip = {**idea(10, 40, on_screen_text="When mom says 5 minutes").model_dump(), "start": 10.0, "end": 40.0}
@@ -305,6 +324,42 @@ class TestRenderClip:
         ffmpeg("-ss", "6", "-i", str(out), "-vn", str(tail))
         assert max_volume(tail) > -40  # music still playing after its own 2 s
 
+    @pytest.mark.parametrize("width, height, sharpened", [(1280, 720, False), (854, 480, True),
+                                                          (720, 1280, True), (1080, 1920, False)])
+    def test_small_sources_are_upscaled_sharp(self, width, height, sharpened):
+        media = MediaInfo(duration_seconds=60, width=width, height=height, has_audio=True, aspect_ratio="x")
+        video = clips.video_filter(media)
+        assert "lanczos" in video and (clips.SHARPEN in video) == sharpened
+
+    def test_upload_limit_matches_the_server_setting(self):
+        config = (Path(clips.__file__).parent / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+        assert f"maxUploadSize = {clips.UPLOAD_LIMIT_MB}" in config and clips.UPLOAD_LIMIT_MB == 500
+
+    def test_only_the_sound_effect_moments_of_the_source_are_kept(self, tmp_path):
+        source = make_video(tmp_path / "src.mp4", 10)  # loud tone all through: stands in for any sound
+        silent_voice = tmp_path / "silence.wav"
+        ffmpeg("-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "1", str(silent_voice))
+        out = clips.render_clip(source, rv.probe_video(source), 2.0, 10.0, tmp_path / "clip.mp4", silent_voice,
+                                sfx=[(3.0, 5.0)])
+        assert rv.probe_video(out).duration_seconds == pytest.approx(8.0, abs=0.15)
+
+        def level(start, seconds):
+            part = tmp_path / f"part_{start}.wav"
+            ffmpeg("-ss", str(start), "-t", str(seconds), "-i", str(out), "-vn", str(part))
+            return max_volume(part)
+        assert level(3.4, 1.2) > -30  # inside the kept moment
+        assert level(0.2, 2.5) < -60 and level(5.5, 2.0) < -60  # silent before and after
+
+    def test_sound_effect_moments_follow_the_clip(self):
+        clip = {"sound_effects": [{"start_seconds": 12.0, "end_seconds": 15.0, "sound": "water"},
+                                  {"start_seconds": 39.8, "end_seconds": 44.0, "sound": "engine"},
+                                  {"start_seconds": 5.0, "end_seconds": 9.0, "sound": "door"}]}
+        assert clips.sfx_windows(clip, 10.0, 40.0) == [(2.0, 5.0)]  # partly outside: cut; too short: dropped
+        assert clips.sfx_windows({}, 0, 10) == [] and clips.sfx_gain([]) == "0"
+        assert clips.sfx_gain([(2.0, 5.0)]) == "min(1,max(0,min(1,(t-2)/0.15))*max(0,min(1,(5-t)/0.15)))"
+        prompt = clips._clip_prompt(MEDIA, [], [])
+        assert "NO music and NO speech" in prompt and "copyright" in prompt
+
     def test_broken_source_raises_a_clear_error(self, tmp_path):
         broken = tmp_path / "broken.mp4"
         broken.write_bytes(b"not a video")
@@ -369,10 +424,11 @@ WRAPPER = textwrap.dedent('''
 
     def fake_find(video, source_url, media, pauses, cuts, notify):
         calls.append(("find", source_url))
-        return plan(idea(2, 20, score=90, title="Secret spice"), idea(35, 53, score=75, title="Taste test"),
+        return plan(idea(2, 20, score=90, title="Secret spice"), idea(35, 53, score=75, title="Taste test", sound_effects=[
+                        {{"start_seconds": 36.5, "end_seconds": 38.5, "sound": "oil sizzling"}}]),
                     idea(70, 88, score=55, title="Washing up")), "gemini-3.6-flash"
 
-    def fake_metadata(context, kind, language, notify):
+    def fake_metadata(context, kind, language, notify, audio_language=""):
         calls.append(("metadata", context.splitlines()[1], language))
         title = context.splitlines()[1].removeprefix("Clip title idea: ")
         return rv.SocialMetadata(youtube_title=f"{{title}} #Shorts", youtube_description="D", youtube_tags="a, b",
@@ -447,6 +503,8 @@ def test_whole_flow_from_link_to_clips_with_their_own_metadata(page):
     takes = [c for c in app.checkbox if "score" in c.label]
     assert [c.value for c in takes] == [True, True, False]  # recommended ones are ticked
     assert any(e.label == "Show 1 more possible clip(s) (not recommended)" for e in app.expander)
+    sfx, = [c for c in app.checkbox if c.label.startswith("Keep sound effects")]
+    assert sfx.label == "Keep sound effects from the video: oil sizzling (0:36.5)" and sfx.value
 
     assert any("orange = recommended" in m.value for m in app.markdown)  # the timeline
     assert any("Language: Telugu" in c.value for c in app.caption)
@@ -461,6 +519,7 @@ def test_whole_flow_from_link_to_clips_with_their_own_metadata(page):
     assert state["stage"] == "done" and not app.exception
     rendered = list(state["rendered"].values())
     assert [c["title"] for c in rendered] == ["Secret spice", "Taste test"]
+    assert [c["sfx"] for c in rendered] == [0, 1]  # the sizzle kept, nothing else of the source
     voices = [call for call in app.session_state.calls if call[0] == "voice"]
     assert [v[1] for v in voices] == ["కొత్త వాయిస్ ఓవర్", "ఈ రహస్య మసాలా రుచిని మార్చేస్తుంది"]
     assert all(v[2] == "te-IN-MohanNeural" for v in voices)

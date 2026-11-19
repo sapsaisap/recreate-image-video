@@ -1539,7 +1539,7 @@ class AudioProfile(BaseModel):
     spoken_language: str = Field(description="Main spoken language as an English name, e.g. 'Telugu', 'Hindi', 'English', or 'none'.")
     speech_summary: str = Field(description="Who speaks, tone and what the speech is about. Empty if no speech.")
     voice_character: str = Field(description="Voice type and delivery, e.g. 'excited child voice', 'calm male narrator', 'none'.")
-    music: str = Field(description="Music genre, tempo, energy, instruments, or 'none'. Describe sung lyrics here; do not transcribe them.")
+    music: str = Field(description="Music genre, tempo, energy, instruments, or 'none'. If it is a recognisable song, start with its title, artist and film / album. Describe sung lyrics here; do not transcribe them.")
     sound_effects: str
     transcript: list[Utterance] = Field(
         description="Every spoken line in order, one entry per sentence or speaker turn, covering all speech "
@@ -2496,8 +2496,9 @@ GENERIC_HASHTAGS = frozenset({
 def _audio_rule(language: str) -> str:
     """Which language the recommended sounds should be in."""
     if _is_english(language):
-        return ("- The content is in English or has no language: pick the sounds trending worldwide for it, "
-                "which are usually English.")
+        return ("- If the content clearly belongs to a region or language (its text, speech, people, place, "
+                "food or culture -- e.g. Telugu, Hindi, Tamil), pick that language's trending songs first. "
+                "Otherwise pick the sounds trending worldwide for it.")
     return (f"- The content is in {language}: most viewers are {language} speakers, so pick trending "
             f"{language} songs and sounds first (at least 2 of the 3). Add an English or global sound only "
             "if it is a well-known trending sound for this meme format.")
@@ -2519,7 +2520,7 @@ def _metadata_language_rule(language: str) -> str:
     )
 
 
-def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> str:
+def _metadata_prompt(context: str, kind: str, language: str, search: bool, audio_language: str = "") -> str:
     """kind: "video" (a Short / Reel) or "image" (a post). With search=True the
     reply is plain-text JSON, because 2.5 models cannot combine Google Search
     with a response schema."""
@@ -2538,6 +2539,8 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> st
             "6. Search which sounds / songs are trending or widely used RIGHT NOW on Instagram Reels and "
             "YouTube Shorts for this kind of content: the sound that goes with this meme format, or the songs "
             "creators use for this topic.\n"
+            "7. Check which BROAD hashtags for this topic and its language / region have big audiences that "
+            "real viewers follow (e.g. #telugumemes #telugufood #foodie #memes), as opposed to dead tags.\n"
             "Base every keyword on what you found; do not invent trends.\n\n"
         )
         reply = (
@@ -2550,7 +2553,8 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> st
         research = "=== KEYWORDS ===\nUse what you know people search on YouTube and Instagram for this topic.\n\n"
         reply = ""
     title_rule = "End it with ' #Shorts'." if is_video else "No hashtags in the title."
-    hashtag_line = "#Shorts first, then 2-4 niche hashtags" if is_video else "3-5 niche hashtags"
+    hashtag_line = ("#Shorts, then 1 broad and 1-2 niche hashtags (YouTube shows the first 3 above the title)"
+                    if is_video else "3 hashtags, 1 broad and 2 niche (YouTube shows them above the title)")
     return (
         "You are a YouTube and Instagram growth strategist. Write metadata that gets this "
         f"{'short video' if is_video else 'image post'} found in search and recommended.\n\n"
@@ -2575,20 +2579,24 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool) -> st
         f"  4. Last line: {hashtag_line}.\n"
         "- youtube_tags: 30-40 tags, best first: the primary keyword, its close variants, long-tail "
         "phrases people really search, the trend / meme format it belongs to, the on-screen text's key "
-        "phrase, language variants, and 2-3 broad category tags. 1-5 words each, no '#'. The app keeps as "
+        "phrase, language variants, and 3-5 broad high-volume tags for the category and its language / region "
+        "(e.g. 'telugu comedy', 'funny memes', 'telugu food'). 1-5 words each, no '#'. The app keeps as "
         "many as fit in YouTube's 500-character limit.\n\n"
         "=== INSTAGRAM ===\n"
         f"- instagram_caption: max {INSTAGRAM_CAPTION_MAX} characters, best 300-800. The first line "
         "(under 125 characters, shown before '...more') holds the hook and the primary keyword, "
         "because Instagram search reads captions. Then 2-4 short lines with natural keywords. End "
         "with a save or share call to action. No hashtags in the caption.\n"
-        f"- instagram_hashtags: exactly {INSTAGRAM_HASHTAGS_MAX}, best first: 1-2 that are trending right "
-        "now for this topic (the trend, meme format or event your research found), the rest specific to "
-        "the content's topic, niche and community. Never generic tags such as #viral #reels #explorepage "
-        "#fyp #trending -- they bring no reach.\n"
+        f"- instagram_hashtags: exactly {INSTAGRAM_HASHTAGS_MAX}, best first, in this mix: 1 trending right now "
+        "for this topic (the trend, meme format or event your research found); 2 niche ones specific to the "
+        "content; 2 broad community tags for its topic and language / region that have big audiences (e.g. "
+        "#telugumemes #foodie #memes). Never generic tags such as #viral #reels #explorepage #fyp #trending -- "
+        "they bring no reach.\n"
         "- trending_now: 1-2 sentences on what is trending for this topic and which tags came from it.\n\n"
         "=== AUDIO ===\n"
-        f"{_audio_rule(language)}\n"
+        f"{_audio_rule(audio_language or language)}\n"
+        "- If the CONTENT lists the source's own music and it is a recognisable song that is trending or "
+        "widely used on Reels / Shorts, list it first.\n"
         "- trending_audio: 2-3 real sounds your search found trending or widely used right now, best first. "
         "Each must fit THIS meme or video -- its joke, mood, topic and energy -- not just be popular. For a "
         "meme, the sound that goes with its format comes first. track and artist exactly as on Instagram; "
@@ -2849,13 +2857,35 @@ def _search_used_up_message() -> str:
     )
 
 
-def generate_metadata(context: str, kind: str, language: str, notify: Notify = _noop_notify) -> SocialMetadata:
+AUDIO_LANGUAGE_KEY = "audio_language_choice"
+AUDIO_LANGUAGES = ["Auto", "Telugu", "Hindi", "Tamil", "Kannada", "Malayalam", "Bengali", "Marathi", "Punjabi",
+                   "Gujarati", "English"]
+
+
+def chosen_audio_language() -> str:
+    """The sidebar's 'Trending audio language' ('' for Auto or outside the app)."""
+    try:
+        import streamlit as st
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is None:
+            return ""
+        value = st.session_state.get(AUDIO_LANGUAGE_KEY, "Auto")
+    except Exception:
+        return ""
+    return "" if value in ("", "Auto") else str(value)
+
+
+def generate_metadata(context: str, kind: str, language: str, notify: Notify = _noop_notify,
+                      audio_language: str = "") -> SocialMetadata:
     """YouTube + Instagram metadata, written only from Google Search results
     (gemini-2.5-flash, then gemini-2.5-flash-lite). With no grounded answer it
-    raises GeminiCallError / QuotaExhaustedError instead of guessing."""
+    raises GeminiCallError / QuotaExhaustedError instead of guessing.
+    audio_language: the audience's language for the trending sounds; the
+    sidebar choice wins, then this, then `language`."""
+    audio_language = chosen_audio_language() or audio_language.strip() or language
     notify("Researching keywords with Google Search and writing the metadata...")
     draft, queries, sources, model = generate_with_optional_search(
-        lambda search: _metadata_prompt(context, kind, language, search),
+        lambda search: _metadata_prompt(context, kind, language, search, audio_language),
         SocialMetadataDraft,
         task="metadata",
         label=f"{kind}-metadata",
@@ -2915,6 +2945,7 @@ def generate_social_metadata(
         f"Settings: {', '.join(analysis.settings)}" if analysis.settings else "",
         f"Spoken language: {audio.spoken_language}" if audio.has_speech else "",
         f"What is said (English meaning): {speech}" if speech else "",
+        f"Source music: {audio.music.strip()}" if audio.music.strip().lower() not in ("", "none") else "",
     ] if part)
     language = audio.spoken_language if audio.has_speech else "English"
     return generate_metadata(context, "video", language, notify)
@@ -3772,7 +3803,7 @@ def _render_quota_sidebar(st) -> None:
 
 
 APP_MODULES = ("recreate_video", "recreate_image", "image_to_video", "summary_short", "clips", "voiceover",
-               "slideshow")
+               "slideshow", "upscale")
 
 
 def drop_stale_app_modules() -> list[str]:
@@ -3825,9 +3856,12 @@ def run_app() -> None:
         st.markdown("## 🎬 Recreate")
         mode = st.radio(
             "What are you recreating?",
-            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE, CLIPS_MODE],
+            options=[VIDEO_MODE, IMAGE_MODE, IMAGE_TO_VIDEO_MODE, SUMMARY_MODE, CLIPS_MODE, UPSCALE_MODE],
             key="app_mode",
         )
+        st.selectbox("Trending audio language", AUDIO_LANGUAGES, key=AUDIO_LANGUAGE_KEY,
+                     help="Language of the trending songs recommended with the metadata. Auto follows the "
+                          "post: its speech, text, people and place.")
         st.divider()
         st.caption(
             "Paste any public link. The app auto-detects image vs video. "
@@ -3851,6 +3885,11 @@ def run_app() -> None:
         from clips import render_page as render_clips_page
 
         render_clips_page(st)
+        return
+    if mode == UPSCALE_MODE:  # Real-ESRGAN / ffmpeg only, no Gemini key needed
+        from upscale import render_page as render_upscale_page
+
+        render_upscale_page(st)
         return
 
     is_image_mode = mode == IMAGE_MODE
@@ -4015,6 +4054,7 @@ VIDEO_MODE = "🎬 Video / Reel"
 IMAGE_TO_VIDEO_MODE = "🎞️ Image to Video"
 SUMMARY_MODE = "📝 Summarise to Short"
 CLIPS_MODE = "✂️ Clips from long video"
+UPSCALE_MODE = "🔍 Upscale to 1080"
 
 
 def _analyze_image_link(st, url: str) -> None:
@@ -4215,16 +4255,13 @@ def _render_image_results(st, is_image_mode: bool) -> None:
             _show_copyable(st, plan.negative_prompt)
         with tab_audio:
             st.subheader("Recommended Audio")
-            render_trending_audio(st, gen.social_metadata)
-            st.caption("Trending sounds for this post, found with Google Search, are in the Social Media tab. The ones below are Gemini's own pick, not checked with search.")
-            audio = plan.suggested_audio
-            with st.container(border=True):
+            trending_slot = st.container()
+            with st.expander("Gemini's own pick (from memory, not checked with search)"):
+                audio = plan.suggested_audio
                 st.markdown(f"**{audio.track_name}** by {audio.artist_name}")
                 st.markdown(f"Genre: {audio.genre} | Feel: {audio.bpm_feel}")
                 st.caption(audio.mood_match)
-                st.markdown("**Search on Instagram:**")
                 _show_copyable(st, audio.instagram_search_query)
-            with st.container(border=True):
                 st.markdown(f"**Alt: {audio.alternative_track_name}** by {audio.alternative_artist_name}")
                 _show_copyable(st, audio.alternative_search_query)
         with tab_social:
@@ -4237,6 +4274,13 @@ def _render_image_results(st, is_image_mode: bool) -> None:
                 return updated.social_metadata
 
             render_social_or_generate(st, gen.social_metadata, f"image_{result.image_sha[:12]}", make)
+        with trending_slot:  # after the Social tab, which makes the metadata on the first view
+            latest = st.session_state.get("image_generated") or gen
+            if latest.social_metadata and latest.social_metadata.trending_audio:
+                render_trending_audio(st, latest.social_metadata)
+            else:
+                st.caption("Trending sounds come with the social metadata (Google Search). "
+                           "Open the Social tab if they are not here yet.")
 
     st.divider()
     st.download_button(

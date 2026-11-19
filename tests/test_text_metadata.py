@@ -49,7 +49,7 @@ class TestImageMetadata:
 
     def test_generate_passes_context_and_language(self, mock_analysis_with_text, mock_plan_with_text, monkeypatch):
         seen = {}
-        monkeypatch.setattr(ri, "generate_metadata", lambda context, kind, language, notify: seen.update(
+        monkeypatch.setattr(ri, "generate_metadata", lambda context, kind, language, notify, audio_language="": seen.update(
             context=context, kind=kind, language=language))
         ri.generate_social_metadata_for_image(mock_analysis_with_text.model_copy(update={"text_language": "Hindi"}),
                                               mock_plan_with_text)
@@ -84,7 +84,7 @@ class TestVideoMetadata:
             rv.HeroSubject(name="iron kadai", why_it_matters="x", size_and_scale="x", shape_and_parts="x",
                            not_present="x")]})
         seen = {}
-        monkeypatch.setattr(rv, "generate_metadata", lambda context, kind, language, notify: seen.update(
+        monkeypatch.setattr(rv, "generate_metadata", lambda context, kind, language, notify, audio_language="": seen.update(
             context=context))
         rv.generate_social_metadata(result_for(source), plan_with(beat([1])))
         lines = seen["context"].splitlines()
@@ -99,8 +99,18 @@ class TestPromptAndTrending:
         prompt = rv._metadata_prompt("Content: meme", "image", "English", search=True)
         assert "=== TEXT ON SCREEN ===" in prompt and "Never ignore it" in prompt
         assert "trending RIGHT NOW" in prompt and "search its key phrase too" in prompt
-        assert "1-2 that are trending right now" in prompt and "trending_now" in prompt
+        assert "1 trending right now" in prompt and "trending_now" in prompt
         assert "#viral #reels" in prompt  # generic tags stay banned
+
+    def test_broad_high_view_tags_are_part_of_the_mix(self):
+        video = rv._metadata_prompt("Content: recipe", "video", "Telugu", search=True)
+        assert "2 broad community tags for its topic and language / region that have big audiences" in video
+        assert "Check which BROAD hashtags" in video and "3-5 broad high-volume tags" in video
+        assert "#Shorts, then 1 broad and 1-2 niche hashtags (YouTube shows the first 3 above the title)" in video
+        image = rv._metadata_prompt("Content: meme", "image", "English", search=True)
+        assert "3 hashtags, 1 broad and 2 niche" in image
+        assert rv._validate_instagram_hashtags(["#telugumemes", "#viral", "#memes", "#fyp", "#3amscroll"],
+                                               fill_from=[]).split() == ["#telugumemes", "#memes", "#3amscroll"]
 
     def test_trending_is_kept_and_shown(self):
         draft = rv.SocialMetadataDraft(
@@ -167,4 +177,57 @@ class TestTrendingAudio:
 
     def test_image_pick_follows_the_text_and_its_language(self):
         prompt = ri._analysis_prompt_image()
-        assert "fit what the image and its text are about" in prompt and "popular song in that language" in prompt
+        assert "fit what the image and its text are about" in prompt and "audience's language" in prompt
+
+
+class TestAudioLanguage:
+    """The trending sounds follow the audience: sidebar choice > what the post shows > metadata language."""
+
+    @staticmethod
+    def prompt_for(monkeypatch, language, audio_language="", chosen=""):
+        seen = {}
+        monkeypatch.setattr(rv, "chosen_audio_language", lambda: chosen)
+
+        def fake(build_prompt, schema, **kwargs):
+            seen["prompt"] = build_prompt(True)
+            return (rv.SocialMetadataDraft(primary_keyword="k", search_insights="x", youtube_title="t",
+                                           youtube_description="d", youtube_tags=[], instagram_caption="c",
+                                           instagram_hashtags=[]), ["q"], [], "m")
+        monkeypatch.setattr(rv, "generate_with_optional_search", fake)
+        rv.generate_metadata("Content: biryani photo", "image", language, audio_language=audio_language)
+        return seen["prompt"]
+
+    def test_the_audience_language_beats_the_text_language(self, monkeypatch):
+        assert "pick trending Telugu songs" in self.prompt_for(monkeypatch, "English", audio_language="Telugu")
+        assert "Write everything in English." in self.prompt_for(monkeypatch, "English", audio_language="Telugu")
+
+    def test_the_sidebar_choice_wins(self, monkeypatch):
+        prompt = self.prompt_for(monkeypatch, "Telugu", audio_language="Telugu", chosen="Hindi")
+        assert "pick trending Hindi songs" in prompt and "pick trending Telugu songs" not in prompt
+
+    def test_without_a_language_the_region_is_read_from_the_content(self, monkeypatch):
+        prompt = self.prompt_for(monkeypatch, "English")
+        assert "clearly belongs to a region or language" in prompt and "list it first" in prompt
+
+    def test_no_choice_outside_the_app(self):
+        assert rv.chosen_audio_language() == "" and rv.AUDIO_LANGUAGES[0] == "Auto"
+
+    def test_image_audience_is_asked_for_and_passed(self, mock_analysis_no_text, mock_plan_with_text, monkeypatch):
+        assert "audience_language" in ri._StrictImageAnalysis.model_json_schema()["required"]
+        seen = {}
+        monkeypatch.setattr(ri, "generate_metadata", lambda context, kind, language, notify, audio_language="":
+                            seen.update(language=language, audio=audio_language))
+        food = mock_analysis_no_text.model_copy(update={"audience_language": "Telugu"})
+        ri.generate_social_metadata_for_image(food, mock_plan_with_text)
+        assert seen == {"language": "English", "audio": "Telugu"}
+
+    def test_the_source_song_reaches_the_video_metadata(self, monkeypatch):
+        source = analysis()
+        source = source.model_copy(update={"audio": source.audio.model_copy(update={
+            "music": "Kurchi Madathapetti (Guntur Kaaram), Thaman S -- mass beat"})})
+        seen = {}
+        monkeypatch.setattr(rv, "generate_metadata", lambda context, kind, language, notify, audio_language="":
+                            seen.update(context=context))
+        rv.generate_social_metadata(result_for(source), plan_with(beat([1])))
+        assert "Source music: Kurchi Madathapetti (Guntur Kaaram)" in seen["context"]
+        assert "recognisable song, start with its title" in rv.AudioProfile.model_fields["music"].description

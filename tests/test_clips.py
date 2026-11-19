@@ -82,9 +82,21 @@ class TestFinaliseClips:
         clip, = finalise_clips(plan(idea(10.0, 100.0)), 300, pauses=[], cuts=[])
         assert clip["end"] - clip["start"] == 45
 
-    def test_a_few_seconds_is_a_clip_but_less_is_not(self):
-        assert len(finalise_clips(plan(idea(10.0, 18.0)), 300, [], [])) == 1
-        assert finalise_clips(plan(idea(10.0, 16.0)), 300, [], []) == []
+    def test_a_short_moment_is_widened_to_8_s_not_dropped(self):
+        clip, = finalise_clips(plan(idea(10.0, 14.0)), 300, [], [])
+        assert (clip["start"], clip["end"]) == (8.0, 16.0)
+        clip, = finalise_clips(plan(idea(0.0, 3.0)), 300, [], [])  # kept inside the video
+        assert (clip["start"], clip["end"]) == (0.0, 8.0)
+        assert clips.stretch_to_minimum(295.0, 299.5, 300) == (292.0, 300.0)
+
+    def test_a_very_short_video_gives_one_clip_that_may_be_all_of_it(self):
+        clip, = [c for c in finalise_clips(plan(idea(0.0, 20.0, 90)), 20, [], []) if c["recommended"]]
+        assert (clip["start"], clip["end"]) == (0.0, 20.0)
+        nine, = finalise_clips(plan(idea(1.0, 5.0, 90)), 9, [], [])
+        assert (nine["start"], nine["end"], nine["recommended"]) == (0.0, 8.0, True)
+        prompt = clips._clip_prompt(MediaInfo(duration_seconds=20, width=1080, height=1920, has_audio=True,
+                                              aspect_ratio="9:16"), [], [])
+        assert "very short (20 s): return 1 clip" in prompt
 
     def test_times_past_the_end_are_clamped(self):
         clip, = finalise_clips(plan(idea(270.0, 400.0)), 300, [], [])
@@ -111,7 +123,7 @@ class TestFinaliseClips:
 
 
 class TestHowMany:
-    @pytest.mark.parametrize("seconds, count", [(60, 2), (120, 2), (179, 2), (300, 3), (600, 6), (1800, 8)])
+    @pytest.mark.parametrize("seconds, count", [(8, 1), (29, 1), (30, 2), (60, 2), (120, 2), (179, 2), (300, 3), (600, 6), (1800, 8)])
     def test_clip_count_follows_the_length(self, seconds, count):
         assert clips.max_clips_for(seconds) == count
 
@@ -193,6 +205,13 @@ class TestGeminiRequest:
         silent = plan().model_copy(update={"spoken_language": "none"})
         assert "Spoken language" not in clips.metadata_context({**clip, "what_is_said": ""}, silent)
         assert "Text on screen" not in context
+
+    def test_the_source_song_is_used_for_the_audio_only(self):
+        clip = {**idea(10, 40).model_dump(), "start": 10.0, "end": 40.0}
+        song = plan().model_copy(update={"source_music": "Kurchi Madathapetti, Thaman S"})
+        assert "Source music: Kurchi Madathapetti, Thaman S" in clips.metadata_context(clip, song)
+        assert "Source music" not in clips.metadata_context(clip, plan().model_copy(update={"source_music": "none"}))
+        assert "it is never put in the clip" in clips._clip_prompt(MEDIA, [], [])
 
     def test_metadata_context_leads_with_the_text_on_screen(self):
         clip = {**idea(10, 40, on_screen_text="When mom says 5 minutes").model_dump(), "start": 10.0, "end": 40.0}
@@ -305,6 +324,17 @@ class TestRenderClip:
         ffmpeg("-ss", "6", "-i", str(out), "-vn", str(tail))
         assert max_volume(tail) > -40  # music still playing after its own 2 s
 
+    @pytest.mark.parametrize("width, height, sharpened", [(1280, 720, False), (854, 480, True),
+                                                          (720, 1280, True), (1080, 1920, False)])
+    def test_small_sources_are_upscaled_sharp(self, width, height, sharpened):
+        media = MediaInfo(duration_seconds=60, width=width, height=height, has_audio=True, aspect_ratio="x")
+        video = clips.video_filter(media)
+        assert "lanczos" in video and (clips.SHARPEN in video) == sharpened
+
+    def test_upload_limit_matches_the_server_setting(self):
+        config = (Path(clips.__file__).parent / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+        assert f"maxUploadSize = {clips.UPLOAD_LIMIT_MB}" in config and clips.UPLOAD_LIMIT_MB == 500
+
     def test_broken_source_raises_a_clear_error(self, tmp_path):
         broken = tmp_path / "broken.mp4"
         broken.write_bytes(b"not a video")
@@ -372,7 +402,7 @@ WRAPPER = textwrap.dedent('''
         return plan(idea(2, 20, score=90, title="Secret spice"), idea(35, 53, score=75, title="Taste test"),
                     idea(70, 88, score=55, title="Washing up")), "gemini-3.6-flash"
 
-    def fake_metadata(context, kind, language, notify):
+    def fake_metadata(context, kind, language, notify, audio_language=""):
         calls.append(("metadata", context.splitlines()[1], language))
         title = context.splitlines()[1].removeprefix("Clip title idea: ")
         return rv.SocialMetadata(youtube_title=f"{{title}} #Shorts", youtube_description="D", youtube_tags="a, b",

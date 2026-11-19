@@ -1,7 +1,9 @@
 [server]
-# Max file upload size in MB — matches MAX_DOWNLOAD_MB in the app config.
-# Streamlit Cloud default is 200 MB; set explicitly so local and cloud behave the same.
-maxUploadSize = 200
+# Max file upload size in MB (Streamlit's default is 200). 500 lets Clips take a
+# 30-minute 720p video. Streamlit holds an upload in memory and Streamlit Cloud's
+# RAM is limited, so do not go much higher: paste a link for bigger files.
+# Matches UPLOAD_LIMIT_MB in clips.py.
+maxUploadSize = 500
 # Required for Streamlit Community Cloud (no browser on the server)
 headless = true
 

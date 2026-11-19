@@ -61,6 +61,7 @@ _LOADED_MTIME = Path(__file__).stat().st_mtime  # see recreate_video.drop_stale_
 
 CLIPS_MAX_VIDEO_SECONDS = int(os.getenv("CLIPS_MAX_VIDEO_SECONDS", "1800") or 1800)
 CLIPS_MAX_DOWNLOAD_MB = int(os.getenv("CLIPS_MAX_DOWNLOAD_MB", "1500") or 1500)
+UPLOAD_LIMIT_MB = 500  # server.maxUploadSize in .streamlit/config.toml
 TOO_LONG = (f"This video cannot be analysed or made into clips due to its duration. The maximum is "
             f"{CLIPS_MAX_VIDEO_SECONDS / 60:.0f} minutes.")
 CLIP_MIN_SECONDS, CLIP_MAX_SECONDS = 8, 45
@@ -73,6 +74,7 @@ CLIPS_TIMEOUT_SECONDS = 600  # one call over up to 30 minutes of video
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be")
 CHOP_GAP_SECONDS = 5.0  # clips closer than this count as "next to each other"
 SHORT_SOURCE_SECONDS = 180  # below this: at most 2 clips
+TINY_SOURCE_SECONDS = 30  # below this: 1 clip, which may be the whole video
 MUSIC_VOLUME = 0.12  # background music under the voice
 NARRATION_SHARE = 0.85  # narration fills ~85% of the clip, leaving breathing room
 CHOPPED_FIX = (
@@ -113,6 +115,10 @@ class ClipPlan(BaseModel):
     video_summary: str = Field(description="2-3 sentence English summary of the whole video.")
     spoken_language: str = Field(description="Main spoken language as an English name, or 'none'.")
     language_code: str = Field(description="ISO 639-1 code of the spoken language, e.g. 'te', 'en'; 'en' if none.")
+    source_music: str = Field(
+        default="",
+        description="The music in the video: if it is a recognisable song, its title, artist and film; else "
+                    "its genre and mood; 'none' if there is no music.")
     recommended_count: int = Field(description="How many clips scored 70 or more and are worth posting.")
     count_reason: str = Field(description="One or two sentences: why that many clips (not more, not fewer).")
     clips: list[ClipIdea] = Field(description="Up to 12 candidates, best first, without overlaps.")
@@ -145,11 +151,30 @@ def snap(value: float, points: list[float], window: float = SNAP_SECONDS) -> flo
 
 
 def max_clips_for(duration: float) -> int:
-    """How many clips a video can give: 2 under 3 minutes, then about one
+    """How many clips a video can give: 1 under 30 s, 2 under 3 minutes, then about one
     per 1.5-2 minutes, at most MAX_CLIPS."""
+    if duration < TINY_SOURCE_SECONDS:
+        return 1
     if duration < SHORT_SOURCE_SECONDS:
         return 2
     return max(2, min(MAX_CLIPS, round(duration / 105)))
+
+
+def coverage_budget(duration: float) -> float:
+    """Seconds the recommended clips may use together: half the video, or
+    all of it for a video under 30 s."""
+    return duration if duration < TINY_SOURCE_SECONDS else MAX_COVERAGE * duration
+
+
+def stretch_to_minimum(start: float, end: float, duration: float) -> tuple[float, float]:
+    """A moment shorter than CLIP_MIN_SECONDS widened around its middle to
+    that length, kept inside the video."""
+    length = min(CLIP_MIN_SECONDS, duration)
+    if end - start >= length:
+        return start, end
+    middle = (start + end) / 2
+    start = min(max(0.0, middle - length / 2), duration - length)
+    return start, start + length
 
 
 def looks_chopped(spans: list[tuple[float, float]], duration: float) -> bool:
@@ -183,7 +208,7 @@ def finalise_clips(plan: ClipPlan, duration: float, pauses: list[tuple[float, fl
     if looks_chopped(_best_spans(kept, duration), duration):
         logger.info("[CLIPS] clips are back-to-back -- keeping only separate moments")
         kept = _pick_clips(plan, duration, pauses, cuts, gap=CHOP_GAP_SECONDS)
-    cap, budget = max_clips_for(duration), MAX_COVERAGE * duration
+    cap, budget = max_clips_for(duration), coverage_budget(duration)
     good: list[dict] = []
     for clip in kept:  # best first
         length = clip["end"] - clip["start"]
@@ -210,9 +235,8 @@ def _pick_clips(plan: ClipPlan, duration: float, pauses: list[tuple[float, float
         if end - start > CLIP_MAX_SECONDS:  # end on the last pause before the limit
             earlier = [p for p in end_points if start + CLIP_MIN_SECONDS <= p <= start + CLIP_MAX_SECONDS]
             end = earlier[-1] if earlier else start + CLIP_MAX_SECONDS
-        if end - start < CLIP_MIN_SECONDS - 1:
-            logger.info(f"[CLIPS] dropped '{idea.title}': {end - start:.1f}s after snapping")
-            continue
+        if end - start < CLIP_MIN_SECONDS:  # a short moment is widened, never dropped
+            start, end = stretch_to_minimum(start, end, duration)
         if any(start < k["end"] + gap and end > k["start"] - gap for k in kept):
             continue
         kept.append({**idea.model_dump(), "start": round(start, 2), "end": round(end, 2)})
@@ -239,8 +263,14 @@ def _clip_prompt(media: MediaInfo, pauses: list[tuple[float, float]], cuts: list
     cut_times = ", ".join(f"{c:.1f}" for c in cuts[:200]) or "none measured"
     rates = ", ".join(f"{code} {rate:g}" for code, rate in WORDS_PER_SECOND.items())
     cap = max_clips_for(media.duration_seconds)
-    short = (f"- This video is short ({media.duration_seconds:.0f} s): 1 or 2 short clips at most, 0 if nothing "
-             "stands alone. Never use most of the video.\n" if media.duration_seconds < SHORT_SOURCE_SECONDS else "")
+    if media.duration_seconds < TINY_SOURCE_SECONDS:
+        short = (f"- This video is very short ({media.duration_seconds:.0f} s): return 1 clip -- the best part, "
+                 "or the whole video if all of it works as a Short.\n")
+    elif media.duration_seconds < SHORT_SOURCE_SECONDS:
+        short = (f"- This video is short ({media.duration_seconds:.0f} s): 1 or 2 short clips at most, 0 if "
+                 "nothing stands alone. Never use most of the video.\n")
+    else:
+        short = ""
     return (
         f"You are a short-form video editor. Watch and listen to this whole {media.duration_seconds:.0f}-second "
         "video. Find the moments worth posting on their own as YouTube Shorts / Instagram Reels, each cut "
@@ -269,6 +299,8 @@ def _clip_prompt(media: MediaInfo, pauses: list[tuple[float, float]], cuts: list
         "in the spoken language and its own script (English if nobody speaks). Size it to the clip: about "
         f"{NARRATION_SHARE:.0%} of (clip seconds x words per second); words per second by language: {rates}, "
         "others 2.0. Plain spoken sentences, no hashtags or emojis, no 'like and subscribe'.\n"
+        "- source_music: if the video's music is a recognisable song, its title, artist and film (used only "
+        "to recommend trending audio; it is never put in the clip).\n"
         "- Never name real people; describe them by appearance or role. Ignore platform UI and watermarks.\n"
         + (f"\nIMPORTANT: {correction}\n" if correction else "")
         + "Return JSON matching the schema."
@@ -351,6 +383,24 @@ class ClipRenderError(RuntimeError):
     pass
 
 
+SHARP_SCALE = "flags=lanczos+accurate_rnd+full_chroma_int"  # the resize Image to Video uses
+SHARPEN = "unsharp=5:5:0.5:5:5:0.0"  # light, luma only: offsets the softness of upscaling
+
+
+def video_filter(media: MediaInfo) -> str:
+    """The 1080x1920 picture: vertical footage filled, landscape footage on a
+    blurred copy of itself. Smaller sources (720p, 480p) are upscaled with
+    lanczos and lightly sharpened, so they come out clean at 1080."""
+    vertical = media.width / max(1, media.height) <= 0.6
+    sharpen = f",{SHARPEN}" if media.width < 1080 or (vertical and media.height < 1920) else ""
+    if vertical:
+        return (f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase:{SHARP_SCALE},crop=1080:1920"
+                f"{sharpen},setsar=1,fps=30[v]")
+    return ("[0:v]split=2[bg0][fg0];"
+            "[bg0]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:2[bg];"
+            f"[fg0]scale=1080:-2:{SHARP_SCALE}{sharpen}[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30[v]")
+
+
 def render_clip(source: Path, media: MediaInfo, start: float, end: float, output: Path,
                 voice: Path, music: Path | None = None) -> Path:
     """One 1080x1920 clip: vertical footage is filled, landscape footage sits
@@ -361,12 +411,7 @@ def render_clip(source: Path, media: MediaInfo, start: float, end: float, output
     inputs = ["-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(source), "-i", str(voice)]
     if music is not None:
         inputs += ["-stream_loop", "-1", "-i", str(music)]
-    if media.width / max(1, media.height) <= 0.6:
-        video = "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30[v]"
-    else:
-        video = ("[0:v]split=2[bg0][fg0];"
-                 "[bg0]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:2[bg];"
-                 "[fg0]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30[v]")
+    video = video_filter(media)
     loudness = "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000"
     voice_chain = "[1:a]aresample=48000,aformat=channel_layouts=stereo,apad"
     if music is not None:
@@ -376,7 +421,7 @@ def render_clip(source: Path, media: MediaInfo, start: float, end: float, output
         audio = f"{voice_chain},{loudness}[a]"
     command = [ffmpeg_exe(), "-y", "-hide_banner", "-loglevel", "error", *inputs,
                "-filter_complex", f"{video};{audio}", "-map", "[v]", "-map", "[a]",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-t", f"{length:.3f}", str(output)]
     try:
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -402,6 +447,7 @@ def metadata_context(clip: dict, plan: ClipPlan) -> str:
         f"New voice-over of the clip: {clip['narration']}" if clip.get("narration") else "",
         f"The full video: {plan.video_summary.strip()[:400]}",
         f"Spoken language: {plan.spoken_language}" if plan.spoken_language.lower() != "none" else "",
+        f"Source music: {plan.source_music.strip()}" if plan.source_music.strip().lower() not in ("", "none") else "",
     ] if part)
 
 
@@ -453,6 +499,8 @@ def _page_input(st) -> None:
         st.error(problem)
     url = st.text_input("Video link", placeholder="https://www.youtube.com/watch?v=...", key="clips_url")
     uploaded = st.file_uploader("Or upload a video", type=["mp4", "mov", "webm", "m4v", "mkv"], key="clips_upload")
+    st.caption(f"Uploads up to {UPLOAD_LIMIT_MB} MB; for bigger files paste a link. Tip: upload 720p -- a 30-minute "
+               "720p video is usually 150-300 MB, and the clips still come out 1080x1920 (upscaled and sharpened).")
     if not st.button("Find clips", type="primary", disabled=bool(problems) or not (url.strip() or uploaded),
                      key="clips_find"):
         return
@@ -463,7 +511,9 @@ def _page_input(st) -> None:
         try:
             if uploaded is not None:
                 video = job / f"source{Path(uploaded.name).suffix.lower() or '.mp4'}"
-                video.write_bytes(uploaded.getvalue())
+                uploaded.seek(0)
+                with video.open("wb") as out:  # streamed: no second copy of a big upload in memory
+                    shutil.copyfileobj(uploaded, out, 8 * 1024 * 1024)
                 title, source_url = Path(uploaded.name).stem, f"upload://{uploaded.name}"
             else:
                 notify("Downloading the video...")
@@ -476,9 +526,9 @@ def _page_input(st) -> None:
             media = probe_video(video)
             if media.duration_seconds > CLIPS_MAX_VIDEO_SECONDS + 0.5:
                 raise URLVideoError(TOO_LONG)
-            if media.duration_seconds < 30:
-                raise URLVideoError(f"This video is only {media.duration_seconds:.0f} seconds long -- too short to "
-                                    "cut into clips. Use Video recreate instead.")
+            if media.duration_seconds < CLIP_MIN_SECONDS:
+                raise URLVideoError(f"This video is only {media.duration_seconds:.1f} seconds long. Clips need at "
+                                    f"least {CLIP_MIN_SECONDS} seconds of video.")
             notify("Finding the speech pauses...")
             pauses = speech_pauses(video) if media.has_audio else []
             notify("Measuring the shot changes...")
@@ -513,6 +563,8 @@ def _page_pick(st) -> None:
                 + f" — {plan.count_reason}")
     if not clips:
         st.warning("Gemini found no moment that works on its own as a Short. Try another video.")
+    elif media.duration_seconds < TINY_SOURCE_SECONDS:
+        st.caption("Very short video: 1 clip, which can be the whole video.")
     elif media.duration_seconds < SHORT_SOURCE_SECONDS:
         st.caption("Short video: at most 2 clips. To retell the whole video as a Short, use Summarise to Short.")
     if clips:
@@ -705,7 +757,9 @@ def _page_done(st) -> None:
                 social = SocialMetadata.model_validate(stored)
 
             def make(notify: Notify, clip=clip, index=index):
-                meta = generate_metadata(metadata_context(clip, plan), "video", language, notify)
+                meta = generate_metadata(metadata_context(clip, plan), "video", language, notify,
+                                         audio_language="" if plan.spoken_language.lower() == "none"
+                                         else plan.spoken_language)
                 state["social"][index] = meta.model_dump()
                 return meta
 

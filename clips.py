@@ -335,42 +335,46 @@ def youtube_watch_url(url: str) -> str:
 
 
 def find_clips(video: Path, source_url: str, media: MediaInfo, pauses: list[tuple[float, float]],
-               cuts: list[float], notify: Notify = _noop_notify) -> tuple[ClipPlan, str]:
+               cuts: list[float], notify: Notify = _noop_notify, *, schema: type[BaseModel] = ClipPlan,
+               build_prompt=None, label: str = "clips") -> tuple[BaseModel, str]:
     """(plan, model). YouTube links are watched by Gemini straight from
-    YouTube (free, no upload); anything else is uploaded and deleted after."""
+    YouTube (free, no upload); anything else is uploaded and deleted after.
+    `schema` / `build_prompt(media, pauses, cuts, correction)` let another
+    mode (Trailer / Teaser) ask for its own kind of clips the same way."""
     from google.genai import types as genai_types
 
     client = get_client()
     metadata = genai_types.VideoMetadata(fps=frames_per_second(media.duration_seconds))
+    prompt_for = build_prompt or _clip_prompt
     used: dict[str, str] = {}
 
     def ask(part):
-        plan = ask_once(part, _clip_prompt(media, pauses, cuts))
+        plan = ask_once(part, prompt_for(media, pauses, cuts, ""))
         if looks_chopped(_best_spans(plan.clips, media.duration_seconds), media.duration_seconds):
-            logger.info("[CLIPS] Gemini chopped the video into back-to-back pieces -- asking once more")
+            logger.info(f"[{label.upper()}] Gemini chopped the video into back-to-back pieces -- asking once more")
             notify("Gemini split the video into back-to-back pieces -- asking again for real moments...")
-            plan = ask_once(part, _clip_prompt(media, pauses, cuts, CHOPPED_FIX))
+            plan = ask_once(part, prompt_for(media, pauses, cuts, CHOPPED_FIX))
         return plan
 
-    def ask_once(part, prompt: str) -> ClipPlan:
-        def run(model: str) -> ClipPlan:
+    def ask_once(part, prompt: str) -> BaseModel:
+        def run(model: str) -> BaseModel:
             response = client.models.generate_content(
                 model=model,
                 contents=[part, prompt],
                 config=genai_types.GenerateContentConfig(
                     http_options=gemini_http_options(CLIPS_TIMEOUT_SECONDS),
                     response_mime_type="application/json",
-                    response_schema=ClipPlan,
+                    response_schema=schema,
                     media_resolution=genai_types.MediaResolution.MEDIA_RESOLUTION_LOW,
                     temperature=0.4,
                     automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
                 ),
             )
             used["model"] = model
-            return _parse_structured(response, ClipPlan)
+            return _parse_structured(response, schema)
 
         notify("Gemini is watching the whole video and picking the clips...")
-        return call_gemini(run, notify, task="analysis", label="clips")
+        return call_gemini(run, notify, task="analysis", label=label)
 
     if youtube := youtube_watch_url(source_url):
         try:

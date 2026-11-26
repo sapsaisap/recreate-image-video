@@ -105,6 +105,15 @@ Paste a YouTube / Instagram link or upload a video of 8 seconds to 30 minutes (`
 
 A new voice-over removes the original voice and music, but the picture is still the creator's footage, and YouTube / Instagram match video too. Post clips only of videos you own or have rights to; for someone else's video, Summarise to Short (AI images) is the safer choice.
 
+#### Trailer / Teaser
+For a newly released movie trailer or teaser (YouTube link or upload, up to 10 minutes, `TRAILER_MAX_VIDEO_SECONDS`). Like Clips, Gemini watches it once (YouTube links directly) and recommends the moments worth posting on their own — title reveal, hero intro, punch dialogue, action peak, song hook — snapped to speech pauses or shot changes: 1 clip under 30 s, 2 under 90 s, 3 under 4 minutes, else 4, together at most half the video. It also reads the title card and credit cards word for word.
+
+**Unlike Clips, the original dialogue and music are kept** — no new voice-over. Each clip gets a short fade in / out, −14 LUFS, 1080x1920 (landscape on a blurred background). You can also render the whole trailer as one vertical video.
+
+**The movie is found with Google Search** (free on `gemini-2.5-flash` / `-flash-lite`): from the video title, title card, credits and language it confirms the title, release date, cinemas / OTT platform, languages, genre, director, music director, main cast, production house and official hashtags, with the sources shown. Nothing is guessed: unconfirmed fields stay empty, and every field can be corrected before rendering. If search is unavailable the clips still work and you fill the details in. Each clip's YouTube / Instagram metadata is written from these facts (title with the movie name and "trailer", official hashtags, a credit line to the official trailer); no trending audio is suggested, since the clip keeps its own sound.
+
+The clips keep the film's own sound and picture, so expect a Content ID claim: the owner may take the ad revenue or, rarely, block the clip. Studios usually welcome credited trailer clips, but the trailer is theirs.
+
 #### Upscale to 1080
 Upload a low-quality image or video and get it back with its short side at 1080 pixels (1080x1920 for 9:16, 1080x1350 for 4:5, 1080x1080 square, 1920x1080 landscape), the same shape, nothing cropped. No Gemini call.
 - **Image**: Real-ESRGAN (`realesr-general-x4v3`, BSD-3-Clause, converted from the official weights to `models/realesr-general-x4v3.onnx`, 4.9 MB) runs on the CPU with `onnxruntime`, in overlapping tiles so memory stays small. It removes blur and JPEG blocks and sharpens edges; a 270x480 image takes about a second. Images already bigger than 1080 are resized down; transparency is kept (PNG). If the model cannot load, a lanczos resize with light sharpening is used.

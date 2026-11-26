@@ -22,8 +22,8 @@ def idea(start, end, score=85, stands_alone=True, title=None, moment="punch dial
                            score=score, stands_alone=stands_alone, on_screen_text="")
 
 
-def plan(*ideas, title_on_screen="దేవర | DEVARA"):
-    return TrailerPlan(video_summary="An action trailer.", video_kind="trailer", spoken_language="Telugu",
+def plan(*ideas, title_on_screen="దేవర | DEVARA", video_kind="trailer"):
+    return TrailerPlan(video_summary="An action trailer.", video_kind=video_kind, spoken_language="Telugu",
                        language_code="te", title_on_screen=title_on_screen,
                        credits_on_screen="In cinemas 10 Jan", source_music="Background score",
                        recommended_count=len(ideas), count_reason="because", clips=list(ideas))
@@ -87,6 +87,12 @@ def test_metadata_context_is_built_from_the_checked_facts():
         in context
     assert "Dialogue: నేను వస్తున్నా (I am coming)" in context
     assert context.endswith("Official trailer: https://www.youtube.com/watch?v=abcdefghijk")
+
+
+def test_category_hashtag_follows_the_kind_of_promo():
+    assert trailer.trailer_category_hashtag(plan()) == "#trailer"
+    assert trailer.trailer_category_hashtag(plan(video_kind="Teaser")) == "#teaser"
+    assert trailer.trailer_category_hashtag(plan(video_kind="first glimpse")) == "#teaser"
 
 
 # ── Rendering: the original sound is kept ───────────────────────────────────
@@ -153,8 +159,8 @@ WRAPPER = textwrap.dedent('''
                                    cast="Actor One"), ["devara trailer"], [{{"title": "Wiki", "uri": "https://w"}}],
                 "gemini-2.5-flash")
 
-    def fake_metadata(context, kind, language, notify, audio_language=""):
-        calls.append(("metadata", context, language))
+    def fake_metadata(context, kind, language, notify, audio_language="", category_hashtag=""):
+        calls.append(("metadata", context, language, category_hashtag))
         return rv.SocialMetadata(youtube_title="T #Shorts", youtube_description="D", youtube_tags="a, b",
                                  instagram_caption="C", instagram_hashtags="#a #b #c #d #e",
                                  trending_audio=[rv.TrendingAudio(track="Some song")],
@@ -236,8 +242,9 @@ def test_whole_flow_from_trailer_link_to_clips_with_original_sound(page):
 
     # 3. each clip's metadata comes from the checked facts, with the corrected cast
     metadata = [call for call in app.session_state.calls if call[0] == "metadata"]
-    assert len(metadata) == 3 and all(language == "Telugu" for _, _, language in metadata)
-    assert all("Cast: Actor One, Actor Two" in context and "movie Devara" in context for _, context, _ in metadata)
+    assert len(metadata) == 3 and all(language == "Telugu" for _, _, language, _ in metadata)
+    assert all("Cast: Actor One, Actor Two" in context and "movie Devara" in context for _, context, _, _ in metadata)
+    assert {category for *_, category in metadata} == {"#trailer"}  # never #comedy for a film's promo
     assert all(not s["trending_audio"] for s in state["social"].values())  # original sound kept
 
 

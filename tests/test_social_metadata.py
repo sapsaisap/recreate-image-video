@@ -100,10 +100,14 @@ class TestTitleAndDescription:
         title = _fit_title("word " * 40, tags)
         assert len(title) <= 100 and title.endswith(f"{SHORTS} #comedy") and "  " not in title
 
-    def test_image_title_has_no_hashtags(self):
-        meta = _finish_metadata(make_draft(), "image", [], [])
-        assert meta.youtube_title == "Telugu Biryani Recipe in 60 Seconds 🔥"
-        assert meta.youtube_description.endswith("\n\n#food #biryani #telugufood")
+    def test_image_post_gets_the_same_youtube_hashtags(self):
+        # An image goes on YouTube as a Short (Image to Video).
+        image = _finish_metadata(make_draft(), "image", [], [])
+        video = _finish_metadata(make_draft(), "video", [], [])
+        assert image.youtube_title == f"Telugu Biryani Recipe in 60 Seconds 🔥 {SHORTS} #food"
+        assert (image.youtube_title, image.youtube_description, image.youtube_tags) == \
+            (video.youtube_title, video.youtube_description, video.youtube_tags)
+        assert image.instagram_caption == "Biryani in 60 seconds 🔥"
 
     def test_description_ends_with_one_hashtag_line(self):
         meta = _finish_metadata(make_draft(), "video", [], [])

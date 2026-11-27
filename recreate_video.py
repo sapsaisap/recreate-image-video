@@ -2582,10 +2582,11 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool, audio
     else:
         research = "=== KEYWORDS ===\nUse what you know people search on YouTube and Instagram for this topic.\n\n"
         reply = ""
+    # An image goes on YouTube as a Short (Image to Video), so both kinds get the Shorts hashtags.
     fixed = " ".join(YOUTUBE_SHORTS_HASHTAGS)
     title_rule = (f"NO hashtags: the app adds '{fixed}' and the category hashtag after it (title max "
-                  f"{YOUTUBE_TITLE_MAX} with them)." if is_video else "NO hashtags in the title.")
-    added_by_app = f"{fixed}, the category hashtag" if is_video else "the category hashtag"
+                  f"{YOUTUBE_TITLE_MAX} with them).")
+    added_by_app = f"{fixed}, the category hashtag"
     instagram_top = " ".join(INSTAGRAM_TOP_HASHTAGS[kind if kind in INSTAGRAM_TOP_HASHTAGS else "video"])
     return (
         "You are a YouTube and Instagram growth strategist. Write metadata that gets this "
@@ -2619,7 +2620,7 @@ def _metadata_prompt(context: str, kind: str, language: str, search: bool, audio
         "phrases people really search, the trend / meme format it belongs to, the on-screen text's key "
         "phrase, language variants, and 3-5 broad high-volume tags for the category and its language / region "
         "(e.g. 'telugu comedy', 'funny memes', 'telugu food'). 1-5 words each, no '#'. The app adds "
-        f"{', '.join(repr(tag) for tag in YOUTUBE_SHORTS_TAGS) if is_video else 'the category'} itself and "
+        f"{', '.join(repr(tag) for tag in YOUTUBE_SHORTS_TAGS)} and the category itself and "
         "keeps as many as fit in YouTube's 500-character limit.\n\n"
         "=== INSTAGRAM ===\n"
         f"- instagram_caption: ONE short, simple line, under 100 characters: the hook with the primary keyword "
@@ -2727,16 +2728,16 @@ def _category_hashtag(draft_value: str, override: str = "") -> str:
     return _hashtag((override or draft_value or "").strip().split(" ")[0]).lower()
 
 
-def _youtube_hashtags(draft: "SocialMetadataDraft", kind: str, category: str) -> tuple[list[str], list[str]]:
-    """(title hashtags, description hashtag line). A Short's title ends with
-    #shorts #trendingshorts #viral + the category; the description repeats them
-    and adds the related ones Gemini found, at most YOUTUBE_DESCRIPTION_HASHTAGS_MAX."""
-    title_tags = _unique_hashtags([*YOUTUBE_SHORTS_HASHTAGS, category]) if kind == "video" else []
-    fixed = title_tags or _unique_hashtags([category])
-    taken = {tag.casefold() for tag in fixed}
+def _youtube_hashtags(draft: "SocialMetadataDraft", category: str) -> tuple[list[str], list[str]]:
+    """(title hashtags, description hashtag line). The title ends with
+    #shorts #trendingshorts #viral + the category -- for images too, which go
+    on YouTube as a Short; the description repeats them and adds the related
+    ones Gemini found, at most YOUTUBE_DESCRIPTION_HASHTAGS_MAX."""
+    title_tags = _unique_hashtags([*YOUTUBE_SHORTS_HASHTAGS, category])
+    taken = {tag.casefold() for tag in title_tags}
     related = [tag for tag in _unique_hashtags(draft.youtube_hashtags)
                if tag.casefold() not in taken and tag.casefold() not in GENERIC_HASHTAGS]
-    line = fixed + related[:YOUTUBE_RELATED_HASHTAGS_MAX]
+    line = title_tags + related[:YOUTUBE_RELATED_HASHTAGS_MAX]
     return title_tags, line[:YOUTUBE_DESCRIPTION_HASHTAGS_MAX]
 
 
@@ -2796,13 +2797,14 @@ def _finish_metadata(
     category_hashtag: str = "",
 ) -> SocialMetadata:
     """Fits Gemini's draft to each platform's limits and adds the fixed
-    hashtags: a Short's title ends with #shorts #trendingshorts #viral + the
-    category tag (#comedy for funny content); the description ends with those
-    and the related ones; Instagram gets one line and 3 related + 2 top tags.
+    hashtags (videos and image posts alike): the YouTube title ends with
+    #shorts #trendingshorts #viral + the category tag (#comedy for funny
+    content); the description ends with those and the related ones; Instagram
+    gets one line and 3 related + 2 top tags (#trendingreels only on Reels).
     category_hashtag: set by the caller (e.g. #trailer) instead of Gemini's."""
     category = _category_hashtag(draft.category_hashtag, category_hashtag)
-    title_tags, description_tags = _youtube_hashtags(draft, kind, category)
-    fixed_tags = [*(YOUTUBE_SHORTS_TAGS if kind == "video" else ()), category.lstrip("#")]
+    title_tags, description_tags = _youtube_hashtags(draft, category)
+    fixed_tags = [*YOUTUBE_SHORTS_TAGS, category.lstrip("#")]
     caption = _one_line_caption(draft.instagram_caption)
     return SocialMetadata(
         youtube_title=_fit_title(draft.youtube_title, title_tags),

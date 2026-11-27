@@ -110,7 +110,8 @@ class TestPromptAndTrending:
         assert "Never #comedy for content that is not funny" in video and "ONE short, simple line" in video
         assert "the app adds #fyp #trendingreels itself" in video
         image = rv._metadata_prompt("Content: meme", "image", "English", search=True)
-        assert "NO hashtags in the title" in image and "#shorts" not in image
+        assert "the app adds '#shorts #trendingshorts #viral' and the category hashtag" in image
+        assert "ONE short, simple line" in image
         assert "the app adds #fyp #trending itself" in image
         assert rv._validate_instagram_hashtags(["#telugumemes", "#viral", "#memes", "#fyp", "#3amscroll"],
                                                fill_from=[]).split() == ["#telugumemes", "#memes", "#3amscroll"]

@@ -1,7 +1,9 @@
 """
 test_social_metadata.py - YouTube / Instagram metadata: platform limits (tags
 packed to YouTube's own count, description in bytes, 5 niche hashtags), the
-search-grounded generation path and its no-search fallback. Zero API calls.
+search-grounded generation path and its no-search fallback, and the fixed
+hashtags (#shorts #trendingshorts #viral + category; Instagram 3 related + 2
+top tags, one-line caption). Zero API calls.
 """
 import dataclasses
 import json
@@ -38,6 +40,8 @@ def make_draft(**overrides):
         youtube_tags=["biryani recipe telugu", "hyderabadi biryani", "biryani in telugu"],
         instagram_caption="Biryani in 60 seconds 🔥\nSave this recipe 📌",
         instagram_hashtags=["#biryani", "#telugufood", "#viral", "hyderabadibiryani", "#reels", "#foodie", "#homecooking"],
+        category_hashtag="#Food",
+        youtube_hashtags=["#biryani", "#viral", "#telugufood"],
     )
     values.update(overrides)
     return SocialMetadataDraft(**values)
@@ -71,34 +75,83 @@ class TestYouTubeTags:
 
 # ── Title and description limits ────────────────────────────────────────────
 
+SHORTS = "#shorts #trendingshorts #viral"
+
+
 class TestTitleAndDescription:
-    def test_shorts_suffix_added_for_video(self):
-        assert _fit_title("Biryani in 60 seconds", shorts=True) == "Biryani in 60 seconds #Shorts"
+    def test_short_title_is_hook_then_fixed_hashtags_and_category(self):
+        meta = _finish_metadata(make_draft(), "video", [], [])
+        assert meta.youtube_title == f"Telugu Biryani Recipe in 60 Seconds 🔥 {SHORTS} #food"
 
-    def test_no_suffix_for_image(self):
-        assert _fit_title("Biryani poster", shorts=False) == "Biryani poster"
+    def test_comedy_tag_comes_from_the_content(self):
+        meta = _finish_metadata(make_draft(category_hashtag="#Comedy"), "video", [], [])
+        assert meta.youtube_title.endswith(f"{SHORTS} #comedy")
 
-    def test_title_trimmed_to_100_at_a_word(self):
-        title = _fit_title("word " * 40, shorts=True)
-        assert len(title) <= 100 and title.endswith(" #Shorts") and "  " not in title
+    def test_callers_category_wins(self):
+        meta = _finish_metadata(make_draft(category_hashtag="#comedy"), "video", [], [], category_hashtag="#trailer")
+        assert meta.youtube_title.endswith(f"{SHORTS} #trailer") and "#comedy" not in meta.youtube_description
 
-    def test_description_capped_in_bytes(self):
+    def test_hashtags_gemini_put_in_the_title_are_replaced(self):
+        meta = _finish_metadata(make_draft(youtube_title="Biryani hack 🔥 #Shorts #viral"), "video", [], [])
+        assert meta.youtube_title == f"Biryani hack 🔥 {SHORTS} #food"
+
+    def test_only_the_hook_is_shortened(self):
+        tags = [*SHORTS.split(), "#comedy"]
+        title = _fit_title("word " * 40, tags)
+        assert len(title) <= 100 and title.endswith(f"{SHORTS} #comedy") and "  " not in title
+
+    def test_image_post_gets_the_same_youtube_hashtags(self):
+        # An image goes on YouTube as a Short (Image to Video).
+        image = _finish_metadata(make_draft(), "image", [], [])
+        video = _finish_metadata(make_draft(), "video", [], [])
+        assert image.youtube_title == f"Telugu Biryani Recipe in 60 Seconds 🔥 {SHORTS} #food"
+        assert (image.youtube_title, image.youtube_description, image.youtube_tags) == \
+            (video.youtube_title, video.youtube_description, video.youtube_tags)
+        assert image.instagram_caption == "Biryani in 60 seconds 🔥"
+
+    def test_description_ends_with_one_hashtag_line(self):
+        meta = _finish_metadata(make_draft(), "video", [], [])
+        assert meta.youtube_description == (
+            f"Make Hyderabadi biryani at home.\n\nSubscribe for more!\n\n{SHORTS} #food #biryani #telugufood")
+
+    def test_description_hashtags_stay_few(self):
+        many = [f"#tag{i}" for i in range(40)]
+        meta = _finish_metadata(make_draft(youtube_hashtags=many), "video", [], [])
+        line = meta.youtube_description.splitlines()[-1].split()
+        assert line[:4] == [*SHORTS.split(), "#food"] and len(line) == 4 + 5 <= 15
+
+    def test_description_capped_in_bytes_and_keeps_hashtags(self):
         telugu = "బిర్యానీ " * 1000  # 3 bytes per letter
         meta = _finish_metadata(make_draft(youtube_description=telugu), "video", [], [])
         assert len(meta.youtube_description.encode("utf-8")) <= 5000
-        assert meta.youtube_description.endswith("బిర్యానీ")
+        assert meta.youtube_description.endswith("#telugufood") and "బిర్యానీ\n\n#shorts" in meta.youtube_description
 
-    def test_caption_capped_at_2200(self):
-        meta = _finish_metadata(make_draft(instagram_caption="food " * 1000), "video", [], [])
-        assert len(meta.instagram_caption) <= 2200
+    def test_fixed_tags_follow_the_primary_keyword(self):
+        meta = _finish_metadata(make_draft(), "video", [], [])
+        assert split_tags(meta.youtube_tags)[:5] == ["telugu biryani recipe", "shorts", "trending shorts", "viral",
+                                                     "food"]
+
+    def test_caption_is_one_short_line(self):
+        assert _finish_metadata(make_draft(), "video", [], []).instagram_caption == "Biryani in 60 seconds 🔥"
+        meta = _finish_metadata(make_draft(instagram_caption="#food " + "food " * 1000), "video", [], [])
+        assert 0 < len(meta.instagram_caption) <= 125 and "\n" not in meta.instagram_caption
+        assert "#" not in meta.instagram_caption
 
 
 # ── Instagram hashtags ──────────────────────────────────────────────────────
 
 class TestInstagramHashtags:
-    def test_drops_generic_tags_and_caps_at_5(self):
+    def test_three_related_then_two_top_tags(self):
         result = _finish_metadata(make_draft(), "video", [], []).instagram_hashtags
-        assert result == "#biryani #telugufood #hyderabadibiryani #foodie #homecooking"
+        assert result == "#biryani #telugufood #hyderabadibiryani #fyp #trendingreels"
+
+    def test_image_post_top_tags(self):
+        result = _finish_metadata(make_draft(), "image", [], []).instagram_hashtags
+        assert result == "#biryani #telugufood #hyderabadibiryani #fyp #trending"
+
+    def test_top_tag_not_repeated(self):
+        result = _validate_instagram_hashtags("#trendingreels #biryani", top=("#fyp", "#trendingreels"))
+        assert result == "#biryani #fyp #trendingreels"
 
     def test_adds_missing_hash_prefix(self):
         assert _validate_instagram_hashtags("phonedrop futuretech") == "#phonedrop #futuretech"
@@ -219,7 +272,8 @@ class TestGenerateMetadata:
         assert "use Google Search" in calls[0]["prompt"] and "Tenglish" in calls[0]["prompt"]
         assert meta.grounded and meta.search_queries == ["telugu biryani recipe shorts", "hyderabadi biryani"]
         assert meta.sources == [{"title": "youtube.com", "uri": "https://example.com/a"}]
-        assert meta.youtube_title.endswith("#Shorts") and meta.model == "gemini-2.5-flash"
+        assert meta.youtube_title.endswith(f"{SHORTS} #food") and meta.model == "gemini-2.5-flash"
+        assert "#comedy' if the content is meant to be funny" in calls[0]["prompt"]
         assert "Google Search · gemini-2.5-flash (2 searches, 1 sources)" in rv.render_social_metadata(meta)
 
     def test_search_quota_used_up_stops_instead_of_guessing(self, fake):
@@ -298,11 +352,10 @@ class TestGenerateMetadata:
 
 
 class TestHashtagFill:
-    def test_fills_up_to_five_from_keyword_ideas(self):
+    def test_fills_up_to_three_from_keyword_ideas(self):
         draft = make_draft(instagram_hashtags=["#viral", "#biryani", "#reels"])
         tags = _finish_metadata(draft, "video", [], []).instagram_hashtags.split()
-        assert tags == ["#biryani", "#telugubiryanirecipe", "#biryanirecipetelugu", "#hyderabadibiryani",
-                        "#biryaniintelugu"]
+        assert tags == ["#biryani", "#telugubiryanirecipe", "#biryanirecipetelugu", "#fyp", "#trendingreels"]
 
     def test_long_ideas_are_not_used_as_hashtags(self):
         tags = _validate_instagram_hashtags("#food", fill_from=["a very long search phrase nobody types", "biryani"])

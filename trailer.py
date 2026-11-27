@@ -322,6 +322,13 @@ def movie_fact_lines(movie: dict) -> list[str]:
     return [f"{label}: {movie[key].strip()}" for key, label in MOVIE_FIELDS if str(movie.get(key, "")).strip()]
 
 
+def trailer_category_hashtag(plan: TrailerPlan) -> str:
+    """The category tag after #shorts #trendingshorts #viral: #teaser for a
+    teaser or glimpse, otherwise #trailer (never #comedy for a film's promo)."""
+    kind = plan.video_kind.casefold()
+    return "#teaser" if "teaser" in kind or "glimpse" in kind else "#trailer"
+
+
 def trailer_metadata_context(clip: dict, plan: TrailerPlan, movie: dict, source_url: str) -> str:
     title = (movie.get("title") or plan.title_on_screen).strip()
     kind = plan.video_kind.strip() or "trailer"
@@ -343,9 +350,9 @@ def trailer_metadata_context(clip: dict, plan: TrailerPlan, movie: dict, source_
         f"The whole {kind}: {plan.video_summary.strip()[:400]}",
         f"Spoken language: {plan.spoken_language}" if plan.spoken_language.lower() != "none" else "",
         f"Trailer music: {plan.source_music.strip()}" if plan.source_music.strip().lower() not in ("", "none") else "",
-        "Put the movie title and the word trailer / teaser in the YouTube title, and use the movie's official "
-        "hashtags." if title else "",
-        f"End the description with the credit line: Official {kind}: {source_url}" if source_url.startswith("http")
+        "Put the movie title and the word trailer / teaser in the YouTube title hook, and put the movie's official "
+        "hashtags first in youtube_hashtags and instagram_hashtags." if title else "",
+        f"Last line of the description text: Official {kind}: {source_url}" if source_url.startswith("http")
         else "",
     ] if part)
 
@@ -618,7 +625,8 @@ def _page_done(st) -> None:
 
             def make(notify: Notify, clip=clip, index=index):
                 meta = generate_metadata(trailer_metadata_context(clip, plan, movie, state["source_url"]), "video",
-                                         language, notify, audio_language=language)
+                                         language, notify, audio_language=language,
+                                         category_hashtag=trailer_category_hashtag(plan))
                 # The clip keeps the trailer's own sound: no other audio to suggest.
                 meta = meta.model_copy(update={"trending_audio": []})
                 state["social"][index] = meta.model_dump()

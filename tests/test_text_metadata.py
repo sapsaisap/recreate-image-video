@@ -104,11 +104,15 @@ class TestPromptAndTrending:
 
     def test_broad_high_view_tags_are_part_of_the_mix(self):
         video = rv._metadata_prompt("Content: recipe", "video", "Telugu", search=True)
-        assert "2 broad community tags for its topic and language / region that have big audiences" in video
+        assert "a broad community tag for its topic and language / region" in video
         assert "Check which BROAD hashtags" in video and "3-5 broad high-volume tags" in video
-        assert "#Shorts, then 1 broad and 1-2 niche hashtags (YouTube shows the first 3 above the title)" in video
+        assert "the app adds '#shorts #trendingshorts #viral' and the category hashtag" in video
+        assert "Never #comedy for content that is not funny" in video and "ONE short, simple line" in video
+        assert "the app adds #fyp #trendingreels itself" in video
         image = rv._metadata_prompt("Content: meme", "image", "English", search=True)
-        assert "3 hashtags, 1 broad and 2 niche" in image
+        assert "the app adds '#shorts #trendingshorts #viral' and the category hashtag" in image
+        assert "ONE short, simple line" in image
+        assert "the app adds #fyp #trending itself" in image
         assert rv._validate_instagram_hashtags(["#telugumemes", "#viral", "#memes", "#fyp", "#3amscroll"],
                                                fill_from=[]).split() == ["#telugumemes", "#memes", "#3amscroll"]
 
